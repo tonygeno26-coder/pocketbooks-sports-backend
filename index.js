@@ -242,7 +242,7 @@ function fetchOdds(sport) {
   });
 }
 
-app.get('/api/odds/:sport', auth, async (req, res) => {
+app.get('/api/odds/:sport', async (req, res) => {
   const sportMap = {
     'nfl': 'americanfootball_nfl',
     'nba': 'basketball_nba',
@@ -277,7 +277,7 @@ app.get('/api/odds/:sport', auth, async (req, res) => {
   }
 });
 
-app.get('/api/odds', auth, async (req, res) => {
+app.get('/api/odds', async (req, res) => {
   // Get games from all active sports
   const sports = ['baseball_mlb', 'basketball_nba', 'icehockey_nhl', 'americanfootball_ufl'];
   try {
