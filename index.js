@@ -224,6 +224,145 @@ app.get('/api/diamonds', auth, async (req, res) => {
   res.json({ balance: user.rows[0].diamonds, transactions: txns.rows });
 });
 
+// ===== CLUBS =====
+
+function genCode() {
+  return Math.random().toString(36).substring(2,8).toUpperCase();
+}
+
+// Create club
+app.post('/api/clubs', auth, async (req, res) => {
+  const { name, description, max_bet, max_parlay } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  let code, attempts = 0;
+  while (attempts < 10) {
+    code = genCode();
+    const exists = await pool.query('SELECT id FROM clubs WHERE code=$1', [code]);
+    if (!exists.rows.length) break;
+    attempts++;
+  }
+  const r = await pool.query(
+    'INSERT INTO clubs (host_id,name,code,description,max_bet,max_parlay) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+    [req.user.id, name, code, description||'', max_bet||500, max_parlay||1000]
+  );
+  res.json(r.rows[0]);
+});
+
+// Get host's clubs
+app.get('/api/clubs', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT c.*, COUNT(m.id) as member_count 
+     FROM clubs c LEFT JOIN club_memberships m ON c.id=m.club_id 
+     WHERE c.host_id=$1 GROUP BY c.id ORDER BY c.created_at DESC`,
+    [req.user.id]
+  );
+  res.json(r.rows);
+});
+
+// Get single club
+app.get('/api/clubs/:id', auth, async (req, res) => {
+  const r = await pool.query('SELECT * FROM clubs WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
+  if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
+  res.json(r.rows[0]);
+});
+
+// Update club
+app.patch('/api/clubs/:id', auth, async (req, res) => {
+  const { name, description, max_bet, max_parlay, is_active } = req.body;
+  const r = await pool.query(
+    'UPDATE clubs SET name=COALESCE($1,name),description=COALESCE($2,description),max_bet=COALESCE($3,max_bet),max_parlay=COALESCE($4,max_parlay),is_active=COALESCE($5,is_active) WHERE id=$6 AND host_id=$7 RETURNING *',
+    [name, description, max_bet, max_parlay, is_active, req.params.id, req.user.id]
+  );
+  res.json(r.rows[0]);
+});
+
+// Delete club
+app.delete('/api/clubs/:id', auth, async (req, res) => {
+  await pool.query('DELETE FROM clubs WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
+  res.json({ success: true });
+});
+
+// Get club members
+app.get('/api/clubs/:id/members', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT m.*, u.name, u.email,
+      CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate
+     FROM club_memberships m JOIN users u ON m.player_id=u.id 
+     WHERE m.club_id=$1 AND m.host_id=$2 ORDER BY m.joined_at DESC`,
+    [req.params.id, req.user.id]
+  );
+  res.json(r.rows);
+});
+
+// Add player to club (by host)
+app.post('/api/clubs/:id/members', auth, async (req, res) => {
+  const { name, phone, credit_limit, max_bet } = req.body;
+  if (!name) return res.status(400).json({ error: 'Name required' });
+  // Create user account if doesn't exist
+  let playerRes = await pool.query('SELECT id FROM users WHERE email=$1', [phone?.toLowerCase() || name.toLowerCase()+'@club.pb']);
+  let playerId;
+  if (!playerRes.rows.length) {
+    const pw = await require('bcryptjs').hash('pb-player-'+Date.now(), 8);
+    const newUser = await pool.query(
+      'INSERT INTO users (email,password,name,role,diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id',
+      [(phone?.toLowerCase()||name.toLowerCase()+'@club.pb'), pw, name.toUpperCase(), 'player', 0]
+    );
+    playerId = newUser.rows[0].id;
+  } else {
+    playerId = playerRes.rows[0].id;
+  }
+  const existing = await pool.query('SELECT id FROM club_memberships WHERE club_id=$1 AND player_id=$2', [req.params.id, playerId]);
+  if (existing.rows.length) return res.status(400).json({ error: 'Player already in club' });
+  const r = await pool.query(
+    'INSERT INTO club_memberships (club_id,player_id,host_id,credit_limit,max_bet) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+    [req.params.id, playerId, req.user.id, credit_limit||500, max_bet||100]
+  );
+  res.json({ ...r.rows[0], name: name.toUpperCase() });
+});
+
+// Remove member
+app.delete('/api/clubs/:id/members/:memberId', auth, async (req, res) => {
+  await pool.query('DELETE FROM club_memberships WHERE id=$1 AND host_id=$2', [req.params.memberId, req.user.id]);
+  res.json({ success: true });
+});
+
+// Join club by code (player)
+app.post('/api/clubs/join', auth, async (req, res) => {
+  const { code } = req.body;
+  const club = await pool.query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
+  if (!club.rows.length) return res.status(404).json({ error: 'Club not found or inactive' });
+  const c = club.rows[0];
+  const exists = await pool.query('SELECT id FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
+  if (exists.rows.length) return res.status(400).json({ error: 'Already a member' });
+  await pool.query(
+    'INSERT INTO club_memberships (club_id,player_id,host_id) VALUES ($1,$2,$3)',
+    [c.id, req.user.id, c.host_id]
+  );
+  res.json({ success: true, club: c });
+});
+
+// Get player's clubs
+app.get('/api/my-clubs', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT c.*, m.balance, m.credit_limit, m.max_bet, m.total_bets, m.wins, m.losses, m.id as membership_id
+     FROM club_memberships m JOIN clubs c ON m.club_id=c.id 
+     WHERE m.player_id=$1 ORDER BY m.joined_at DESC`,
+    [req.user.id]
+  );
+  res.json(r.rows);
+});
+
+// Get club bets
+app.get('/api/clubs/:id/bets', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT b.*, u.name as player_name FROM bets b 
+     LEFT JOIN users u ON b.player_id=u.id
+     WHERE b.club_id=$1 AND b.host_id=$2 ORDER BY b.created_at DESC LIMIT 50`,
+    [req.params.id, req.user.id]
+  );
+  res.json(r.rows);
+});
+
 // ===== ODDS =====
 const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const https = require('https');

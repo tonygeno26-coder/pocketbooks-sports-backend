@@ -13,7 +13,36 @@ pool.on('error', (err) => {
 
 async function initDB() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
+    CREATE TABLE IF NOT EXISTS clubs (
+    id SERIAL PRIMARY KEY,
+    host_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    code VARCHAR(20) UNIQUE NOT NULL,
+    description VARCHAR(500),
+    max_bet DECIMAL(10,2) DEFAULT 500,
+    max_parlay DECIMAL(10,2) DEFAULT 1000,
+    active_sports TEXT[] DEFAULT ARRAY['MLB','NBA','NFL','NHL'],
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW()
+  );
+
+  CREATE TABLE IF NOT EXISTS club_memberships (
+    id SERIAL PRIMARY KEY,
+    club_id INTEGER REFERENCES clubs(id) ON DELETE CASCADE,
+    player_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    host_id INTEGER REFERENCES users(id),
+    balance DECIMAL(10,2) DEFAULT 0,
+    credit_limit DECIMAL(10,2) DEFAULT 500,
+    max_bet DECIMAL(10,2) DEFAULT 100,
+    total_bets INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'active',
+    joined_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(club_id, player_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       email VARCHAR(255) UNIQUE NOT NULL,
       password VARCHAR(255) NOT NULL,
