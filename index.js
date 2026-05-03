@@ -326,6 +326,78 @@ app.delete('/api/clubs/:id/members/:memberId', auth, async (req, res) => {
   res.json({ success: true });
 });
 
+
+// Join request (player requests to join by code)
+app.post('/api/clubs/request', auth, async (req, res) => {
+  const { code } = req.body;
+  const club = await pool.query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
+  if (!club.rows.length) return res.status(404).json({ error: 'Club not found' });
+  const c = club.rows[0];
+  const exists = await pool.query('SELECT id,status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
+  if (exists.rows.length) return res.status(400).json({ error: 'Already a member or request pending', status: exists.rows[0].status });
+  await pool.query('INSERT INTO club_memberships (club_id,player_id,host_id,status,role) VALUES ($1,$2,$3,$4,$5)',
+    [c.id, req.user.id, c.host_id, 'pending', 'player']);
+  res.json({ success: true, club: { id: c.id, name: c.name, code: c.code } });
+});
+
+// Get pending join requests for host
+app.get('/api/clubs/:id/requests', auth, async (req, res) => {
+  const r = await pool.query(
+    `SELECT m.*, u.name, u.email FROM club_memberships m JOIN users u ON m.player_id=u.id
+     WHERE m.club_id=$1 AND m.host_id=$2 AND m.status='pending' ORDER BY m.joined_at DESC`,
+    [req.params.id, req.user.id]);
+  res.json(r.rows);
+});
+
+// Approve/reject request
+app.patch('/api/clubs/:id/requests/:memberId', auth, async (req, res) => {
+  const { action } = req.body; // 'approve' or 'reject'
+  const status = action === 'approve' ? 'approved' : 'rejected';
+  const r = await pool.query(
+    `UPDATE club_memberships SET status=$1, approved_at=${action==='approve'?'NOW()':'NULL'}
+     WHERE id=$2 AND host_id=$3 RETURNING *`,
+    [status, req.params.memberId, req.user.id]);
+  if (action === 'approve') {
+    const m = r.rows[0];
+    await pool.query(
+      'INSERT INTO player_limits (club_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
+      [req.params.id, m.player_id]);
+  }
+  res.json(r.rows[0]);
+});
+
+// Get/set player limits per club
+app.get('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
+  const r = await pool.query('SELECT * FROM player_limits WHERE club_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
+  res.json(r.rows[0] || {});
+});
+
+app.put('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
+  const { max_bet, max_daily_risk, max_payout, allowed_sports } = req.body;
+  const r = await pool.query(
+    `INSERT INTO player_limits (club_id,user_id,max_bet,max_daily_risk,max_payout,allowed_sports,updated_at)
+     VALUES ($1,$2,$3,$4,$5,$6,NOW())
+     ON CONFLICT (club_id,user_id) DO UPDATE SET max_bet=$3,max_daily_risk=$4,max_payout=$5,allowed_sports=$6,updated_at=NOW()
+     RETURNING *`,
+    [req.params.id, req.params.userId, max_bet||100, max_daily_risk||500, max_payout||2000, allowed_sports||['MLB','NBA','NFL','NHL']]);
+  res.json(r.rows[0]);
+});
+
+// Search club by code (public)
+app.get('/api/clubs/search/:code', async (req, res) => {
+  const r = await pool.query('SELECT id,name,code,description FROM clubs WHERE code=$1 AND is_active=true', [req.params.code.toUpperCase()]);
+  if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
+  res.json(r.rows[0]);
+});
+
+// Check bet eligibility (player must be approved in club)
+app.get('/api/clubs/:id/eligibility', auth, async (req, res) => {
+  const r = await pool.query('SELECT status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [req.params.id, req.user.id]);
+  if (!r.rows.length) return res.json({ eligible: false, reason: 'Not a member' });
+  if (r.rows[0].status !== 'approved') return res.json({ eligible: false, reason: r.rows[0].status === 'pending' ? 'Pending approval' : 'Access denied' });
+  res.json({ eligible: true });
+});
+
 // Join club by code (player)
 app.post('/api/clubs/join', auth, async (req, res) => {
   const { code } = req.body;

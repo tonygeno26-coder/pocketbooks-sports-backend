@@ -26,6 +26,18 @@ async function initDB() {
     created_at TIMESTAMP DEFAULT NOW()
   );
 
+  CREATE TABLE IF NOT EXISTS player_limits (
+    id SERIAL PRIMARY KEY,
+    club_id INTEGER REFERENCES clubs(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    max_bet DECIMAL(10,2) DEFAULT 100,
+    max_daily_risk DECIMAL(10,2) DEFAULT 500,
+    max_payout DECIMAL(10,2) DEFAULT 2000,
+    allowed_sports TEXT[] DEFAULT ARRAY['MLB','NBA','NFL','NHL','SOCCER'],
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(club_id, user_id)
+  );
+
   CREATE TABLE IF NOT EXISTS club_memberships (
     id SERIAL PRIMARY KEY,
     club_id INTEGER REFERENCES clubs(id) ON DELETE CASCADE,
@@ -37,8 +49,10 @@ async function initDB() {
     total_bets INTEGER DEFAULT 0,
     wins INTEGER DEFAULT 0,
     losses INTEGER DEFAULT 0,
-    status VARCHAR(20) DEFAULT 'active',
+    role VARCHAR(20) DEFAULT 'player',
+    status VARCHAR(20) DEFAULT 'pending',
     joined_at TIMESTAMP DEFAULT NOW(),
+    approved_at TIMESTAMP,
     UNIQUE(club_id, player_id)
   );
 
