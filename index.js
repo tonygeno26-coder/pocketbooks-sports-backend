@@ -227,11 +227,14 @@ app.get('/api/diamonds', auth, async (req, res) => {
 // ===== START =====
 const PORT = process.env.PORT || 3001;
 (async () => {
+  // Start server first, then try DB
+  app.listen(PORT, () => console.log(`💎 Pocketbooks Sports Backend running on port ${PORT}`));
   try {
     await initDB();
-    app.listen(PORT, () => console.log(`💎 Pocketbooks Sports Backend running on port ${PORT}`));
+    console.log('✅ Ready!');
   } catch(e) {
-    console.error('Startup error:', e);
-    process.exit(1);
+    console.error('DB init error (server still running):', e.message);
+    console.error('DATABASE_URL set:', !!process.env.DATABASE_URL);
+    console.error('DATABASE_URL starts with:', process.env.DATABASE_URL?.slice(0,30));
   }
 })();
