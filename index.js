@@ -224,6 +224,83 @@ app.get('/api/diamonds', auth, async (req, res) => {
   res.json({ balance: user.rows[0].diamonds, transactions: txns.rows });
 });
 
+// ===== ODDS =====
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const https = require('https');
+
+function fetchOdds(sport) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=spreads,totals,h2h&oddsFormat=american&bookmakers=draftkings`;
+    https.get(url, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(d)); }
+        catch(e) { resolve([]); }
+      });
+    }).on('error', reject);
+  });
+}
+
+app.get('/api/odds/:sport', auth, async (req, res) => {
+  const sportMap = {
+    'nfl': 'americanfootball_nfl',
+    'nba': 'basketball_nba',
+    'mlb': 'baseball_mlb',
+    'nhl': 'icehockey_nhl',
+    'soccer': 'soccer_usa_mls',
+    'ncaaf': 'americanfootball_ncaaf',
+    'ufl': 'americanfootball_ufl',
+  };
+  const sport = sportMap[req.params.sport] || req.params.sport;
+  try {
+    const games = await fetchOdds(sport);
+    const formatted = games.slice(0, 20).map(g => {
+      const bm = g.bookmakers?.[0];
+      const spreads = bm?.markets?.find(m => m.key === 'spreads')?.outcomes || [];
+      const totals = bm?.markets?.find(m => m.key === 'totals')?.outcomes || [];
+      const h2h = bm?.markets?.find(m => m.key === 'h2h')?.outcomes || [];
+      return {
+        id: g.id,
+        sport: req.params.sport.toUpperCase(),
+        home: g.home_team,
+        away: g.away_team,
+        time: g.commence_time,
+        spreads: spreads.map(o => ({ team: o.name, line: o.point, odds: o.price })),
+        totals: totals.map(o => ({ name: o.name, line: o.point, odds: o.price })),
+        moneyline: h2h.map(o => ({ team: o.name, odds: o.price }))
+      };
+    });
+    res.json(formatted);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/odds', auth, async (req, res) => {
+  // Get games from all active sports
+  const sports = ['baseball_mlb', 'basketball_nba', 'icehockey_nhl', 'americanfootball_ufl'];
+  try {
+    const results = await Promise.all(sports.map(s => fetchOdds(s).catch(() => [])));
+    const all = results.flat().slice(0, 30).map(g => {
+      const bm = g.bookmakers?.[0];
+      const spreads = bm?.markets?.find(m => m.key === 'spreads')?.outcomes || [];
+      const totals = bm?.markets?.find(m => m.key === 'totals')?.outcomes || [];
+      const h2h = bm?.markets?.find(m => m.key === 'h2h')?.outcomes || [];
+      return {
+        id: g.id, sport: g.sport_title || g.sport_key,
+        home: g.home_team, away: g.away_team, time: g.commence_time,
+        spreads: spreads.map(o => ({ team: o.name, line: o.point, odds: o.price })),
+        totals: totals.map(o => ({ name: o.name, line: o.point, odds: o.price })),
+        moneyline: h2h.map(o => ({ team: o.name, odds: o.price }))
+      };
+    });
+    res.json(all);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ===== START =====
 const PORT = process.env.PORT || 3001;
 (async () => {
