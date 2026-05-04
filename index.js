@@ -36,9 +36,10 @@ app.post('/api/auth/signup', async (req, res) => {
   try {
     const hashed = await bcrypt.hash(password, 10);
     const startDiamonds = role === 'host' ? 500 : 0;
+    const assignedRole = (process.env.MASTER_ADMIN_EMAIL && email.toLowerCase() === process.env.MASTER_ADMIN_EMAIL.toLowerCase()) ? 'master_admin' : (role || 'user');
     const result = await pool.query(
       'INSERT INTO users (email, password, name, role, diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id, email, name, role, diamonds',
-      [email.toLowerCase(), hashed, name, role || 'host', startDiamonds]
+      [email.toLowerCase(), hashed, assignedRole, assignedRole, startDiamonds]
     );
     const user = result.rows[0];
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
@@ -432,6 +433,112 @@ app.get('/api/clubs/:id/bets', auth, async (req, res) => {
      WHERE b.club_id=$1 AND b.host_id=$2 ORDER BY b.created_at DESC LIMIT 50`,
     [req.params.id, req.user.id]
   );
+  res.json(r.rows);
+});
+
+
+// ===== MASTER ADMIN =====
+function adminAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const user = require('jsonwebtoken').verify(token, process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026');
+    if (user.role !== 'master_admin') return res.status(403).json({ error: 'Forbidden' });
+    req.user = user;
+    next();
+  } catch(e) { res.status(401).json({ error: 'Invalid token' }); }
+}
+
+// Admin overview stats
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  const [users, clubs, bets, members] = await Promise.all([
+    pool.query("SELECT COUNT(*) as total, COUNT(CASE WHEN role='master_admin' THEN 1 END) as admins, created_at::date as day FROM users GROUP BY created_at::date ORDER BY day DESC LIMIT 30"),
+    pool.query('SELECT COUNT(*) as total FROM clubs'),
+    pool.query('SELECT COUNT(*) as total, COALESCE(SUM(risk),0) as handle, COALESCE(SUM(CASE WHEN result='win' THEN win ELSE 0 END),0) as paid_out, COALESCE(SUM(CASE WHEN result='loss' THEN risk ELSE 0 END),0) as collected FROM bets'),
+    pool.query("SELECT COUNT(*) as total, COUNT(CASE WHEN status='approved' THEN 1 END) as approved, COUNT(CASE WHEN status='pending' THEN 1 END) as pending FROM club_memberships"),
+  ]);
+  const u = await pool.query('SELECT COUNT(*) as total FROM users');
+  const hosts = await pool.query("SELECT COUNT(DISTINCT host_id) as total FROM clubs");
+  const sharp = await pool.query(`SELECT u.name, u.email, m.wins, m.total_bets, c.name as club_name,
+    CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate
+    FROM club_memberships m JOIN users u ON m.player_id=u.id JOIN clubs c ON m.club_id=c.id
+    WHERE m.total_bets >= 5 AND m.total_bets > 0
+    ORDER BY win_rate DESC LIMIT 20`);
+  const b = bets.rows[0];
+  const profit = parseFloat(b.collected) - parseFloat(b.paid_out);
+  res.json({
+    users: parseInt(u.rows[0].total),
+    clubs: parseInt(clubs.rows[0].total),
+    active_hosts: parseInt(hosts.rows[0].total),
+    active_members: parseInt(members.rows[0].approved),
+    pending_requests: parseInt(members.rows[0].pending),
+    total_bets: parseInt(b.total),
+    handle: parseFloat(b.handle).toFixed(2),
+    profit: profit.toFixed(2),
+    sharp_players: sharp.rows,
+    user_signups: users.rows
+  });
+});
+
+// Admin: all users
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  const { search, role, limit=50, offset=0 } = req.query;
+  let q = 'SELECT id, name, email, role, diamonds, created_at FROM users WHERE 1=1';
+  const params = [];
+  if (search) { params.push('%'+search+'%'); q += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length})`; }
+  if (role) { params.push(role); q += ` AND role=$${params.length}`; }
+  q += ` ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
+  const r = await pool.query(q, params);
+  const count = await pool.query('SELECT COUNT(*) FROM users');
+  res.json({ users: r.rows, total: parseInt(count.rows[0].count) });
+});
+
+// Admin: update user role
+app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
+  const { role, diamonds } = req.body;
+  const r = await pool.query('UPDATE users SET role=COALESCE($1,role), diamonds=COALESCE($2,diamonds) WHERE id=$3 RETURNING id,name,email,role,diamonds', [role, diamonds, req.params.id]);
+  res.json(r.rows[0]);
+});
+
+// Admin: all clubs
+app.get('/api/admin/clubs', adminAuth, async (req, res) => {
+  const r = await pool.query(`SELECT c.*, u.name as host_name, u.email as host_email,
+    COUNT(DISTINCT m.id) as member_count,
+    COUNT(DISTINCT b.id) as bet_count,
+    COALESCE(SUM(b.risk),0) as handle
+    FROM clubs c JOIN users u ON c.host_id=u.id
+    LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved'
+    LEFT JOIN bets b ON b.club_id=c.id
+    GROUP BY c.id, u.name, u.email ORDER BY c.created_at DESC`);
+  res.json(r.rows);
+});
+
+// Admin: platform fees (host pays per active player per week)
+app.get('/api/admin/payments', adminAuth, async (req, res) => {
+  const r = await pool.query(`SELECT c.id as club_id, c.name as club_name, c.code,
+    u.name as host_name, u.email as host_email,
+    COUNT(m.id) as active_players,
+    COUNT(m.id) * 10 as weekly_fee_owed,
+    c.created_at
+    FROM clubs c JOIN users u ON c.host_id=u.id
+    LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved'
+    GROUP BY c.id, u.name, u.email ORDER BY weekly_fee_owed DESC`);
+  res.json(r.rows);
+});
+
+// Admin: flag/unflag user
+app.post('/api/admin/flags', adminAuth, async (req, res) => {
+  const { user_id, reason, action } = req.body;
+  if (action === 'ban') await pool.query("UPDATE users SET role='banned' WHERE id=$1", [user_id]);
+  if (action === 'unban') await pool.query("UPDATE users SET role='user' WHERE id=$1", [user_id]);
+  res.json({ success: true });
+});
+
+// Admin: global bet history
+app.get('/api/admin/bets', adminAuth, async (req, res) => {
+  const r = await pool.query(`SELECT b.*, u.name as player_name, c.name as club_name
+    FROM bets b LEFT JOIN users u ON b.player_id=u.id LEFT JOIN clubs c ON b.club_id=c.id
+    ORDER BY b.created_at DESC LIMIT 100`);
   res.json(r.rows);
 });
 
