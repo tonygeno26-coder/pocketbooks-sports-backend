@@ -6,7 +6,12 @@ const jwt = require('jsonwebtoken');
 const { pool, initDB } = require('./db');
 
 const app = express();
-app.use(cors());
+app.use(require('cors')({
+  origin: '*',
+  methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Api-Key']
+}));
+app.options('*', require('cors')());
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
