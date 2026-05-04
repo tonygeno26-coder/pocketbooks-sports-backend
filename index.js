@@ -3,45 +3,134 @@ const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { pool, initDB } = require('./db');
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
+
 app.use(cors());
 app.use(express.json());
 
-const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
+// ===== HEALTH (first route) =====
+app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+
+// ===== DB (lazy init - won't crash startup) =====
+let pool = null;
+function getPool() {
+  if (!pool) {
+    const { Pool } = require('pg');
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      connectionTimeoutMillis: 5000,
+    });
+    pool.on('error', err => console.error('DB pool error:', err.message));
+  }
+  return pool;
+}
+
+async function query(sql, params) {
+  return getPool().query(sql, params);
+}
+
+async function initDB() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email VARCHAR(255) UNIQUE NOT NULL,
+      password VARCHAR(255) NOT NULL,
+      name VARCHAR(255) NOT NULL,
+      role VARCHAR(20) NOT NULL DEFAULT 'user',
+      diamonds INTEGER NOT NULL DEFAULT 500,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS clubs (
+      id SERIAL PRIMARY KEY,
+      host_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      name VARCHAR(255) NOT NULL,
+      code VARCHAR(20) UNIQUE NOT NULL,
+      description VARCHAR(500),
+      max_bet DECIMAL(10,2) DEFAULT 500,
+      max_parlay DECIMAL(10,2) DEFAULT 1000,
+      is_active BOOLEAN DEFAULT true,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS club_memberships (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER REFERENCES clubs(id) ON DELETE CASCADE,
+      player_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      host_id INTEGER REFERENCES users(id),
+      balance DECIMAL(10,2) DEFAULT 0,
+      credit_limit DECIMAL(10,2) DEFAULT 500,
+      max_bet DECIMAL(10,2) DEFAULT 100,
+      total_bets INTEGER DEFAULT 0,
+      wins INTEGER DEFAULT 0,
+      losses INTEGER DEFAULT 0,
+      role VARCHAR(20) DEFAULT 'player',
+      status VARCHAR(20) DEFAULT 'pending',
+      joined_at TIMESTAMP DEFAULT NOW(),
+      approved_at TIMESTAMP,
+      UNIQUE(club_id, player_id)
+    );
+    CREATE TABLE IF NOT EXISTS player_limits (
+      id SERIAL PRIMARY KEY,
+      club_id INTEGER REFERENCES clubs(id) ON DELETE CASCADE,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      max_bet DECIMAL(10,2) DEFAULT 100,
+      max_daily_risk DECIMAL(10,2) DEFAULT 500,
+      max_payout DECIMAL(10,2) DEFAULT 2000,
+      updated_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(club_id, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS bets (
+      id SERIAL PRIMARY KEY,
+      host_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      club_id INTEGER REFERENCES clubs(id) ON DELETE SET NULL,
+      player_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      game VARCHAR(500) NOT NULL,
+      bet_type VARCHAR(50) NOT NULL,
+      sport VARCHAR(50) DEFAULT 'MLB',
+      risk DECIMAL(10,2) NOT NULL,
+      win DECIMAL(10,2) NOT NULL,
+      line VARCHAR(100),
+      result VARCHAR(20) DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      settled_at TIMESTAMP
+    );
+  `);
+}
 
 // ===== AUTH MIDDLEWARE =====
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
-  try {
-    req.user = jwt.verify(token, JWT_SECRET);
-    next();
-  } catch(e) {
-    res.status(401).json({ error: 'Invalid token' });
-  }
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch(e) { res.status(401).json({ error: 'Invalid token' }); }
 }
 
-// ===== HEALTH =====
-app.get('/health', (req, res) => res.json({ status: 'ok', service: 'Pocketbooks Sports' }));
+function adminAuth(req, res, next) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  try {
+    const user = jwt.verify(token, JWT_SECRET);
+    if (user.role !== 'master_admin') return res.status(403).json({ error: 'Forbidden' });
+    req.user = user;
+    next();
+  } catch(e) { res.status(401).json({ error: 'Invalid token' }); }
+}
 
-// ===== AUTH ROUTES =====
-
-// Sign Up
+// ===== AUTH =====
 app.post('/api/auth/signup', async (req, res) => {
   const { email, password, name, role } = req.body;
   if (!email || !password || !name) return res.status(400).json({ error: 'Missing fields' });
-  
   try {
     const hashed = await bcrypt.hash(password, 10);
-    const startDiamonds = role === 'host' ? 500 : 0;
-    const assignedRole = (process.env.MASTER_ADMIN_EMAIL && email.toLowerCase() === process.env.MASTER_ADMIN_EMAIL.toLowerCase()) ? 'master_admin' : (role || 'user');
-    const result = await pool.query(
-      'INSERT INTO users (email, password, name, role, diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id, email, name, role, diamonds',
-      [email.toLowerCase(), hashed, assignedRole, assignedRole, startDiamonds]
+    const assignedRole = (process.env.MASTER_ADMIN_EMAIL && email.toLowerCase() === process.env.MASTER_ADMIN_EMAIL.toLowerCase()) ? 'master_admin' : 'user';
+    const r = await query(
+      'INSERT INTO users (email,password,name,role,diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id,email,name,role,diamonds',
+      [email.toLowerCase(), hashed, name, assignedRole, 500]
     );
-    const user = result.rows[0];
+    const user = r.rows[0];
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, token, user });
   } catch(e) {
@@ -50,602 +139,263 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
-// Sign In
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   try {
-    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
-    const user = result.rows[0];
-    if (!user) return res.status(400).json({ error: 'Invalid email or password' });
-    
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.status(400).json({ error: 'Invalid email or password' });
-    
+    const r = await query('SELECT * FROM users WHERE email=$1', [email.toLowerCase()]);
+    const user = r.rows[0];
+    if (!user) return res.status(400).json({ error: 'Invalid credentials' });
+    if (!await bcrypt.compare(password, user.password)) return res.status(400).json({ error: 'Invalid credentials' });
     const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ success: true, token, user: { id: user.id, email: user.email, name: user.name, role: user.role, diamonds: user.diamonds } });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get current user
 app.get('/api/auth/me', auth, async (req, res) => {
-  const result = await pool.query('SELECT id, email, name, role, diamonds, created_at FROM users WHERE id = $1', [req.user.id]);
-  res.json(result.rows[0]);
-});
-
-// ===== PLAYERS =====
-
-// Get all players for host
-app.get('/api/players', auth, async (req, res) => {
-  const result = await pool.query(
-    `SELECT p.*, 
-      CASE WHEN p.total_bets > 0 THEN ROUND((p.wins::float/p.total_bets*100)::numeric,1) ELSE 0 END as win_rate
-     FROM players p WHERE p.host_id = $1 ORDER BY p.created_at DESC`,
-    [req.user.id]
-  );
-  res.json(result.rows);
-});
-
-// Add player
-app.post('/api/players', auth, async (req, res) => {
-  const { name, phone, credit_limit, max_bet } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  const result = await pool.query(
-    'INSERT INTO players (host_id, name, phone, credit_limit, max_bet) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-    [req.user.id, name.toUpperCase(), phone || '', credit_limit || 500, max_bet || 100]
-  );
-  res.json(result.rows[0]);
-});
-
-// Update player
-app.patch('/api/players/:id', auth, async (req, res) => {
-  const { credit_limit, max_bet, telegram_chat_id } = req.body;
-  const result = await pool.query(
-    'UPDATE players SET credit_limit=$1, max_bet=$2, telegram_chat_id=$3 WHERE id=$4 AND host_id=$5 RETURNING *',
-    [credit_limit, max_bet, telegram_chat_id, req.params.id, req.user.id]
-  );
-  res.json(result.rows[0]);
-});
-
-// Delete player
-app.delete('/api/players/:id', auth, async (req, res) => {
-  await pool.query('DELETE FROM players WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
-  res.json({ success: true });
-});
-
-// ===== BETS =====
-
-// Get all bets for host
-app.get('/api/bets', auth, async (req, res) => {
-  const { player_id, result: betResult, sport, limit = 50 } = req.query;
-  let q = 'SELECT b.*, p.name as player_name FROM bets b JOIN players p ON b.player_id = p.id WHERE b.host_id = $1';
-  const params = [req.user.id];
-  if (player_id) { params.push(player_id); q += ` AND b.player_id = $${params.length}`; }
-  if (betResult) { params.push(betResult); q += ` AND b.result = $${params.length}`; }
-  if (sport) { params.push(sport); q += ` AND b.sport = $${params.length}`; }
-  q += ` ORDER BY b.created_at DESC LIMIT ${parseInt(limit)}`;
-  const result = await pool.query(q, params);
-  res.json(result.rows);
-});
-
-// Log bet
-app.post('/api/bets', auth, async (req, res) => {
-  const { player_id, game, bet_type, sport, risk, win, line, result: betResult } = req.body;
-  if (!player_id || !game || !risk) return res.status(400).json({ error: 'Missing fields' });
-
-  const betRes = await pool.query(
-    'INSERT INTO bets (host_id, player_id, game, bet_type, sport, risk, win, line, result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-    [req.user.id, player_id, game, bet_type || 'Spread', sport || 'NFL', risk, win || risk * 0.909, line || '', betResult || 'pending']
-  );
-  const bet = betRes.rows[0];
-
-  // Update player stats if result is set
-  if (betResult && betResult !== 'pending') {
-    await settleBet(bet.id, player_id, betResult, risk, win || risk * 0.909);
-  }
-
-  res.json(bet);
-});
-
-// Settle bet
-app.patch('/api/bets/:id/settle', auth, async (req, res) => {
-  const { result: betResult } = req.body;
-  const betRes = await pool.query('SELECT * FROM bets WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
-  const bet = betRes.rows[0];
-  if (!bet) return res.status(404).json({ error: 'Bet not found' });
-
-  await settleBet(bet.id, bet.player_id, betResult, bet.risk, bet.win);
-  const updated = await pool.query('SELECT b.*, p.name as player_name FROM bets b JOIN players p ON b.player_id=p.id WHERE b.id=$1', [bet.id]);
-  res.json(updated.rows[0]);
-});
-
-async function settleBet(betId, playerId, result, risk, win) {
-  let balanceChange = 0;
-  if (result === 'win') balanceChange = parseFloat(win);
-  else if (result === 'loss') balanceChange = -parseFloat(risk);
-
-  await pool.query('UPDATE bets SET result=$1, settled_at=NOW() WHERE id=$2', [result, betId]);
-  await pool.query(
-    `UPDATE players SET 
-      balance = balance + $1,
-      total_bets = total_bets + 1,
-      wins = wins + $2,
-      losses = losses + $3
-     WHERE id = $4`,
-    [balanceChange, result === 'win' ? 1 : 0, result === 'loss' ? 1 : 0, playerId]
-  );
-}
-
-// ===== STATS =====
-app.get('/api/stats/weekly', auth, async (req, res) => {
-  const result = await pool.query(`
-    SELECT 
-      COUNT(*) as total_bets,
-      SUM(risk) as handle,
-      SUM(CASE WHEN result='loss' THEN risk ELSE 0 END) - SUM(CASE WHEN result='win' THEN win ELSE 0 END) as profit,
-      COUNT(CASE WHEN result='win' THEN 1 END) as wins,
-      COUNT(CASE WHEN result='loss' THEN 1 END) as losses,
-      COUNT(CASE WHEN result='pending' THEN 1 END) as pending
-    FROM bets 
-    WHERE host_id=$1 AND created_at >= NOW() - INTERVAL '7 days'
-  `, [req.user.id]);
-  
-  const stats = result.rows[0];
-  const handle = parseFloat(stats.handle) || 0;
-  const profit = parseFloat(stats.profit) || 0;
-  const holdPct = handle > 0 ? ((profit / handle) * 100).toFixed(1) : 0;
-  
-  res.json({ ...stats, hold_pct: holdPct });
-});
-
-// Sharp detection
-app.get('/api/stats/sharp', auth, async (req, res) => {
-  const result = await pool.query(`
-    SELECT 
-      p.id, p.name, p.total_bets, p.wins, p.losses, p.balance,
-      CASE WHEN p.total_bets > 0 THEN ROUND((p.wins::float/p.total_bets*100)::numeric,1) ELSE 0 END as win_rate
-    FROM players p
-    WHERE p.host_id = $1 AND p.total_bets >= 10
-    ORDER BY win_rate DESC
-  `, [req.user.id]);
-  
-  const players = result.rows.map(p => ({
-    ...p,
-    sharp_status: p.win_rate >= 60 ? 'sharp' : p.win_rate >= 52 ? 'watch' : 'square'
-  }));
-  
-  res.json(players);
-});
-
-// ===== DIAMONDS =====
-app.get('/api/diamonds', auth, async (req, res) => {
-  const user = await pool.query('SELECT diamonds FROM users WHERE id=$1', [req.user.id]);
-  const txns = await pool.query('SELECT * FROM diamond_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20', [req.user.id]);
-  res.json({ balance: user.rows[0].diamonds, transactions: txns.rows });
+  try {
+    const r = await query('SELECT id,email,name,role,diamonds,created_at FROM users WHERE id=$1', [req.user.id]);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ===== CLUBS =====
+function genCode() { return Math.random().toString(36).substring(2,8).toUpperCase(); }
 
-function genCode() {
-  return Math.random().toString(36).substring(2,8).toUpperCase();
-}
-
-// Create club
 app.post('/api/clubs', auth, async (req, res) => {
   const { name, description, max_bet, max_parlay } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
-  let code, attempts = 0;
-  while (attempts < 10) {
-    code = genCode();
-    const exists = await pool.query('SELECT id FROM clubs WHERE code=$1', [code]);
-    if (!exists.rows.length) break;
-    attempts++;
-  }
-  const r = await pool.query(
-    'INSERT INTO clubs (host_id,name,code,description,max_bet,max_parlay) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
-    [req.user.id, name, code, description||'', max_bet||500, max_parlay||1000]
-  );
-  res.json(r.rows[0]);
+  let code = genCode();
+  try {
+    const r = await query('INSERT INTO clubs (host_id,name,code,description,max_bet,max_parlay) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *',
+      [req.user.id, name, code, description||'', max_bet||500, max_parlay||1000]);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get host's clubs
 app.get('/api/clubs', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT c.*, COUNT(m.id) as member_count 
-     FROM clubs c LEFT JOIN club_memberships m ON c.id=m.club_id 
-     WHERE c.host_id=$1 GROUP BY c.id ORDER BY c.created_at DESC`,
-    [req.user.id]
-  );
-  res.json(r.rows);
+  try {
+    const r = await query(`SELECT c.*,COUNT(m.id) as member_count FROM clubs c LEFT JOIN club_memberships m ON c.id=m.club_id WHERE c.host_id=$1 GROUP BY c.id ORDER BY c.created_at DESC`, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Get single club
-app.get('/api/clubs/:id', auth, async (req, res) => {
-  const r = await pool.query('SELECT * FROM clubs WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
-  if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
-  res.json(r.rows[0]);
+app.get('/api/clubs/search/:code', async (req, res) => {
+  try {
+    const r = await query('SELECT id,name,code,description FROM clubs WHERE code=$1 AND is_active=true', [req.params.code.toUpperCase()]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Update club
-app.patch('/api/clubs/:id', auth, async (req, res) => {
-  const { name, description, max_bet, max_parlay, is_active } = req.body;
-  const r = await pool.query(
-    'UPDATE clubs SET name=COALESCE($1,name),description=COALESCE($2,description),max_bet=COALESCE($3,max_bet),max_parlay=COALESCE($4,max_parlay),is_active=COALESCE($5,is_active) WHERE id=$6 AND host_id=$7 RETURNING *',
-    [name, description, max_bet, max_parlay, is_active, req.params.id, req.user.id]
-  );
-  res.json(r.rows[0]);
-});
-
-// Delete club
-app.delete('/api/clubs/:id', auth, async (req, res) => {
-  await pool.query('DELETE FROM clubs WHERE id=$1 AND host_id=$2', [req.params.id, req.user.id]);
-  res.json({ success: true });
-});
-
-// Get club members
-app.get('/api/clubs/:id/members', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT m.*, u.name, u.email,
-      CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate
-     FROM club_memberships m JOIN users u ON m.player_id=u.id 
-     WHERE m.club_id=$1 AND m.host_id=$2 ORDER BY m.joined_at DESC`,
-    [req.params.id, req.user.id]
-  );
-  res.json(r.rows);
-});
-
-// Add player to club (by host)
-app.post('/api/clubs/:id/members', auth, async (req, res) => {
-  const { name, phone, credit_limit, max_bet } = req.body;
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  // Create user account if doesn't exist
-  let playerRes = await pool.query('SELECT id FROM users WHERE email=$1', [phone?.toLowerCase() || name.toLowerCase()+'@club.pb']);
-  let playerId;
-  if (!playerRes.rows.length) {
-    const pw = await require('bcryptjs').hash('pb-player-'+Date.now(), 8);
-    const newUser = await pool.query(
-      'INSERT INTO users (email,password,name,role,diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id',
-      [(phone?.toLowerCase()||name.toLowerCase()+'@club.pb'), pw, name.toUpperCase(), 'player', 0]
-    );
-    playerId = newUser.rows[0].id;
-  } else {
-    playerId = playerRes.rows[0].id;
-  }
-  const existing = await pool.query('SELECT id FROM club_memberships WHERE club_id=$1 AND player_id=$2', [req.params.id, playerId]);
-  if (existing.rows.length) return res.status(400).json({ error: 'Player already in club' });
-  const r = await pool.query(
-    'INSERT INTO club_memberships (club_id,player_id,host_id,credit_limit,max_bet) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-    [req.params.id, playerId, req.user.id, credit_limit||500, max_bet||100]
-  );
-  res.json({ ...r.rows[0], name: name.toUpperCase() });
-});
-
-// Remove member
-app.delete('/api/clubs/:id/members/:memberId', auth, async (req, res) => {
-  await pool.query('DELETE FROM club_memberships WHERE id=$1 AND host_id=$2', [req.params.memberId, req.user.id]);
-  res.json({ success: true });
-});
-
-
-// Join request (player requests to join by code)
 app.post('/api/clubs/request', auth, async (req, res) => {
   const { code } = req.body;
-  const club = await pool.query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
-  if (!club.rows.length) return res.status(404).json({ error: 'Club not found' });
-  const c = club.rows[0];
-  const exists = await pool.query('SELECT id,status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
-  if (exists.rows.length) return res.status(400).json({ error: 'Already a member or request pending', status: exists.rows[0].status });
-  await pool.query('INSERT INTO club_memberships (club_id,player_id,host_id,status,role) VALUES ($1,$2,$3,$4,$5)',
-    [c.id, req.user.id, c.host_id, 'pending', 'player']);
-  res.json({ success: true, club: { id: c.id, name: c.name, code: c.code } });
-});
-
-// Get pending join requests for host
-app.get('/api/clubs/:id/requests', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT m.*, u.name, u.email FROM club_memberships m JOIN users u ON m.player_id=u.id
-     WHERE m.club_id=$1 AND m.host_id=$2 AND m.status='pending' ORDER BY m.joined_at DESC`,
-    [req.params.id, req.user.id]);
-  res.json(r.rows);
-});
-
-// Approve/reject request
-app.patch('/api/clubs/:id/requests/:memberId', auth, async (req, res) => {
-  const { action } = req.body; // 'approve' or 'reject'
-  const status = action === 'approve' ? 'approved' : 'rejected';
-  const r = await pool.query(
-    `UPDATE club_memberships SET status=$1, approved_at=${action==='approve'?'NOW()':'NULL'}
-     WHERE id=$2 AND host_id=$3 RETURNING *`,
-    [status, req.params.memberId, req.user.id]);
-  if (action === 'approve') {
-    const m = r.rows[0];
-    await pool.query(
-      'INSERT INTO player_limits (club_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING',
-      [req.params.id, m.player_id]);
-  }
-  res.json(r.rows[0]);
-});
-
-// Get/set player limits per club
-app.get('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
-  const r = await pool.query('SELECT * FROM player_limits WHERE club_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
-  res.json(r.rows[0] || {});
-});
-
-app.put('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
-  const { max_bet, max_daily_risk, max_payout, allowed_sports } = req.body;
-  const r = await pool.query(
-    `INSERT INTO player_limits (club_id,user_id,max_bet,max_daily_risk,max_payout,allowed_sports,updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,NOW())
-     ON CONFLICT (club_id,user_id) DO UPDATE SET max_bet=$3,max_daily_risk=$4,max_payout=$5,allowed_sports=$6,updated_at=NOW()
-     RETURNING *`,
-    [req.params.id, req.params.userId, max_bet||100, max_daily_risk||500, max_payout||2000, allowed_sports||['MLB','NBA','NFL','NHL']]);
-  res.json(r.rows[0]);
-});
-
-// Search club by code (public)
-app.get('/api/clubs/search/:code', async (req, res) => {
-  const r = await pool.query('SELECT id,name,code,description FROM clubs WHERE code=$1 AND is_active=true', [req.params.code.toUpperCase()]);
-  if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
-  res.json(r.rows[0]);
-});
-
-// Check bet eligibility (player must be approved in club)
-app.get('/api/clubs/:id/eligibility', auth, async (req, res) => {
-  const r = await pool.query('SELECT status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [req.params.id, req.user.id]);
-  if (!r.rows.length) return res.json({ eligible: false, reason: 'Not a member' });
-  if (r.rows[0].status !== 'approved') return res.json({ eligible: false, reason: r.rows[0].status === 'pending' ? 'Pending approval' : 'Access denied' });
-  res.json({ eligible: true });
-});
-
-// Join club by code (player)
-app.post('/api/clubs/join', auth, async (req, res) => {
-  const { code } = req.body;
-  const club = await pool.query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
-  if (!club.rows.length) return res.status(404).json({ error: 'Club not found or inactive' });
-  const c = club.rows[0];
-  const exists = await pool.query('SELECT id FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
-  if (exists.rows.length) return res.status(400).json({ error: 'Already a member' });
-  await pool.query(
-    'INSERT INTO club_memberships (club_id,player_id,host_id) VALUES ($1,$2,$3)',
-    [c.id, req.user.id, c.host_id]
-  );
-  res.json({ success: true, club: c });
-});
-
-// Get player's clubs
-app.get('/api/my-clubs', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT c.*, m.balance, m.credit_limit, m.max_bet, m.total_bets, m.wins, m.losses, m.id as membership_id
-     FROM club_memberships m JOIN clubs c ON m.club_id=c.id 
-     WHERE m.player_id=$1 ORDER BY m.joined_at DESC`,
-    [req.user.id]
-  );
-  res.json(r.rows);
-});
-
-// Get club bets
-app.get('/api/clubs/:id/bets', auth, async (req, res) => {
-  const r = await pool.query(
-    `SELECT b.*, u.name as player_name FROM bets b 
-     LEFT JOIN users u ON b.player_id=u.id
-     WHERE b.club_id=$1 AND b.host_id=$2 ORDER BY b.created_at DESC LIMIT 50`,
-    [req.params.id, req.user.id]
-  );
-  res.json(r.rows);
-});
-
-
-// ===== MASTER ADMIN =====
-function adminAuth(req, res, next) {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: 'Unauthorized' });
   try {
-    const user = require('jsonwebtoken').verify(token, process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026');
-    if (user.role !== 'master_admin') return res.status(403).json({ error: 'Forbidden' });
-    req.user = user;
-    next();
-  } catch(e) { res.status(401).json({ error: 'Invalid token' }); }
-}
-
-// Admin overview stats
-app.get('/api/admin/stats', adminAuth, async (req, res) => {
-  const [users, clubs, bets, members] = await Promise.all([
-    pool.query("SELECT COUNT(*) as total, COUNT(CASE WHEN role='master_admin' THEN 1 END) as admins, created_at::date as day FROM users GROUP BY created_at::date ORDER BY day DESC LIMIT 30"),
-    pool.query('SELECT COUNT(*) as total FROM clubs'),
-    pool.query('SELECT COUNT(*) as total, COALESCE(SUM(risk),0) as handle, COALESCE(SUM(CASE WHEN result='win' THEN win ELSE 0 END),0) as paid_out, COALESCE(SUM(CASE WHEN result='loss' THEN risk ELSE 0 END),0) as collected FROM bets'),
-    pool.query("SELECT COUNT(*) as total, COUNT(CASE WHEN status='approved' THEN 1 END) as approved, COUNT(CASE WHEN status='pending' THEN 1 END) as pending FROM club_memberships"),
-  ]);
-  const u = await pool.query('SELECT COUNT(*) as total FROM users');
-  const hosts = await pool.query("SELECT COUNT(DISTINCT host_id) as total FROM clubs");
-  const sharp = await pool.query(`SELECT u.name, u.email, m.wins, m.total_bets, c.name as club_name,
-    CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate
-    FROM club_memberships m JOIN users u ON m.player_id=u.id JOIN clubs c ON m.club_id=c.id
-    WHERE m.total_bets >= 5 AND m.total_bets > 0
-    ORDER BY win_rate DESC LIMIT 20`);
-  const b = bets.rows[0];
-  const profit = parseFloat(b.collected) - parseFloat(b.paid_out);
-  res.json({
-    users: parseInt(u.rows[0].total),
-    clubs: parseInt(clubs.rows[0].total),
-    active_hosts: parseInt(hosts.rows[0].total),
-    active_members: parseInt(members.rows[0].approved),
-    pending_requests: parseInt(members.rows[0].pending),
-    total_bets: parseInt(b.total),
-    handle: parseFloat(b.handle).toFixed(2),
-    profit: profit.toFixed(2),
-    sharp_players: sharp.rows,
-    user_signups: users.rows
-  });
+    const club = await query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
+    if (!club.rows.length) return res.status(404).json({ error: 'Club not found' });
+    const c = club.rows[0];
+    const exists = await query('SELECT id,status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
+    if (exists.rows.length) return res.status(400).json({ error: 'Already a member', status: exists.rows[0].status });
+    await query('INSERT INTO club_memberships (club_id,player_id,host_id,status,role) VALUES ($1,$2,$3,$4,$5)', [c.id, req.user.id, c.host_id, 'pending', 'player']);
+    res.json({ success: true, club: { id: c.id, name: c.name, code: c.code } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: all users
-app.get('/api/admin/users', adminAuth, async (req, res) => {
-  const { search, role, limit=50, offset=0 } = req.query;
-  let q = 'SELECT id, name, email, role, diamonds, created_at FROM users WHERE 1=1';
-  const params = [];
-  if (search) { params.push('%'+search+'%'); q += ` AND (name ILIKE $${params.length} OR email ILIKE $${params.length})`; }
-  if (role) { params.push(role); q += ` AND role=$${params.length}`; }
-  q += ` ORDER BY created_at DESC LIMIT ${limit} OFFSET ${offset}`;
-  const r = await pool.query(q, params);
-  const count = await pool.query('SELECT COUNT(*) FROM users');
-  res.json({ users: r.rows, total: parseInt(count.rows[0].count) });
+app.get('/api/clubs/:id/members', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT m.*,u.name,u.email,CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate FROM club_memberships m JOIN users u ON m.player_id=u.id WHERE m.club_id=$1 AND m.host_id=$2 ORDER BY m.joined_at DESC`, [req.params.id, req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: update user role
-app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
-  const { role, diamonds } = req.body;
-  const r = await pool.query('UPDATE users SET role=COALESCE($1,role), diamonds=COALESCE($2,diamonds) WHERE id=$3 RETURNING id,name,email,role,diamonds', [role, diamonds, req.params.id]);
-  res.json(r.rows[0]);
+app.get('/api/clubs/:id/requests', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT m.*,u.name,u.email FROM club_memberships m JOIN users u ON m.player_id=u.id WHERE m.club_id=$1 AND m.host_id=$2 AND m.status='pending' ORDER BY m.joined_at DESC`, [req.params.id, req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: all clubs
-app.get('/api/admin/clubs', adminAuth, async (req, res) => {
-  const r = await pool.query(`SELECT c.*, u.name as host_name, u.email as host_email,
-    COUNT(DISTINCT m.id) as member_count,
-    COUNT(DISTINCT b.id) as bet_count,
-    COALESCE(SUM(b.risk),0) as handle
-    FROM clubs c JOIN users u ON c.host_id=u.id
-    LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved'
-    LEFT JOIN bets b ON b.club_id=c.id
-    GROUP BY c.id, u.name, u.email ORDER BY c.created_at DESC`);
-  res.json(r.rows);
+app.patch('/api/clubs/:id/requests/:memberId', auth, async (req, res) => {
+  const { action } = req.body;
+  const status = action === 'approve' ? 'approved' : 'rejected';
+  try {
+    const r = await query(`UPDATE club_memberships SET status=$1,approved_at=${action==='approve'?'NOW()':'NULL'} WHERE id=$2 AND host_id=$3 RETURNING *`, [status, req.params.memberId, req.user.id]);
+    if (action === 'approve' && r.rows[0]) await query('INSERT INTO player_limits (club_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.params.id, r.rows[0].player_id]);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: platform fees (host pays per active player per week)
-app.get('/api/admin/payments', adminAuth, async (req, res) => {
-  const r = await pool.query(`SELECT c.id as club_id, c.name as club_name, c.code,
-    u.name as host_name, u.email as host_email,
-    COUNT(m.id) as active_players,
-    COUNT(m.id) * 10 as weekly_fee_owed,
-    c.created_at
-    FROM clubs c JOIN users u ON c.host_id=u.id
-    LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved'
-    GROUP BY c.id, u.name, u.email ORDER BY weekly_fee_owed DESC`);
-  res.json(r.rows);
+app.get('/api/my-clubs', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT c.*,m.balance,m.credit_limit,m.max_bet,m.total_bets,m.wins,m.losses,m.role,m.status,m.id as membership_id FROM club_memberships m JOIN clubs c ON m.club_id=c.id WHERE m.player_id=$1 ORDER BY m.joined_at DESC`, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: flag/unflag user
-app.post('/api/admin/flags', adminAuth, async (req, res) => {
-  const { user_id, reason, action } = req.body;
-  if (action === 'ban') await pool.query("UPDATE users SET role='banned' WHERE id=$1", [user_id]);
-  if (action === 'unban') await pool.query("UPDATE users SET role='user' WHERE id=$1", [user_id]);
-  res.json({ success: true });
+// ===== BETS =====
+app.get('/api/bets', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT b.*,u.name as player_name FROM bets b LEFT JOIN users u ON b.player_id=u.id WHERE b.host_id=$1 ORDER BY b.created_at DESC LIMIT 50`, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Admin: global bet history
-app.get('/api/admin/bets', adminAuth, async (req, res) => {
-  const r = await pool.query(`SELECT b.*, u.name as player_name, c.name as club_name
-    FROM bets b LEFT JOIN users u ON b.player_id=u.id LEFT JOIN clubs c ON b.club_id=c.id
-    ORDER BY b.created_at DESC LIMIT 100`);
-  res.json(r.rows);
+app.post('/api/bets', auth, async (req, res) => {
+  const { player_id, game, bet_type, sport, risk, win, line, result, club_id } = req.body;
+  if (!game || !risk) return res.status(400).json({ error: 'Missing fields' });
+  try {
+    const r = await query('INSERT INTO bets (host_id,club_id,player_id,game,bet_type,sport,risk,win,line,result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+      [req.user.id, club_id||null, player_id||null, game, bet_type||'Straight', sport||'MLB', risk, win||Math.round(risk*0.909), line||'', result||'pending']);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== ODDS =====
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
+// ===== PLAYERS (legacy) =====
+app.get('/api/players', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT m.*,u.name,u.email,CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate FROM club_memberships m JOIN users u ON m.player_id=u.id WHERE m.host_id=$1 ORDER BY m.joined_at DESC`, [req.user.id]);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/stats/weekly', auth, async (req, res) => {
+  try {
+    const r = await query(`SELECT COUNT(*) as total_bets,COALESCE(SUM(risk),0) as handle,COALESCE(SUM(CASE WHEN result='loss' THEN risk ELSE 0 END),0)-COALESCE(SUM(CASE WHEN result='win' THEN win ELSE 0 END),0) as profit,COUNT(CASE WHEN result='pending' THEN 1 END) as pending FROM bets WHERE host_id=$1 AND created_at>=NOW()-INTERVAL '7 days'`, [req.user.id]);
+    const s = r.rows[0];
+    const handle = parseFloat(s.handle)||0;
+    const profit = parseFloat(s.profit)||0;
+    res.json({ ...s, hold_pct: handle>0?((profit/handle)*100).toFixed(1):0 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== ODDS (public, no auth) =====
+const ODDS_KEY = process.env.ODDS_API_KEY;
 const https = require('https');
 
 function fetchOdds(sport) {
-  return new Promise((resolve, reject) => {
-    const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=spreads,totals,h2h&oddsFormat=american&bookmakers=draftkings`;
-    https.get(url, res => {
+  return new Promise((resolve) => {
+    if (!ODDS_KEY) { console.warn('ODDS_API_KEY not set'); return resolve([]); }
+    const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_KEY}&regions=us&markets=spreads,totals,h2h&oddsFormat=american&bookmakers=draftkings`;
+    const req = https.get(url, (res) => {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(d)); }
-        catch(e) { resolve([]); }
+        try { resolve(JSON.parse(d)); } catch(e) { console.error('Odds parse error:', e.message); resolve([]); }
       });
-    }).on('error', reject);
+    });
+    req.on('error', e => { console.error('Odds fetch error:', e.message); resolve([]); });
+    req.setTimeout(8000, () => { req.destroy(); resolve([]); });
   });
 }
 
 app.get('/api/odds/:sport', async (req, res) => {
-  const sportMap = {
-    'nfl': 'americanfootball_nfl',
-    'nba': 'basketball_nba',
-    'mlb': 'baseball_mlb',
-    'nhl': 'icehockey_nhl',
-    'soccer': 'soccer_usa_mls',
-    'ncaaf': 'americanfootball_ncaaf',
-    'ufl': 'americanfootball_ufl',
-  };
+  const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
   try {
-    let games;
-    try {
-      games = await fetchOdds(sport);
-    } catch(fetchErr) {
-      console.error('Odds fetch error:', fetchErr.message);
-      return res.json([]);
-    }
-    if (!Array.isArray(games)) { console.error('Odds not array:', typeof games); return res.json([]); }
-    const formatted = games.slice(0, 20).map(g => {
-      const bm = g.bookmakers?.[0];
-      const spreads = bm?.markets?.find(m => m.key === 'spreads')?.outcomes || [];
-      const totals = bm?.markets?.find(m => m.key === 'totals')?.outcomes || [];
-      const h2h = bm?.markets?.find(m => m.key === 'h2h')?.outcomes || [];
-      return {
-        id: g.id,
-        sport: req.params.sport.toUpperCase(),
-        home: g.home_team,
-        away: g.away_team,
-        time: g.commence_time,
-        spreads: spreads.map(o => ({ team: o.name, line: o.point, odds: o.price })),
-        totals: totals.map(o => ({ name: o.name, line: o.point, odds: o.price })),
-        moneyline: h2h.map(o => ({ team: o.name, odds: o.price }))
-      };
-    });
+    const games = await fetchOdds(sport);
+    const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => ({
+      id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
+      home: g.home_team, away: g.away_team, time: g.commence_time,
+      spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>({team:o.name,line:o.point,odds:o.price})),
+      totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>({name:o.name,line:o.point,odds:o.price})),
+      moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>({team:o.name,odds:o.price}))
+    }));
     res.json(formatted);
-  } catch(e) {
-    console.error('Odds endpoint error:', e.message);
-    res.json([]);
-  }
+  } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
 });
 
 app.get('/api/odds', async (req, res) => {
-  // Get games from all active sports
-  const sports = ['baseball_mlb', 'basketball_nba', 'icehockey_nhl', 'americanfootball_ufl'];
+  const sports = ['baseball_mlb','basketball_nba','icehockey_nhl','americanfootball_ufl'];
   try {
-    const results = await Promise.all(sports.map(s => fetchOdds(s).catch(() => [])));
-    const all = results.flat().slice(0, 30).map(g => {
-      const bm = g.bookmakers?.[0];
-      const spreads = bm?.markets?.find(m => m.key === 'spreads')?.outcomes || [];
-      const totals = bm?.markets?.find(m => m.key === 'totals')?.outcomes || [];
-      const h2h = bm?.markets?.find(m => m.key === 'h2h')?.outcomes || [];
-      return {
-        id: g.id, sport: g.sport_title || g.sport_key,
-        home: g.home_team, away: g.away_team, time: g.commence_time,
-        spreads: spreads.map(o => ({ team: o.name, line: o.point, odds: o.price })),
-        totals: totals.map(o => ({ name: o.name, line: o.point, odds: o.price })),
-        moneyline: h2h.map(o => ({ team: o.name, odds: o.price }))
-      };
-    });
+    const results = await Promise.all(sports.map(s => fetchOdds(s).catch(()=>[])));
+    const all = results.flat().slice(0,30).map(g => ({
+      id: g.id, sport: g.sport_title||'',
+      home: g.home_team, away: g.away_team, time: g.commence_time,
+      spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>({team:o.name,line:o.point,odds:o.price})),
+      totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>({name:o.name,line:o.point,odds:o.price})),
+      moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>({team:o.name,odds:o.price}))
+    }));
     res.json(all);
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+  } catch(e) { res.json([]); }
+});
+
+// ===== ADMIN =====
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+  try {
+    const [u,c,b,m,h,sh] = await Promise.all([
+      query('SELECT COUNT(*) as total FROM users'),
+      query('SELECT COUNT(*) as total FROM clubs'),
+      query("SELECT COUNT(*) as total,COALESCE(SUM(risk),0) as handle,COALESCE(SUM(CASE WHEN result='loss' THEN risk ELSE 0 END),0) as collected,COALESCE(SUM(CASE WHEN result='win' THEN win ELSE 0 END),0) as paid_out FROM bets"),
+      query("SELECT COUNT(CASE WHEN status='approved' THEN 1 END) as approved,COUNT(CASE WHEN status='pending' THEN 1 END) as pending FROM club_memberships"),
+      query('SELECT COUNT(DISTINCT host_id) as total FROM clubs'),
+      query(`SELECT u.name,u.email,m.wins,m.total_bets,c.name as club_name,CASE WHEN m.total_bets>0 THEN ROUND((m.wins::float/m.total_bets*100)::numeric,1) ELSE 0 END as win_rate FROM club_memberships m JOIN users u ON m.player_id=u.id JOIN clubs c ON m.club_id=c.id WHERE m.total_bets>=5 ORDER BY win_rate DESC LIMIT 20`)
+    ]);
+    const bets = b.rows[0];
+    const profit = parseFloat(bets.collected)-parseFloat(bets.paid_out);
+    res.json({ users:parseInt(u.rows[0].total), clubs:parseInt(c.rows[0].total), active_hosts:parseInt(h.rows[0].total), active_members:parseInt(m.rows[0].approved), pending_requests:parseInt(m.rows[0].pending), total_bets:parseInt(bets.total), handle:parseFloat(bets.handle).toFixed(2), profit:profit.toFixed(2), sharp_players:sh.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/users', adminAuth, async (req, res) => {
+  try {
+    const r = await query('SELECT id,email,name,role,diamonds,created_at FROM users ORDER BY created_at DESC LIMIT 100');
+    res.json({ users: r.rows, total: r.rows.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/admin/users/:id', adminAuth, async (req, res) => {
+  const { role, diamonds } = req.body;
+  try {
+    const r = await query('UPDATE users SET role=COALESCE($1,role),diamonds=COALESCE($2,diamonds) WHERE id=$3 RETURNING id,name,email,role,diamonds', [role, diamonds, req.params.id]);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/clubs', adminAuth, async (req, res) => {
+  try {
+    const r = await query(`SELECT c.*,u.name as host_name,u.email as host_email,COUNT(DISTINCT m.id) as member_count,COUNT(DISTINCT b.id) as bet_count,COALESCE(SUM(b.risk),0) as handle FROM clubs c JOIN users u ON c.host_id=u.id LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved' LEFT JOIN bets b ON b.club_id=c.id GROUP BY c.id,u.name,u.email ORDER BY c.created_at DESC`);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/payments', adminAuth, async (req, res) => {
+  try {
+    const r = await query(`SELECT c.id as club_id,c.name as club_name,c.code,u.name as host_name,u.email as host_email,COUNT(m.id) as active_players,COUNT(m.id)*10 as weekly_fee_owed FROM clubs c JOIN users u ON c.host_id=u.id LEFT JOIN club_memberships m ON c.id=m.club_id AND m.status='approved' GROUP BY c.id,u.name,u.email ORDER BY weekly_fee_owed DESC`);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/admin/bets', adminAuth, async (req, res) => {
+  try {
+    const r = await query(`SELECT b.*,u.name as player_name,c.name as club_name FROM bets b LEFT JOIN users u ON b.player_id=u.id LEFT JOIN clubs c ON b.club_id=c.id ORDER BY b.created_at DESC LIMIT 100`);
+    res.json(r.rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ===== PLAYER LIMITS =====
+app.get('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
+  try {
+    const r = await query('SELECT * FROM player_limits WHERE club_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
+    res.json(r.rows[0]||{});
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
+  const { max_bet, max_daily_risk, max_payout } = req.body;
+  try {
+    const r = await query(`INSERT INTO player_limits (club_id,user_id,max_bet,max_daily_risk,max_payout,updated_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (club_id,user_id) DO UPDATE SET max_bet=$3,max_daily_risk=$4,max_payout=$5,updated_at=NOW() RETURNING *`,
+      [req.params.id, req.params.userId, max_bet||100, max_daily_risk||500, max_payout||2000]);
+    res.json(r.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ===== START =====
-const PORT = parseInt(process.env.PORT) || 3001;
-console.log('Starting on PORT:', PORT);
+console.log('Starting Pocketbooks Sports Backend...');
+console.log('PORT:', process.env.PORT);
 console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
-console.log('NODE_ENV:', process.env.NODE_ENV);
+console.log('ODDS_API_KEY set:', !!process.env.ODDS_API_KEY);
 
-// Bind port FIRST - Railway requires this within 30s
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log('💎 Pocketbooks Sports running on port', PORT);
-});
-
-server.on('error', (err) => {
-  console.error('Server error:', err.message);
-  process.exit(1);
-});
-
-// DB init async after server is up
-initDB().then(() => {
-  console.log('✅ DB ready');
-}).catch(e => {
-  console.error('DB init failed (continuing without DB):', e.message);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Server running on port ${PORT}`);
+  // Init DB after server is bound
+  initDB().then(() => console.log('✅ DB ready')).catch(e => console.error('DB init failed:', e.message));
 });
