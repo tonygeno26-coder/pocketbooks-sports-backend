@@ -628,16 +628,24 @@ app.get('/api/odds', async (req, res) => {
 });
 
 // ===== START =====
-const PORT = process.env.PORT || 3001;
-(async () => {
-  // Start server first, then try DB
-  app.listen(PORT, () => console.log(`💎 Pocketbooks Sports Backend running on port ${PORT}`));
-  try {
-    await initDB();
-    console.log('✅ Ready!');
-  } catch(e) {
-    console.error('DB init error (server still running):', e.message);
-    console.error('DATABASE_URL set:', !!process.env.DATABASE_URL);
-    console.error('DATABASE_URL starts with:', process.env.DATABASE_URL?.slice(0,30));
-  }
-})();
+const PORT = parseInt(process.env.PORT) || 3001;
+console.log('Starting on PORT:', PORT);
+console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
+console.log('NODE_ENV:', process.env.NODE_ENV);
+
+// Bind port FIRST - Railway requires this within 30s
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log('💎 Pocketbooks Sports running on port', PORT);
+});
+
+server.on('error', (err) => {
+  console.error('Server error:', err.message);
+  process.exit(1);
+});
+
+// DB init async after server is up
+initDB().then(() => {
+  console.log('✅ DB ready');
+}).catch(e => {
+  console.error('DB init failed (continuing without DB):', e.message);
+});
