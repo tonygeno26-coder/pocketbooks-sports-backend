@@ -6,12 +6,7 @@ const jwt = require('jsonwebtoken');
 const { pool, initDB } = require('./db');
 
 const app = express();
-app.use(require('cors')({
-  origin: '*',
-  methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Api-Key']
-}));
-app.options('*', require('cors')());
+app.use(cors());
 app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
@@ -577,7 +572,14 @@ app.get('/api/odds/:sport', async (req, res) => {
   };
   const sport = sportMap[req.params.sport] || req.params.sport;
   try {
-    const games = await fetchOdds(sport);
+    let games;
+    try {
+      games = await fetchOdds(sport);
+    } catch(fetchErr) {
+      console.error('Odds fetch error:', fetchErr.message);
+      return res.json([]);
+    }
+    if (!Array.isArray(games)) { console.error('Odds not array:', typeof games); return res.json([]); }
     const formatted = games.slice(0, 20).map(g => {
       const bm = g.bookmakers?.[0];
       const spreads = bm?.markets?.find(m => m.key === 'spreads')?.outcomes || [];
@@ -596,7 +598,8 @@ app.get('/api/odds/:sport', async (req, res) => {
     });
     res.json(formatted);
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    console.error('Odds endpoint error:', e.message);
+    res.json([]);
   }
 });
 
