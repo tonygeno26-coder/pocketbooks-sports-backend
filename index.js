@@ -279,7 +279,16 @@ function fetchOdds(sport) {
       let d = '';
       res.on('data', c => d += c);
       res.on('end', () => {
-        try { resolve(JSON.parse(d)); } catch(e) { console.error('Odds parse error:', e.message); resolve([]); }
+        try {
+          const parsed = JSON.parse(d);
+          // Odds API returns an error object (not array) on quota/auth errors
+          if (parsed && parsed.error_code) {
+            console.error('[ODDS] API error:', parsed.error_code, parsed.message);
+            resolve({ _error: parsed.error_code, _message: parsed.message });
+          } else {
+            resolve(parsed);
+          }
+        } catch(e) { console.error('Odds parse error:', e.message); resolve([]); }
       });
     });
     req.on('error', e => { console.error('Odds fetch error:', e.message); resolve([]); });
@@ -302,7 +311,8 @@ app.get('/api/odds/:sport', async (req, res) => {
   const sport = sportMap[req.params.sport] || req.params.sport;
   try {
     const games = await fetchOdds(sport);
-    if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server. Set it in Railway environment variables.' }); }
+    if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server.' }); }
+    if (games && games._error) { return res.status(402).json({ error: games._message, error_code: games._error }); }
     const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => ({
       id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
       home: g.home_team, away: g.away_team, time: g.commence_time,
