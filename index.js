@@ -309,6 +309,7 @@ app.get('/api/env-check', (req, res) => {
 app.get('/api/odds/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
+  console.log('[odds] source=backend-proxy sport='+req.params.sport+' key_fingerprint='+(ODDS_KEY?ODDS_KEY.slice(0,4)+'...'+ODDS_KEY.slice(-4):'MISSING'));
   try {
     const games = await fetchOdds(sport);
     if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server.' }); }
@@ -413,7 +414,8 @@ app.put('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
 console.log('Starting Pocketbooks Sports Backend...');
 console.log('PORT:', process.env.PORT);
 console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
-console.log('ODDS_API_KEY set:', !!process.env.ODDS_API_KEY);
+const _k = process.env.ODDS_API_KEY || '';
+console.log('ODDS_API_KEY set:', !!_k, '| fingerprint:', _k ? _k.slice(0,4)+'...'+_k.slice(-4) : 'MISSING');
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
