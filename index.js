@@ -287,6 +287,16 @@ function fetchOdds(sport) {
   });
 }
 
+
+// Debug: confirm env vars are set (no values exposed)
+app.get('/api/env-check', (req, res) => {
+  res.json({
+    ODDS_API_KEY: !!process.env.ODDS_API_KEY,
+    DATABASE_URL: !!process.env.DATABASE_URL,
+    JWT_SECRET: !!process.env.JWT_SECRET
+  });
+});
+
 app.get('/api/odds/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
