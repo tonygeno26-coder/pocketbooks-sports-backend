@@ -273,7 +273,7 @@ const https = require('https');
 
 function fetchOdds(sport) {
   return new Promise((resolve) => {
-    if (!ODDS_KEY) { console.warn('ODDS_API_KEY not set'); return resolve([]); }
+    if (!ODDS_KEY) { console.error('[ODDS] ODDS_API_KEY is not set — set it in Railway environment variables'); return resolve(null); }
     const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_KEY}&regions=us&markets=spreads,totals,h2h&oddsFormat=american&bookmakers=draftkings`;
     const req = https.get(url, (res) => {
       let d = '';
@@ -302,6 +302,7 @@ app.get('/api/odds/:sport', async (req, res) => {
   const sport = sportMap[req.params.sport] || req.params.sport;
   try {
     const games = await fetchOdds(sport);
+    if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server. Set it in Railway environment variables.' }); }
     const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => ({
       id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
       home: g.home_team, away: g.away_team, time: g.commence_time,
