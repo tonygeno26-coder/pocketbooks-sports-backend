@@ -306,6 +306,36 @@ app.get('/api/env-check', (req, res) => {
   });
 });
 
+// Scores endpoint — returns completed games with final scores
+app.get('/api/scores/:sport', async (req, res) => {
+  const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
+  const sport = sportMap[req.params.sport] || req.params.sport;
+  const daysFrom = req.query.daysFrom || '3';
+  if (!ODDS_KEY) return res.status(503).json({ error: 'ODDS_API_KEY not configured' });
+  const url = `https://api.the-odds-api.com/v4/sports/${sport}/scores/?apiKey=${ODDS_KEY}&daysFrom=${daysFrom}`;
+  const req2 = require('https').get(url, r => {
+    let d = '';
+    r.on('data', c => d += c);
+    r.on('end', () => {
+      try {
+        const parsed = JSON.parse(d);
+        if (parsed && parsed.error_code) return res.status(402).json({ error: parsed.message, error_code: parsed.error_code });
+        // Return only completed games with scores
+        const completed = (Array.isArray(parsed) ? parsed : []).filter(g => g.completed && g.scores && g.scores.length >= 2);
+        res.json(completed.map(g => ({
+          id: g.id, sport: g.sport_title, home: g.home_team, away: g.away_team,
+          commence_time: g.commence_time, completed: g.completed,
+          home_score: parseInt((g.scores.find(s => s.name === g.home_team)||{}).score||0),
+          away_score: parseInt((g.scores.find(s => s.name === g.away_team)||{}).score||0),
+          last_update: g.last_update
+        })));
+      } catch(e) { res.status(500).json({ error: 'Parse error' }); }
+    });
+  });
+  req2.on('error', e => res.status(502).json({ error: e.message }));
+  req2.setTimeout(8000, () => { req2.destroy(); res.status(504).json({ error: 'Timeout' }); });
+});
+
 app.get('/api/odds/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
