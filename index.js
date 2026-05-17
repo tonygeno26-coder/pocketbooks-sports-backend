@@ -1,8 +1,98 @@
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const cors    = require('cors');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
+
+// ── Supabase mirror client (Phase A — passive write only) ─────────────────────
+// Loaded lazily so missing env never crashes startup.
+let _supabase = null;
+function getSupabase() {
+  if (_supabase) return _supabase;
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return null;
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    _supabase = createClient(url, key, {
+      auth: { persistSession: false, autoRefreshToken: false }
+    });
+    console.log('[supabase] client initialised — mirror writes enabled');
+  } catch(e) {
+    console.warn('[supabase] client init failed:', e.message);
+  }
+  return _supabase;
+}
+
+// Fire-and-forget mirror: never throws, never blocks.
+async function mirrorTicketToSupabase(ticket) {
+  const sb = getSupabase();
+  if (!sb) return; // env not configured — silent skip
+  const ticketId = ticket.id || ('T_' + Date.now());
+  try {
+    // 1. Insert ticket row
+    const sels = Array.isArray(ticket.selections) ? ticket.selections : [];
+    const ticketRow = {
+      id:                ticketId,
+      club_id:           ticket.clubId   || ticket.club_id   || null,
+      player_id:         ticket.playerId || ticket.player_id || null,
+      player_username:   ticket.playerUsername || null,
+      type:              ticket.type || 'Single',
+      status:            ticket.status || 'active',
+      risk_amount:       parseFloat(ticket.riskAmount)      || 0,
+      potential_profit:  parseFloat(ticket.potentialProfit) || 0,
+      estimated_payout:  parseFloat(ticket.estimatedPayout) || 0,
+      odds:              ticket.odds ? String(ticket.odds) : null,
+      placed_at:         ticket.placedAt || new Date().toISOString(),
+      raw_local:         ticket, // full object stored for Phase A audit
+      mirrored_at:       new Date().toISOString()
+    };
+    const { error: tErr } = await sb.from('tickets').upsert(ticketRow, { onConflict: 'id' });
+    if (tErr) throw new Error('ticket: ' + tErr.message);
+
+    // 2. Insert ticket_legs rows
+    if (sels.length) {
+      const legRows = sels.map(function(sel, i) {
+        return {
+          id:                 sel.legId || (ticketId + '_leg' + i),
+          ticket_id:          ticketId,
+          leg_index:          i,
+          provider_name:      sel.providerName      || 'odds-api',
+          provider_game_id:   sel.providerGameId    || sel.gameId   || null,
+          canonical_game_key: sel.canonicalGameKey  || sel.gameKey  || '',
+          sport:              sel.sport || null,
+          home_team:          sel.homeTeam   || null,
+          away_team:          sel.awayTeam   || null,
+          scheduled_start:    sel.scheduledStart || sel.commenceTime || null,
+          market:             sel.market || '',
+          pick:               sel.pick   || '',
+          odds:               typeof sel.odds === 'number' ? sel.odds : null,
+          line:               sel.line != null ? parseFloat(sel.line) : null,
+          side:               sel.side  || null,
+          game_status:        sel.gameStatus || null,
+          leg_result:         sel.result || null
+        };
+      });
+      const { error: lErr } = await sb.from('ticket_legs').upsert(legRows, { onConflict: 'id' });
+      if (lErr) throw new Error('legs: ' + lErr.message);
+    }
+
+    // 3. Audit event
+    await sb.from('audit_events').insert({
+      event_type: 'ticket_mirrored',
+      ticket_id:  ticketId,
+      player_id:  ticketRow.player_id,
+      club_id:    ticketRow.club_id,
+      payload:    { legs: sels.length, type: ticket.type, risk: ticketRow.risk_amount }
+    });
+
+    console.log('[supabase mirror] ticketId:', ticketId, 'success: true');
+  } catch(e) {
+    // Log but NEVER throw — mirror failure must not affect localStorage flow
+    console.warn('[supabase mirror] ticketId:', ticketId, 'success: false', 'error:', e.message);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -325,6 +415,41 @@ app.get('/api/env-check', (req, res) => {
 });
 
 // Scores endpoint — returns completed games with final scores
+// ── Supabase mirror endpoints (Phase A) ────────────────────────────────────────
+// POST /api/mirror/ticket — fire-and-forget from client after localStorage write
+// No auth required in Phase A (write-only, no sensitive reads).
+// Returns immediately so client is never blocked by mirror failure.
+app.post('/api/mirror/ticket', async (req, res) => {
+  // Respond immediately — client does not wait
+  res.json({ queued: true });
+  // Mirror async after response sent
+  const ticket = req.body;
+  if (!ticket || !ticket.id) return;
+  mirrorTicketToSupabase(ticket).catch(function(e){
+    console.warn('[supabase mirror] unhandled error:', e.message);
+  });
+});
+
+// GET /api/mirror/audit?limit=20 — compare recent mirrored tickets
+// Returns counts for runSupabaseMirrorAudit() client helper.
+app.get('/api/mirror/audit', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||20, 100);
+    const { data, error, count } = await sb
+      .from('tickets')
+      .select('id, type, status, risk_amount, placed_at, mirrored_at', { count: 'exact' })
+      .order('mirrored_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ enabled: true, total_mirrored: count, recent: data || [] });
+  } catch(e) {
+    res.status(500).json({ enabled: true, error: e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 app.get('/api/scores/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
