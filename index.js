@@ -478,6 +478,28 @@ app.post('/api/mirror/ledger', async (req, res) => {
   mirrorLedgerEntry(entry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
 });
 
+// GET /api/mirror/tickets — read tickets from Supabase for a player/club (shadow read)
+// Used by client runReadShadowAudit() — compare-only, never replaces localStorage.
+app.get('/api/mirror/tickets', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured', tickets: [] });
+  try {
+    const { playerId, clubId, limit: limitQ } = req.query;
+    const limit = Math.min(parseInt(limitQ)||200, 500);
+    let query = sb.from('tickets')
+      .select('id, status, type, risk_amount, potential_profit, placed_at, graded_at, mirrored_at')
+      .order('placed_at', { ascending: false })
+      .limit(limit);
+    if (playerId) query = query.eq('player_id', playerId);
+    if (clubId)   query = query.eq('club_id', clubId);
+    const { data, error, count } = await query;
+    if (error) throw error;
+    res.json({ enabled: true, tickets: data || [], count: count });
+  } catch(e) {
+    res.status(500).json({ enabled: true, tickets: [], error: e.message });
+  }
+});
+
 // GET /api/mirror/audit — ticket mirror status
 app.get('/api/mirror/audit', async (req, res) => {
   const sb = getSupabase();
