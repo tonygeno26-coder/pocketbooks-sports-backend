@@ -478,6 +478,36 @@ app.post('/api/mirror/ledger', async (req, res) => {
   mirrorLedgerEntry(entry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
 });
 
+// GET /api/mirror/tickets-with-legs — tickets + legs in one call for DB primary read
+app.get('/api/mirror/tickets-with-legs', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled: false, tickets: [], legs: [], reason: 'not configured' });
+  try {
+    const { playerId, clubId, limit: limitQ } = req.query;
+    const limit = Math.min(parseInt(limitQ)||200, 500);
+    let tq = sb.from('tickets')
+      .select('id,type,status,risk_amount,potential_profit,estimated_payout,odds,placed_at,graded_at,grading_source,grading_snapshot,player_id,club_id')
+      .order('placed_at', { ascending: false }).limit(limit);
+    if (playerId) tq = tq.eq('player_id', playerId);
+    if (clubId)   tq = tq.eq('club_id', clubId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+    // Fetch legs for these ticket IDs
+    const ticketIds = (tickets||[]).map(function(t){ return t.id; });
+    let legs = [];
+    if (ticketIds.length) {
+      const { data: legData, error: lErr } = await sb.from('ticket_legs')
+        .select('id,ticket_id,leg_index,pick,market,odds,line,sport,home_team,away_team,canonical_game_key,scheduled_start,provider_game_id,game_status,leg_result')
+        .in('ticket_id', ticketIds);
+      if (lErr) throw lErr;
+      legs = legData || [];
+    }
+    res.json({ enabled: true, tickets: tickets || [], legs });
+  } catch(e) {
+    res.status(500).json({ enabled: true, tickets: [], legs: [], error: e.message });
+  }
+});
+
 // GET /api/mirror/tickets — read tickets from Supabase for a player/club (shadow read)
 // Used by client runReadShadowAudit() — compare-only, never replaces localStorage.
 app.get('/api/mirror/tickets', async (req, res) => {
