@@ -104,6 +104,20 @@ app.use(express.json());
 // ===== HEALTH (first route) =====
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+// ===== ENV CHECK (safe — returns boolean flags only, no secret values) =====
+app.get('/api/env-check', (req, res) => {
+  res.json({
+    serviceName:          'pocketbooks-sports-backend',
+    railwayServiceUrl:    'pocketbooks-sports-backend-production.up.railway.app',
+    hasSupabaseUrl:       !!process.env.SUPABASE_URL,
+    hasSupabaseServiceKey:!!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    hasDatabaseUrl:       !!process.env.DATABASE_URL,
+    hasOddsApiKey:        !!process.env.ODDS_API_KEY,
+    nodeEnv:              process.env.NODE_ENV || 'development',
+    timestamp:            new Date().toISOString()
+  });
+});
+
 // ===== DB (lazy init - won't crash startup) =====
 let pool = null;
 function getPool() {
