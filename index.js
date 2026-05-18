@@ -86,10 +86,37 @@ async function mirrorTicketToSupabase(ticket) {
       payload:    { legs: sels.length, type: ticket.type, risk: ticketRow.risk_amount }
     });
 
-    console.log('[supabase mirror] ticketId:', ticketId, 'success: true');
+    console.log('[supabase mirror] ticketId:', ticketId, 'success: true legs:', sels.length);
   } catch(e) {
-    // Log but NEVER throw — mirror failure must not affect localStorage flow
-    console.warn('[supabase mirror] ticketId:', ticketId, 'success: false', 'error:', e.message);
+    console.warn('[supabase mirror] ticketId:', ticketId, 'success: false error:', e.message);
+  }
+}
+
+// Mirror a single ledger entry — append-only, idempotency via id (upsert onConflict=id does nothing on duplicate)
+async function mirrorLedgerEntry(entry) {
+  const sb = getSupabase();
+  if (!sb || !entry || !entry.id) return;
+  try {
+    const row = {
+      id:             entry.id,
+      club_id:        entry.clubId  || entry.club_id  || null,
+      player_id:      entry.playerId || entry.player_id || null,
+      ticket_id:      entry.ticketId || entry.ticket_id || null,
+      type:           entry.type,
+      amount:         parseFloat(entry.amount) || 0,
+      balance_before: entry.balanceBefore != null ? parseFloat(entry.balanceBefore) : null,
+      balance_after:  entry.balanceAfter  != null ? parseFloat(entry.balanceAfter)  : null,
+      reason:         entry.reason || entry.type,
+      final_score:    entry.finalScore || entry.final_score || null,
+      created_at:     entry.createdAt || new Date().toISOString(),
+      created_by:     entry.createdBy || 'system'
+    };
+    // ignoreDuplicates: true means duplicate id is silently ignored (append-only, no update)
+    const { error } = await sb.from('ledger_entries').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throw new Error(error.message);
+    console.log('[supabase mirror] ledger id:', entry.id, 'type:', entry.type, 'success: true');
+  } catch(e) {
+    console.warn('[supabase mirror] ledger id:', entry.id, 'success: false error:', e.message);
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
@@ -431,21 +458,27 @@ app.get('/api/env-check', (req, res) => {
 // Scores endpoint — returns completed games with final scores
 // ── Supabase mirror endpoints (Phase A) ────────────────────────────────────────
 // POST /api/mirror/ticket — fire-and-forget from client after localStorage write
-// No auth required in Phase A (write-only, no sensitive reads).
-// Returns immediately so client is never blocked by mirror failure.
 app.post('/api/mirror/ticket', async (req, res) => {
-  // Respond immediately — client does not wait
-  res.json({ queued: true });
-  // Mirror async after response sent
-  const ticket = req.body;
-  if (!ticket || !ticket.id) return;
-  mirrorTicketToSupabase(ticket).catch(function(e){
-    console.warn('[supabase mirror] unhandled error:', e.message);
-  });
+  res.json({ queued: true }); // respond immediately
+  const { ticket, ledgerEntry } = req.body.ticket ? req.body : { ticket: req.body, ledgerEntry: null };
+  const t = ticket || req.body;
+  if (!t || !t.id) return;
+  mirrorTicketToSupabase(t).catch(function(e){ console.warn('[mirror/ticket] error:', e.message); });
+  // Also mirror ledger entry if provided in same call
+  if (ledgerEntry && ledgerEntry.id) {
+    mirrorLedgerEntry(ledgerEntry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
+  }
 });
 
-// GET /api/mirror/audit?limit=20 — compare recent mirrored tickets
-// Returns counts for runSupabaseMirrorAudit() client helper.
+// POST /api/mirror/ledger — mirror a single ledger entry (append-only, idempotent)
+app.post('/api/mirror/ledger', async (req, res) => {
+  res.json({ queued: true }); // respond immediately
+  const entry = req.body;
+  if (!entry || !entry.id) return;
+  mirrorLedgerEntry(entry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
+});
+
+// GET /api/mirror/audit — ticket mirror status
 app.get('/api/mirror/audit', async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
@@ -458,9 +491,39 @@ app.get('/api/mirror/audit', async (req, res) => {
       .limit(limit);
     if (error) throw error;
     res.json({ enabled: true, total_mirrored: count, recent: data || [] });
-  } catch(e) {
-    res.status(500).json({ enabled: true, error: e.message });
-  }
+  } catch(e) { res.status(500).json({ enabled: true, error: e.message }); }
+});
+
+// GET /api/mirror/audit/legs — ticket_legs mirror status
+app.get('/api/mirror/audit/legs', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||50, 200);
+    const { data, error, count } = await sb
+      .from('ticket_legs')
+      .select('id, ticket_id, leg_index, canonical_game_key, market, pick, odds', { count: 'exact' })
+      .order('ticket_id', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ enabled: true, total_mirrored: count, recent: data || [] });
+  } catch(e) { res.status(500).json({ enabled: true, error: e.message }); }
+});
+
+// GET /api/mirror/audit/ledger — ledger_entries mirror status
+app.get('/api/mirror/audit/ledger', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
+  try {
+    const limit = Math.min(parseInt(req.query.limit)||50, 200);
+    const { data, error, count } = await sb
+      .from('ledger_entries')
+      .select('id, ticket_id, type, amount, balance_before, balance_after, reason, created_at', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .limit(limit);
+    if (error) throw error;
+    res.json({ enabled: true, total_mirrored: count, recent: data || [] });
+  } catch(e) { res.status(500).json({ enabled: true, error: e.message }); }
 });
 // ─────────────────────────────────────────────────────────────────────────────
 
