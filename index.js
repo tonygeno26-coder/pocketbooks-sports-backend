@@ -478,6 +478,38 @@ app.post('/api/mirror/ledger', async (req, res) => {
   mirrorLedgerEntry(entry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
 });
 
+// POST /api/mirror/ledger-debug — synchronous insert, returns actual Supabase error for diagnosis
+app.post('/api/mirror/ledger-debug', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok: false, reason: 'supabase_not_configured' });
+  const entry = req.body;
+  if (!entry || !entry.id) return res.json({ ok: false, reason: 'missing_id' });
+  try {
+    const row = {
+      id:             entry.id,
+      club_id:        entry.clubId   || entry.club_id   || null,
+      player_id:      entry.playerId || entry.player_id || null,
+      ticket_id:      entry.ticketId || entry.ticket_id || null,
+      type:           entry.type     || 'bet_placed',
+      amount:         parseFloat(entry.amount) || 0,
+      balance_before: entry.balanceBefore != null ? parseFloat(entry.balanceBefore) : null,
+      balance_after:  entry.balanceAfter  != null ? parseFloat(entry.balanceAfter)  : null,
+      reason:         entry.reason   || entry.type || 'debug',
+      final_score:    entry.finalScore || null,
+      created_at:     entry.createdAt || new Date().toISOString(),
+      created_by:     'debug'
+    };
+    // Try insert first (no ignoreDuplicates) to surface real constraint errors
+    const { data, error } = await sb.from('ledger_entries').insert(row).select();
+    if (error) {
+      return res.json({ ok: false, supabaseError: error.message, code: error.code, hint: error.hint, details: error.details, row });
+    }
+    res.json({ ok: true, inserted: data });
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // GET /api/mirror/tickets-with-legs — tickets + legs in one call for DB primary read
 app.get('/api/mirror/tickets-with-legs', async (req, res) => {
   const sb = getSupabase();
