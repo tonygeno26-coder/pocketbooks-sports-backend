@@ -111,10 +111,11 @@ async function mirrorLedgerEntry(entry) {
       created_at:     entry.createdAt || new Date().toISOString(),
       created_by:     entry.createdBy || 'system'
     };
-    // ignoreDuplicates: true means duplicate id is silently ignored (append-only, no update)
-    const { error } = await sb.from('ledger_entries').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+    // upsert by id — if id already exists, updates in place (safe: content is immutable)
+    // Previously used ignoreDuplicates:true which silently dropped rows when IDs collided
+    const { data: upserted, error } = await sb.from('ledger_entries').upsert(row, { onConflict: 'id' }).select('id');
     if (error) throw new Error(error.message);
-    console.log('[supabase mirror] ledger id:', entry.id, 'type:', entry.type, 'success: true');
+    console.log('[supabase mirror] ledger id:', entry.id, 'type:', entry.type, 'upserted:', upserted && upserted.length, 'success: true');
   } catch(e) {
     console.warn('[supabase mirror] ledger id:', entry.id, 'success: false error:', e.message);
   }
@@ -476,6 +477,41 @@ app.post('/api/mirror/ledger', async (req, res) => {
   const entry = req.body;
   if (!entry || !entry.id) return;
   mirrorLedgerEntry(entry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
+});
+
+// POST /api/mirror/ledger-bulk — mirror array of ledger entries in one batch (for replay)
+app.post('/api/mirror/ledger-bulk', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok: false, reason: 'supabase_not_configured', inserted: 0 });
+  const entries = Array.isArray(req.body) ? req.body : (req.body.entries || []);
+  if (!entries.length) return res.json({ ok: true, inserted: 0 });
+  res.json({ queued: true, count: entries.length });
+  // Process async after response
+  (async function() {
+    const rows = entries.filter(function(e){ return e && e.id; }).map(function(e) {
+      return {
+        id:             e.id,
+        club_id:        e.clubId   || e.club_id   || null,
+        player_id:      e.playerId || e.player_id || null,
+        ticket_id:      e.ticketId || e.ticket_id || null,
+        type:           e.type     || 'bet_placed',
+        amount:         parseFloat(e.amount) || 0,
+        balance_before: e.balanceBefore != null ? parseFloat(e.balanceBefore) : null,
+        balance_after:  e.balanceAfter  != null ? parseFloat(e.balanceAfter)  : null,
+        reason:         e.reason   || e.type     || 'replay',
+        final_score:    e.finalScore || e.final_score || null,
+        created_at:     e.createdAt  || new Date().toISOString(),
+        created_by:     e.createdBy  || 'replay'
+      };
+    });
+    try {
+      const { data, error } = await sb.from('ledger_entries').upsert(rows, { onConflict: 'id' }).select('id');
+      if (error) throw error;
+      console.log('[supabase mirror] ledger-bulk upserted:', data && data.length, 'of', rows.length);
+    } catch(e) {
+      console.warn('[supabase mirror] ledger-bulk error:', e.message);
+    }
+  })();
 });
 
 // POST /api/mirror/ledger-debug — synchronous insert, returns actual Supabase error for diagnosis
