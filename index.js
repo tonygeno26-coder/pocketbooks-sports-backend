@@ -1443,6 +1443,89 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// GET /api/host/settlement-reconciliation — read-only balance proof
+app.get('/api/host/settlement-reconciliation', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
+  const { clubId } = req.query;
+  const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+  try {
+    // 1. Tickets
+    let tq = sb.from('tickets').select('id,status,risk_amount,potential_profit');
+    if (clubId) tq = tq.eq('club_id', clubId);
+    const { data: tickets } = await tq;
+    var activeRisk=0, settledGain=0, settledLoss=0;
+    (tickets||[]).forEach(function(t){
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
+      if (s==='active'||s==='open')  activeRisk  +=r;
+      else if (s==='lost')           settledGain +=r;
+      else if (s==='won')            settledLoss +=p;
+    });
+    var ticketTotals = { activeRisk:rnd(activeRisk), settledGain:rnd(settledGain),
+      settledLoss:rnd(settledLoss), profit:rnd(settledGain-settledLoss) };
+
+    // 2. Ledger
+    let lq = sb.from('ledger_entries').select('id,type,amount');
+    if (clubId) lq = lq.eq('club_id', clubId);
+    const { data: ledger } = await lq;
+    var lTotals = { bet_placed:0,bet_won:0,bet_lost:0,bet_push:0,bet_canceled:0,settlement:0,other:0 };
+    (ledger||[]).forEach(function(e){
+      var a=parseFloat(e.amount)||0;
+      if (lTotals[e.type]!==undefined) lTotals[e.type]+=a; else lTotals.other+=a;
+    });
+    var ledgerNet = rnd(Object.values(lTotals).reduce(function(s,v){return s+v;},0));
+    var ledgerTotals = Object.assign({net:ledgerNet},
+      Object.fromEntries(Object.entries(lTotals).map(function(kv){return [kv[0],rnd(kv[1])];})));
+
+    // 3. Settlement preview
+    var byPlayer={}, oweTot=0, hostTot=0;
+    (tickets||[]).forEach(function(t){
+      var pid=t.player_id||'unknown', s=t.status.toLowerCase(),
+          r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (!byPlayer[pid]) byPlayer[pid]={net:0};
+      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
+      if (s==='lost') byPlayer[pid].net-=r;
+      if (s==='won')  byPlayer[pid].net+=p;
+    });
+    Object.values(byPlayer).forEach(function(p){
+      if (p.net<0) oweTot+=Math.abs(p.net); else hostTot+=p.net;
+    });
+    var previewTotals = { playersOwe:rnd(oweTot), hostOwes:rnd(hostTot), net:rnd(oweTot-hostTot) };
+
+    // 4. Latest rollover
+    var latestRollover = null;
+    try {
+      let rq = sb.from('weekly_rollovers').select('rollover_week,totals_snapshot,performed_at')
+        .order('rollover_week',{ascending:false}).limit(1);
+      if (clubId) rq = rq.eq('club_id',clubId);
+      const { data:rr } = await rq;
+      if (rr&&rr[0]) { var rt={}; try{rt=JSON.parse(rr[0].totals_snapshot||'{}');}catch(_e){}
+        latestRollover = { rolloverWeek:rr[0].rollover_week, performedAt:rr[0].performed_at, ...rt }; }
+    } catch(_e){}
+
+    // 5. Mismatches
+    var mismatches = [];
+    var pNet = previewTotals.net;
+    if (Math.abs(ticketTotals.profit - pNet) > 0.02)
+      mismatches.push({ category:'ticket_vs_preview', delta:rnd(ticketTotals.profit-pNet),
+        detail:'ticketProfit='+ticketTotals.profit+' previewNet='+pNet });
+    if (latestRollover) {
+      var snapCalcNet = rnd((latestRollover.playersOwe||0)-(latestRollover.hostOwes||0));
+      if (Math.abs(snapCalcNet-(latestRollover.net||0)) > 0.02)
+        mismatches.push({ category:'snapshot_internal', delta:rnd(snapCalcNet-(latestRollover.net||0)),
+          detail:'calcNet='+snapCalcNet+' snapshotNet='+latestRollover.net });
+    }
+
+    res.json({ ok:true, clubId:clubId||null, ticketTotals, ledgerTotals,
+      settlementPreviewTotals:previewTotals, latestRollover,
+      mismatches, status:mismatches.length===0?'balanced':'mismatch' });
+  } catch(e) {
+    console.error('[reconciliation] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
