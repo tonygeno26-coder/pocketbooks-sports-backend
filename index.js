@@ -678,6 +678,129 @@ function _matchScanToIntent(scanResult, intent) {
            confirmations:scanResult.confirmations };
 }
 
+// GET /api/admin/crypto/reconciliation
+app.get('/api/admin/crypto/reconciliation', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const nowMs = Date.now();
+  const clubId = req._clubId || req.query.clubId;
+  try {
+    // Load intents
+    let iq = sb.from('crypto_deposit_intents').select('*').order('created_at',{ ascending:false }).limit(200);
+    if (clubId && actor.platformRole !== 'platform_admin') iq = iq.eq('club_id', clubId);
+    const { data: intents } = await iq;
+    // Load scans
+    const { data: scans } = await sb.from('crypto_tx_scans').select('*').order('scanned_at',{ ascending:false }).limit(500);
+
+    const FLAG_MISSING_HASH_MS  = 30 * 60 * 1000;
+    const FLAG_NO_SCAN_AFTER_MS = 30 * 60 * 1000;
+
+    function _dayKey(ts) { return ts ? new Date(ts).toISOString().slice(0,10) : 'unknown'; }
+    function _scanIdx(ss) {
+      var bi = {}, tc = {};
+      (ss||[]).forEach(function(s){
+        var id = s.matched_intent_id;
+        if (id) { if (!bi[id]) bi[id]=[]; bi[id].push(s); }
+        var h = s.tx_hash; if (h) tc[h]=(tc[h]||0)+1;
+      });
+      return { bi, tc };
+    }
+    var idx = _scanIdx(scans||[]);
+    var all = intents||[];
+
+    // Daily summary
+    var daysMap = {};
+    all.forEach(function(i) {
+      var d = _dayKey(i.created_at);
+      if (!daysMap[d]) daysMap[d] = { date:d, totalDepositIntents:0, totalHashSubmitted:0,
+        totalCreditedDiamonds:0, totalExpectedUsd:0, totalScannedUsd:0, totalConfirmedUsd:0,
+        totalRejected:0, missingHashCount:0, pendingReviewCount:0, mismatchCount:0 };
+      var r = daysMap[d];
+      r.totalDepositIntents++;
+      r.totalExpectedUsd += parseFloat(i.expected_usd||0);
+      if (i.status==='credited')       r.totalCreditedDiamonds += parseFloat(i.package_amount_diamonds||0);
+      if (i.status==='rejected')       r.totalRejected++;
+      if (i.status==='pending_review') r.pendingReviewCount++;
+      if (i.tx_hash) r.totalHashSubmitted++;
+      if (i.status==='created' && nowMs-new Date(i.created_at).getTime()>FLAG_MISSING_HASH_MS) r.missingHashCount++;
+      (idx.bi[i.intent_id]||[]).forEach(function(s){
+        var u=parseFloat(s.amount_usd_estimate||0);
+        r.totalScannedUsd+=u;
+        if (s.status==='found_confirmed') r.totalConfirmedUsd+=u;
+        if (s.status==='mismatch') r.mismatchCount++;
+      });
+    });
+    var dailySummary = Object.values(daysMap).sort(function(a,b){ return b.date.localeCompare(a.date); });
+
+    // Wallet summary
+    var walletMap = {};
+    all.forEach(function(i) {
+      var w=(i.assigned_wallet_address||'').toLowerCase();
+      var k=w+'::'+i.network+'::'+i.crypto_symbol;
+      if (!walletMap[k]) walletMap[k]={ walletAddress:i.assigned_wallet_address,
+        network:i.network, cryptoSymbol:i.crypto_symbol,
+        confirmedUsd:0, creditedDiamonds:0, pendingUsd:0, mismatchCount:0, txCount:0 };
+      var rw=walletMap[k];
+      if (i.tx_hash) rw.txCount++;
+      if (i.status==='credited') rw.creditedDiamonds+=parseFloat(i.package_amount_diamonds||0);
+      (idx.bi[i.intent_id]||[]).forEach(function(s){
+        var u=parseFloat(s.amount_usd_estimate||0);
+        if (s.status==='found_confirmed') rw.confirmedUsd+=u;
+        else if (s.status==='found_pending') rw.pendingUsd+=u;
+        if (s.status==='mismatch') rw.mismatchCount++;
+      });
+    });
+    var walletSummary = Object.values(walletMap);
+
+    // Flagged rows
+    var flagged = [];
+    all.forEach(function(i) {
+      var flags=[]; var is=(idx.bi[i.intent_id]||[]); var ls=is[is.length-1]||null;
+      if (i.status==='created' && nowMs-new Date(i.created_at).getTime()>FLAG_MISSING_HASH_MS) flags.push('missing_hash');
+      if (i.status==='hash_submitted' && i.tx_hash_submitted_at) {
+        var wms=nowMs-new Date(i.tx_hash_submitted_at).getTime();
+        if (wms>FLAG_NO_SCAN_AFTER_MS && is.length===0) flags.push('no_scan_after_hash');
+      }
+      if (ls && ls.status==='found_confirmed' && i.status!=='credited') flags.push('confirmed_not_credited');
+      if (i.status==='credited' && ls && ls.status==='mismatch') flags.push('credited_mismatch');
+      if (is.some(function(s){ return s.status==='mismatch'; })) flags.push('wallet_mismatch');
+      if (is.some(function(s){ return s.error_message==='amount_short'; })) flags.push('amount_short');
+      if (i.tx_hash && (idx.tc[i.tx_hash]||0)>1) flags.push('duplicate_txhash_attempt');
+      if (flags.length) flagged.push({ intentId:i.intent_id, playerId:i.player_id,
+        clubId:i.club_id, assignedWalletAddress:i.assigned_wallet_address,
+        txHash:i.tx_hash||null, status:i.status, flags });
+    });
+
+    // Player audit rows
+    var playerAuditRows = all.map(function(i) {
+      var is=(idx.bi[i.intent_id]||[]); var ls=is[is.length-1]||null;
+      var myFlag=flagged.find(function(f){ return f.intentId===i.intent_id; });
+      return { playerId:i.player_id, intentId:i.intent_id,
+        packageAmountDiamonds:parseFloat(i.package_amount_diamonds||0),
+        expectedUsd:parseFloat(i.expected_usd||0),
+        assignedWalletAddress:i.assigned_wallet_address,
+        txHash:i.tx_hash||null,
+        scanStatus:ls?ls.status:null,
+        matchedPlayerId:ls?ls.matched_player_id:null,
+        creditedDiamonds:i.status==='credited'?parseFloat(i.package_amount_diamonds||0):0,
+        status:i.status, flags:myFlag?myFlag.flags:[],
+        createdAt:i.created_at, updatedAt:i.updated_at };
+    });
+
+    res.json({ ok:true, dailySummary, walletSummary, flaggedRows:flagged, playerAuditRows,
+      meta:{ totalIntents:all.length, totalFlagged:flagged.length,
+             generatedAt:new Date().toISOString() } });
+  } catch(e) {
+    console.error('[crypto/recon]', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 // POST /api/admin/crypto/deposits/scan
 app.post('/api/admin/crypto/deposits/scan', async (req, res) => {
   const actor = requireActor(req);
