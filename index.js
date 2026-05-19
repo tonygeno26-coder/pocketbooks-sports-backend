@@ -275,32 +275,16 @@ function _canDo(role, action) {
 
 // requirePermission(action) middleware factory
 // Reads X-Staff-Role header (or falls back to default 'owner' for existing JWT auth)
-function requirePermission(action) {
+// requirePermission — Phase A stub; replaced by full version in auth block below.
+// This placeholder lets existing route declarations compile; the real middleware
+// is installed after the auth block initialises.
+let requirePermission = function(action, getTargetPlayerId) {
   return function(req, res, next) {
-    // Phase A compat: if no role header, treat existing JWT users as owner
-    const staffRole = req.headers['x-staff-role'] || 'owner';
-    const actorId   = req.headers['x-staff-id']   || (req.user && req.user.id) || 'unknown';
-    const clubId    = req.query.clubId || (req.body && req.body.clubId) || null;
-    const check = _canDo(staffRole, action);
-    // Audit log every permission check
-    console.log('[permission check] actor='+actorId+' role='+staffRole+' action='+action+
-      ' clubId='+(clubId||'?')+' allowed='+check.allowed+
-      (check.allowed ? '' : ' reason='+check.reason));
-    if (!check.allowed) {
-      // Write audit event to Supabase if available (fire-and-forget)
-      const sb = getSupabase();
-      if (sb) sb.from('audit_events').insert({
-        event_type:'permission_denied', actor_id:actorId, club_id:clubId,
-        payload:{ action, role:staffRole, reason:check.reason }
-      }).then(function(){}).catch(function(){});
-      return res.status(403).json({ ok:false, error:'permission_denied',
-        action, role:staffRole, reason:check.reason });
-    }
-    req.staffRole = staffRole;
-    req.actorId   = actorId;
-    next();
+    // Phase A compat: honour x-staff-role as well as x-actor-role
+    req._permAction = action;
+    next(); // will be replaced post-auth-block
   };
-}
+};
 
 // Permission management endpoints
 // GET /api/permissions/roles — list all roles and their capabilities
@@ -522,6 +506,117 @@ function fetchOdds(sport) {
   });
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// AUTH + ROLE ENFORCEMENT
+// ════════════════════════════════════════════════════════════════════════════
+
+const IS_PRODUCTION     = process.env.NODE_ENV === 'production';
+const DEV_AUTH_BYPASS   = process.env.DEV_AUTH_BYPASS === 'true';
+
+const ROLE_RANK = {
+  owner:              5,
+  full_admin:         4,
+  settlement_manager: 3,
+  risk_viewer:        2,
+  player:             1,
+  view_only:          0
+};
+
+// -1 = player-self check; >=0 = minimum role rank
+const ACTION_MIN_RANK = {
+  place_bet:                  -1,
+  cancel_bet:                 -1,
+  view_player_dashboard:      -1,
+  view_host_dashboard:         2,
+  view_settlement_history:     2,
+  settle_player:               3,
+  weekly_rollover:             3,
+  run_server_grade:            3,
+  force_market_refresh:        4,
+  view_audit_log:              2,
+  // Legacy aliases from Phase A permissions system
+  grade_trigger:               3,  // = run_server_grade
+  settle:                      3,  // = settle_player
+  rollover:                    3,  // = weekly_rollover
+  view_risk:                   2,  // = view_host_dashboard
+};
+
+function _getRoleRank(role) { return ROLE_RANK[role] != null ? ROLE_RANK[role] : -99; }
+
+// Resolve actor from request headers
+function requireActor(req) {
+  const actorId   = (req.headers['x-actor-id']   || '').trim();
+  const clubId    = (req.headers['x-club-id']    || '').trim();
+  const actorRole = (req.headers['x-actor-role'] || '').trim();
+  const bypassAllowed = !IS_PRODUCTION || DEV_AUTH_BYPASS;
+
+  if (!actorId) {
+    if (bypassAllowed) {
+      const bypassClub = clubId || (req.query && req.query.clubId) || (req.body && req.body.clubId) || 'dev-club';
+      console.log('[auth] DEV BYPASS actor=dev-owner role=owner club=' + bypassClub);
+      return { actorId:'dev-owner', role:'owner', clubId:bypassClub, isDevBypass:true };
+    }
+    return { error:'unauthenticated', status:401 };
+  }
+  const role = ROLE_RANK[actorRole] != null ? actorRole : 'view_only';
+  return { actorId, role, clubId: clubId || (req.body && req.body.clubId) || (req.query && req.query.clubId) || '', isDevBypass:false };
+}
+
+// Check permission for action; targetPlayerId for player-self actions
+function _checkPermission(actor, action, targetPlayerId) {
+  if (actor.error) return { allowed:false, reason:actor.error, status:actor.status||401 };
+  const minRank = ACTION_MIN_RANK[action];
+  if (minRank == null) return { allowed:false, reason:'unknown_action:'+action };
+  const rank = _getRoleRank(actor.role);
+  if (minRank === -1) {
+    const isSelf       = targetPlayerId && actor.actorId === targetPlayerId;
+    const isPrivileged = rank >= ROLE_RANK.full_admin;
+    if (!isSelf && !isPrivileged) return { allowed:false, reason:'not_own_account', status:403 };
+    return { allowed:true };
+  }
+  if (rank < minRank) {
+    return {
+      allowed:false, reason:'insufficient_role', status:403,
+      required: Object.keys(ROLE_RANK).find(r => ROLE_RANK[r] === minRank),
+      actual: actor.role
+    };
+  }
+  return { allowed:true };
+}
+
+// Express middleware factory: enforces permission, writes audit on deny.
+// Reassigns the placeholder declared above.
+requirePermission = function(action, getTargetPlayerId) {
+  return async function(req, res, next) {
+    const actor = requireActor(req);
+    const targetId = typeof getTargetPlayerId === 'function'
+      ? getTargetPlayerId(req) : (req.body && req.body.playerId) || (req.query && req.query.playerId);
+    const perm = _checkPermission(actor, action, targetId);
+    if (!perm.allowed) {
+      console.log('[auth] DENIED actor='+(actor.actorId||'?')+' role='+(actor.role||'?')+' action='+action+' reason='+perm.reason);
+      // Write audit event (fire-and-forget)
+      try {
+        const sb = getSupabase();
+        if (sb) sb.from('audit_events').insert({
+          event_type:'permission_denied',
+          player_id: actor.actorId||null, club_id: actor.clubId||null,
+          payload:{ actorId:actor.actorId, role:actor.role, action, endpoint:req.path,
+                    reason:perm.reason, required:perm.required }
+        }).then(()=>{}).catch(()=>{});
+      } catch(_e){}
+      return res.status(perm.status||403).json({
+        ok:false, error:'permission_denied',
+        reason:perm.reason, required:perm.required, actual:perm.actual
+      });
+    }
+    req._actor = actor; // make actor available to handler
+    if (actor.isDevBypass) console.log('[auth] DEV BYPASS passthrough action='+action);
+    next();
+  };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════
 // LIVE MARKET CACHE ENGINE
@@ -1419,7 +1514,7 @@ app.get('/api/markets/health', (req, res) => {
 });
 
 // POST /api/markets/refresh — force cache refresh (dev/admin)
-app.post('/api/markets/refresh', async (req, res) => {
+app.post('/api/markets/refresh', requirePermission('force_market_refresh'), async (req, res) => {
   try {
     await pollLiveOddsLoop();
     const cache = LIVE_MARKET_CACHE;
@@ -1433,7 +1528,7 @@ app.post('/api/markets/refresh', async (req, res) => {
 // ───────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/dashboard?clubId=...
-app.get('/api/host/dashboard', async (req, res) => {
+app.get('/api/host/dashboard', requirePermission('view_host_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
   const { clubId, playerId } = req.query;
@@ -1517,7 +1612,7 @@ app.get('/api/host/dashboard', async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
-app.get('/api/host/settlements-preview', async (req, res) => {
+app.get('/api/host/settlements-preview', requirePermission('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   const { clubId } = req.query;
@@ -1838,7 +1933,7 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 
 // ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
 // POST /api/bets/place
-app.post('/api/bets/place', async (req, res) => {
+app.post('/api/bets/place', requirePermission('place_bet'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { clubId, playerId, betType, stake, legs, payout, potentialProfit,
@@ -1997,7 +2092,7 @@ app.post('/api/bets/place', async (req, res) => {
 // ───────────────────────────────────────────────────────────────────────═
 
 // POST /api/bets/cancel — DB-authoritative ticket cancellation
-app.post('/api/bets/cancel', async (req, res) => {
+app.post('/api/bets/cancel', requirePermission('cancel_bet'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { clubId, playerId, ticketId, idempotencyKey, reason } = req.body || {};
@@ -2069,7 +2164,7 @@ app.post('/api/bets/cancel', async (req, res) => {
 });
 
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
-app.get('/api/player/dashboard', async (req, res) => {
+app.get('/api/player/dashboard', requirePermission('view_player_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', balance:null });
   const { clubId, playerId } = req.query;
@@ -2160,7 +2255,7 @@ app.get('/api/player/dashboard', async (req, res) => {
 });
 
 // GET /api/host/settlement-reconciliation — read-only balance proof
-app.get('/api/host/settlement-reconciliation', async (req, res) => {
+app.get('/api/host/settlement-reconciliation', requirePermission('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
   const { clubId } = req.query;
