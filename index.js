@@ -787,6 +787,274 @@ console.log('DATABASE_URL set:', !!process.env.DATABASE_URL);
 const _k = process.env.ODDS_API_KEY || '';
 console.log('ODDS_API_KEY set:', !!_k, '| fingerprint:', _k ? _k.slice(0,4)+'...'+_k.slice(-4) : 'MISSING');
 
+// ════════════════════════════════════════════════════════════════════════════
+// SERVER GRADING ENGINE (Phase C)
+// POST /api/grade/run — authoritative server-side grading
+// Reads tickets from Supabase, fetches scores, grades, writes ledger + audit.
+// ════════════════════════════════════════════════════════════════════════════
+
+const FINAL_STATUSES_SG = new Set(['final','f','completed','complete','closed',
+  'cancelled','canceled','postponed','suspended','forfeit','f/ot','f/so']);
+
+function _sgIsGameFinal(s) { return s ? FINAL_STATUSES_SG.has(String(s).toLowerCase().trim()) : false; }
+
+function _sgNorm(s) {
+  if (!s) return '';
+  return String(s).toLowerCase().replace(/\s+/g,' ').trim().replace(/^the\s+/,'');
+}
+
+function _sgSameDateUTC(msA, msB) {
+  if (!msA || !msB) return true;
+  var a = new Date(msA), b = new Date(msB);
+  return a.getUTCFullYear()===b.getUTCFullYear()&&a.getUTCMonth()===b.getUTCMonth()&&a.getUTCDate()===b.getUTCDate();
+}
+
+function _sgAmToDecimal(o) {
+  var n = parseInt(String(o||0).replace('+',''));
+  if (!n || isNaN(n)) return 1;
+  return n > 0 ? n/100+1 : 100/Math.abs(n)+1;
+}
+
+function _sgFindGame(leg, games) {
+  var selMs  = leg.scheduled_start ? new Date(leg.scheduled_start).getTime() : 0;
+  var provId = leg.provider_game_id || null;
+  var cKey   = leg.canonical_game_key || null;
+  var selH   = _sgNorm(leg.home_team), selA = _sgNorm(leg.away_team);
+
+  if (provId) {
+    var p1 = games.find(function(g){ return g.id===provId || String(g.id)===String(provId); });
+    if (p1) return { game:p1, method:'provider_game_id' };
+  }
+  if (cKey) {
+    var sport = (leg.sport||'mlb').toUpperCase();
+    var p2 = games.filter(function(g){
+      var ga=_sgNorm(g.away||''), gh=_sgNorm(g.home||'');
+      var gMs = g._commenceMs||0;
+      var gDate = gMs ? new Date(gMs).toISOString().slice(0,10) : '';
+      var gKey = sport+'|'+ga.replace(/\s+/g,'-')+'|'+gh.replace(/\s+/g,'-')+'|'+gDate;
+      return gKey === cKey;
+    });
+    if (p2.length===1) return { game:p2[0], method:'canonical_game_key' };
+    if (p2.length>1)  return { game:null, reason:'ambiguous_match_refused', method:'canonical_game_key', candidates:p2.length };
+  }
+  if (selH && selA) {
+    var p3 = games.filter(function(g){
+      var gh=_sgNorm(g.home||''), ga=_sgNorm(g.away||'');
+      var teams=(gh===selH&&ga===selA)||(gh===selA&&ga===selH);
+      if (!teams) return false;
+      return selMs>0&&g._commenceMs>0 ? _sgSameDateUTC(selMs,g._commenceMs) : true;
+    });
+    if (p3.length===1) return { game:p3[0], method:'teams_date' };
+    if (p3.length>1)  return { game:null, reason:'ambiguous_match_refused', method:'teams_date', candidates:p3.length };
+    return { game:null, reason:'no_candidate', method:'teams_date', candidates:0 };
+  }
+  return { game:null, reason:'no_match_found', method:'none', candidates:0 };
+}
+
+function _sgGradeLeg(leg, game) {
+  var pick   = _sgNorm(leg.pick||'');
+  var market = (leg.market||'').toLowerCase();
+  var hs=game.home_score||game.homeScore, as=game.away_score||game.awayScore;
+  var home=_sgNorm(game.home||''), away=_sgNorm(game.away||'');
+  if (market.includes('moneyline')||market.includes('to win')) {
+    var winner=hs>as?home:as>hs?away:null;
+    if (!winner) return 'push';
+    return (pick.includes(winner)||pick.includes(winner.split(' ').pop()))?'won':'lost';
+  }
+  if (market.includes('run line')||market.includes('spread')) {
+    var m=pick.match(/([+-]?\d+\.?\d*)/);
+    if (!m) return null;
+    var spread=parseFloat(m[1]);
+    var isH=pick.includes(home)||pick.includes(home.split(' ').pop());
+    var margin=isH?(hs-as):(as-hs); var adj=margin+spread;
+    return adj>0?'won':adj<0?'lost':'push';
+  }
+  if (market.includes('total')||market.includes('over')||market.includes('under')) {
+    var m2=pick.match(/(\d+\.?\d*)/);
+    if (!m2) return null;
+    var line=parseFloat(m2[1]); var total=hs+as;
+    var isOver=pick.includes('over')||/^o\s/.test(pick);
+    if (total===line) return 'push';
+    return (isOver?total>line:total<line)?'won':'lost';
+  }
+  return null;
+}
+
+async function _sgFetchCompletedGames(daysBack) {
+  daysBack = daysBack || 3;
+  const oddsKey = process.env.ODDS_API_KEY;
+  if (!oddsKey) return [];
+  return new Promise(function(resolve) {
+    const https = require('https');
+    const url = `https://api.the-odds-api.com/v4/sports/baseball_mlb/scores/?apiKey=${oddsKey}&daysFrom=${daysBack}`;
+    const req = https.get(url, function(r) {
+      let d = '';
+      r.on('data', function(c){ d+=c; });
+      r.on('end', function(){
+        try {
+          const parsed = JSON.parse(d);
+          if (!Array.isArray(parsed)) { resolve([]); return; }
+          const completed = parsed.filter(function(g){ return g.completed&&g.scores&&g.scores.length>=2; });
+          const games = completed.map(function(g) {
+            const hs = parseInt((g.scores.find(function(s){ return s.name===g.home_team; })||{}).score||0);
+            const as = parseInt((g.scores.find(function(s){ return s.name===g.away_team; })||{}).score||0);
+            const cMs = g.commence_time ? new Date(g.commence_time).getTime() : 0;
+            return { id:g.id, home:g.home_team, away:g.away_team,
+              home_score:hs, away_score:as, status:'Final', completed:true,
+              _commenceMs:cMs };
+          });
+          resolve(games);
+        } catch(e) { resolve([]); }
+      });
+    });
+    req.on('error', function(){ resolve([]); });
+    req.setTimeout(8000, function(){ req.destroy(); resolve([]); });
+  });
+}
+
+app.post('/api/grade/run', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+
+  const { daysBack=3, playerId, clubId } = req.body||{};
+  const nowMs = Date.now();
+  const gradedAt = new Date().toISOString();
+
+  try {
+    // 1. Load active tickets from Supabase
+    let tq = sb.from('tickets')
+      .select('id,type,status,risk_amount,potential_profit,estimated_payout,graded_at,player_id,club_id')
+      .in('status',['active','open']);
+    if (playerId) tq = tq.eq('player_id', playerId);
+    if (clubId)   tq = tq.eq('club_id',   clubId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+    if (!tickets || !tickets.length) return res.json({ ok:true, checked:0, graded:0, skipped:0, errors:[], results:[] });
+
+    // Load legs for these tickets
+    const ticketIds = tickets.map(function(t){ return t.id; });
+    const { data: allLegs, error: lErr } = await sb.from('ticket_legs')
+      .select('id,ticket_id,leg_index,pick,market,odds,line,sport,home_team,away_team,canonical_game_key,scheduled_start,provider_game_id,game_status,leg_result')
+      .in('ticket_id', ticketIds);
+    if (lErr) throw lErr;
+
+    // 2. Fetch completed scores
+    const completedGames = await _sgFetchCompletedGames(daysBack);
+    console.log('[server grade] checked='+tickets.length+' completedGames='+completedGames.length);
+
+    const results = [];
+    let graded = 0, skipped = 0;
+    const errors = [];
+
+    for (const ticket of tickets) {
+      const ticketLegs = (allLegs||[]).filter(function(l){ return l.ticket_id===ticket.id; })
+        .sort(function(a,b){ return (a.leg_index||0)-(b.leg_index||0); });
+
+      const row = { ticketId:ticket.id, statusBefore:ticket.status, statusAfter:null,
+        result:null, matchMethod:null, payoutDelta:0, ledgerEntryId:null, auditEventId:null, reason:null };
+
+      try {
+        // Skip already settled (idempotency)
+        if (ticket.graded_at) { row.reason='already_graded'; skipped++; results.push(row); continue; }
+
+        // Future gate + grade
+        for (const leg of ticketLegs) {
+          const ctMs = leg.scheduled_start ? new Date(leg.scheduled_start).getTime() : 0;
+          if (ctMs>0 && ctMs>nowMs) { row.reason='future_game_not_gradeable'; break; }
+        }
+        if (row.reason) { skipped++; results.push(row); continue; }
+
+        // Match and grade each leg
+        const legResults = [];
+        let skipReason = null;
+        for (const leg of ticketLegs) {
+          const match = _sgFindGame(leg, completedGames);
+          row.matchMethod = match.method;
+          if (!match.game) { skipReason = match.reason||'no_match'; break; }
+          if (!_sgIsGameFinal(match.game.status)) { skipReason = 'game_not_final'; break; }
+          const lr = _sgGradeLeg(leg, match.game);
+          if (!lr) { skipReason = 'leg_unable_to_grade'; break; }
+          legResults.push(lr);
+        }
+
+        if (skipReason) { row.reason=skipReason; skipped++; results.push(row); continue; }
+        if (!legResults.length) { row.reason='no_legs'; skipped++; results.push(row); continue; }
+
+        const combined = legResults.some(function(r){return r==='lost';})?'lost':
+                         legResults.every(function(r){return r==='push';})?'push':
+                         legResults.some(function(r){return r==='push';})?'push':'won';
+
+        const risk    = parseFloat(ticket.risk_amount)||0;
+        const profit  = parseFloat(ticket.potential_profit)||0;
+        const payout  = combined==='won' ? Math.round((risk+profit)*100)/100
+                      : combined==='push' ? risk : 0;
+        const delta   = combined==='won' ? profit : combined==='push' ? 0 : -risk;
+
+        // Write ticket update
+        const { error: uErr } = await sb.from('tickets').update({
+          status: combined, graded_at: gradedAt, grading_source: 'server-api'
+        }).eq('id', ticket.id).eq('status','active'); // eq guard prevents double-grade
+        if (uErr) throw uErr;
+
+        // Write ledger entry (idempotency via deterministic id)
+        const ledgerId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
+        const ledgerType = combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost';
+        await sb.from('ledger_entries').upsert({
+          id: ledgerId, ticket_id: ticket.id,
+          player_id: ticket.player_id, club_id: ticket.club_id,
+          type: ledgerType, amount: combined==='won' ? profit : combined==='push' ? 0 : 0,
+          reason: 'server_grade_'+combined, created_at: gradedAt, created_by: 'server-grade-api'
+        }, { onConflict:'id' });
+
+        // Write audit event
+        const { data: auditData } = await sb.from('audit_events').insert({
+          event_type: 'ticket_graded_server',
+          ticket_id: ticket.id, player_id: ticket.player_id, club_id: ticket.club_id,
+          payload: { result:combined, matchMethod:row.matchMethod, legResults, payout, delta,
+                     legCount: ticketLegs.length }
+        }).select('id');
+
+        row.statusAfter    = combined;
+        row.result         = combined;
+        row.payoutDelta    = delta;
+        row.ledgerEntryId  = ledgerId;
+        row.auditEventId   = auditData&&auditData[0] ? auditData[0].id : null;
+        graded++;
+        console.log('[server grade] graded ticketId='+ticket.id+' result='+combined+' method='+row.matchMethod);
+
+      } catch(ticketErr) {
+        row.reason = 'error:'+ticketErr.message;
+        errors.push({ ticketId:ticket.id, error:ticketErr.message });
+        console.error('[server grade] error on ticket', ticket.id, ticketErr.message);
+      }
+
+      results.push(row);
+    }
+
+    res.json({ ok:true, checked:tickets.length, graded, skipped, errors, results });
+  } catch(e) {
+    console.error('[server grade] fatal:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// GET /api/grade/status — returns last-graded timestamp + recent results
+app.get('/api/grade/status', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ enabled:false, reason:'supabase_not_configured' });
+  try {
+    const { data: recent } = await sb.from('audit_events')
+      .select('id,event_type,ticket_id,payload,created_at')
+      .eq('event_type','ticket_graded_server')
+      .order('created_at',{ ascending:false }).limit(10);
+    const { data: active } = await sb.from('tickets')
+      .select('id',{ count:'exact' }).in('status',['active','open']);
+    res.json({ enabled:true, lastGradedAt: recent&&recent[0] ? recent[0].created_at : null,
+      recentGrades: recent||[], activeTicketCount: active ? active.length : 0 });
+  } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
+});
+// ════════════════════════════════════════════════════════════════════════════
+
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   // Init DB after server is bound
