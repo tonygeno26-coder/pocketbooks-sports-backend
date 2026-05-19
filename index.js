@@ -865,6 +865,102 @@ function _deriveClubId(actor, req) {
 // Extend requirePermission to enforce club scope
 // _safeClubId: get canonical clubId for a request (req._clubId set by scope middleware, or body/query in dev)
 // ════════════════════════════════════════════════════════════════════════════
+// CANONICAL LEDGER ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+
+const LEDGER_EVENT_TYPES = new Set([
+  'BET_PLACED','BET_CANCELED_REFUND','BET_GRADED_WIN','BET_GRADED_LOSS',
+  'BET_GRADED_PUSH','SETTLEMENT_APPLIED','WEEKLY_ROLLOVER','BALANCE_ADJUSTMENT'
+]);
+const LEDGER_DEBIT_EVENTS  = new Set(['BET_PLACED','SETTLEMENT_APPLIED']);
+const LEDGER_CREDIT_EVENTS = new Set(['BET_CANCELED_REFUND','BET_GRADED_WIN','BET_GRADED_PUSH','BALANCE_ADJUSTMENT']);
+
+function _ledgerDirection(eventType) {
+  if (LEDGER_DEBIT_EVENTS.has(eventType))  return 'debit';
+  if (LEDGER_CREDIT_EVENTS.has(eventType)) return 'credit';
+  return 'neutral';
+}
+
+function _ledgerId(eventType) {
+  return 'LE_'+eventType.slice(0,4)+'_'+Date.now()+'_'+_crypto.randomBytes(4).toString('hex');
+}
+
+// Derive ledger balance from rows
+function _deriveLedgerBalance(startingLimit, rows) {
+  let bal = parseFloat(startingLimit)||0;
+  (rows||[]).forEach(function(r) {
+    const amt = parseFloat(r.amount||r.amount_cents/100||0);
+    if (r.direction==='credit') bal+=amt;
+    else if (r.direction==='debit') bal-=amt;
+  });
+  return Math.round(bal*100)/100;
+}
+
+// Write a ledger entry to Supabase
+async function _writeLedgerEntry(params) {
+  const { clubId, playerId, ticketId, settlementId, eventType, amount,
+          balanceBefore, balanceAfter, idempotencyKey, createdBy, reason, metadataJson } = params;
+  if (!LEDGER_EVENT_TYPES.has(eventType)) throw new Error('invalid_eventType:'+eventType);
+  const amt = parseFloat(amount);
+  if (isNaN(amt)||amt<0) throw new Error('invalid_amount:'+amount);
+  const dir = _ledgerDirection(eventType);
+  const ledgerId = _ledgerId(eventType);
+  const row = {
+    ledger_id:ledgerId, club_id:clubId||'', player_id:playerId||'',
+    ticket_id:ticketId||null, settlement_id:settlementId||null,
+    event_type:eventType, amount:amt, currency:'diamonds', direction:dir,
+    balance_before:balanceBefore!=null?Math.round(balanceBefore*100)/100:null,
+    balance_after:balanceAfter!=null?Math.round(balanceAfter*100)/100:null,
+    idempotency_key:idempotencyKey||null,
+    created_at:new Date().toISOString(), created_by:createdBy||'system',
+    reason:reason||eventType, metadata_json:metadataJson||null
+  };
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { error } = await sb.from('ledger').insert(row);
+      if (error) {
+        // Unique constraint = idempotent duplicate
+        if (error.code === '23505') return { ok:true, idempotent:true, ledgerId };
+        throw error;
+      }
+    }
+  } catch(e) {
+    if (e.code==='23505') return { ok:true, idempotent:true, ledgerId };
+    throw e;
+  }
+  console.log('[ledger] '+eventType+' club='+clubId+' player='+playerId+' amt='+amt+
+    (ticketId?' ticket='+ticketId:'')+(idempotencyKey?' idem='+idempotencyKey:''));
+  return { ok:true, ledgerId, row };
+}
+
+// Fetch player ledger rows from Supabase
+async function _fetchPlayerLedger(clubId, playerId) {
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('ledger').select('*')
+        .eq('club_id',clubId).eq('player_id',playerId).order('created_at');
+      return data || [];
+    }
+  } catch(_e) {}
+  return [];
+}
+
+// Derive available balance from ledger + active tickets
+async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
+  const rows = await _fetchPlayerLedger(clubId, playerId);
+  const { data: activeTix } = (getSupabase() ? await getSupabase().from('tickets')
+    .select('risk_amount').eq('player_id',playerId).in('status',['active','open']) : { data:[] }) || { data:[] };
+  const ledgerBal = _deriveLedgerBalance(startingLimit, rows);
+  const openRisk  = (activeTix||[]).reduce(function(s,t){ return s+parseFloat(t.risk_amount||0); }, 0);
+  const available = Math.round((ledgerBal-openRisk)*100)/100;
+  return { ledgerBal, openRisk, available, rows };
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════════════════════
 // IDEMPOTENCY ENGINE
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2824,14 +2920,19 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
     if (lErr) throw lErr;
 
-    // 7. Write ledger entry (idempotencyKey as id)
-    const { error: leErr } = await sb.from('ledger_entries').upsert({
+    // 7a. Legacy ledger_entries mirror (Phase A compat)
+    await sb.from('ledger_entries').upsert({
       id: idempotencyKey, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_placed',
-      amount: rnd(-stakeAmt),  // negative = player debit
-      reason: 'bet_placed:'+betType, created_at: now, created_by: playerId
-    }, { onConflict:'id' });
-    if (leErr) throw leErr;
+      amount: rnd(-stakeAmt), reason: 'bet_placed:'+betType,
+      created_at: now, created_by: playerId
+    }, { onConflict:'id' }).catch(()=>{});
+
+    // 7b. Phase H canonical ledger write (BET_PLACED debit)
+    await _writeLedgerEntry({
+      clubId, playerId, ticketId, eventType:'BET_PLACED', amount:rnd(stakeAmt),
+      idempotencyKey, createdBy:playerId, reason:'bet_placed:'+betType
+    });
 
     // 8. Audit event
     await sb.from('audit_events').insert({
@@ -2897,15 +2998,20 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
       .eq('id', ticketId).eq('status','active');
     if (uErr) throw uErr;
 
-    // 5. Write refund ledger entry (idempotent)
+    // 5. Write refund ledger entry (Phase H canonical + legacy)
     const riskAmt = parseFloat(ticket.risk_amount)||0;
-    const { error: leErr } = await sb.from('ledger_entries').upsert({
-      id: idempotencyKey, club_id: clubId||ticket.club_id||null,
-      player_id: playerId, ticket_id: ticketId,
-      type: 'bet_canceled', amount: riskAmt,  // positive = refund to player
+    // Legacy mirror
+    await sb.from('ledger_entries').upsert({
+      id: idempotencyKey, club_id: clubId||ticket.club_id||null, player_id: playerId,
+      ticket_id: ticketId, type: 'bet_canceled', amount: riskAmt,
       reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: playerId
-    }, { onConflict:'id' });
-    if (leErr) throw leErr;
+    }, { onConflict:'id' }).catch(()=>{});
+    // Canonical ledger
+    await _writeLedgerEntry({
+      clubId: clubId||ticket.club_id, playerId, ticketId,
+      eventType:'BET_CANCELED_REFUND', amount:riskAmt,
+      idempotencyKey, createdBy:playerId, reason:'cancel_refund:'+(reason||'player_request')
+    });
 
     // 6. Audit event
     await sb.from('audit_events').insert({
@@ -3011,6 +3117,54 @@ app.get('/api/player/dashboard', requirePermissionScoped('view_player_dashboard'
     console.error('[player/dashboard] error:', e.message);
     res.status(500).json({ ok:false, source:'db_error', error:e.message, balance:null });
   }
+});
+
+// GET /api/host/reconciliation — Phase H atomic ledger balance reconciliation
+app.get('/api/host/reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId } = req.query;
+  const sb = getSupabase();
+  if (!sb || !clubId) return res.json({ ok:false, error:'missing_clubId_or_supabase' });
+  try {
+    // Load all club players
+    const { data: members } = await sb.from('club_memberships')
+      .select('actor_id,role').eq('club_id',clubId).eq('status','active');
+    const { data: limits }  = await sb.from('player_limits')
+      .select('player_id,balance_start').eq('club_id',clubId);
+    const balanceMap = {};
+    (limits||[]).forEach(function(l){ balanceMap[l.player_id]=parseFloat(l.balance_start)||1000; });
+
+    const players = [];
+    for (const m of (members||[])) {
+      const pid = m.actor_id;
+      const startingLimit = balanceMap[pid]||1000;
+      // Ledger-derived balance
+      const { data: ledgerRows } = await sb.from('ledger').select('amount,direction')
+        .eq('club_id',clubId).eq('player_id',pid);
+      const { data: activeTix } = await sb.from('tickets').select('risk_amount,status,potential_profit')
+        .eq('club_id',clubId).eq('player_id',pid);
+      const allTix = activeTix||[];
+      const ledgerBal = _deriveLedgerBalance(startingLimit, ledgerRows||[]);
+      const openRisk  = allTix.filter(function(t){ return t.status==='active'||t.status==='open'; })
+                              .reduce(function(s,t){ return s+parseFloat(t.risk_amount||0); },0);
+      const ledgerAvail = Math.round((ledgerBal-openRisk)*100)/100;
+      // Ticket-derived (old)
+      let gains=0, losses=0;
+      allTix.forEach(function(t){
+        if(t.status==='won') gains+=parseFloat(t.potential_profit||0);
+        if(t.status==='lost') losses+=parseFloat(t.risk_amount||0);
+      });
+      const ticketAvail = Math.round((startingLimit-openRisk-losses+gains)*100)/100;
+      const mismatch = Math.abs(ledgerAvail-ticketAvail)>0.01;
+      const lastRow = (ledgerRows||[]).slice(-1)[0];
+      players.push({ playerId:pid, role:m.role, startingLimit, ledgerBal, ledgerAvail,
+                     ticketAvail, openRisk, mismatch,
+                     lastLedgerId:lastRow&&lastRow.ledger_id||null });
+    }
+    const mismatches = players.filter(function(p){ return p.mismatch; });
+    res.json({ ok:true, clubId, players, mismatchCount:mismatches.length,
+               healthy:mismatches.length===0 });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
 // GET /api/host/settlement-reconciliation — read-only balance proof
