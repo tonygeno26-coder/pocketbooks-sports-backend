@@ -671,6 +671,166 @@ function _deriveClubId(actor, req) {
 
 // Extend requirePermission to enforce club scope
 // _safeClubId: get canonical clubId for a request (req._clubId set by scope middleware, or body/query in dev)
+// ════════════════════════════════════════════════════════════════════════════
+// IDEMPOTENCY ENGINE
+// ════════════════════════════════════════════════════════════════════════════
+
+const KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24h
+// In-memory fallback when Supabase is unavailable
+const _idemMemStore = new Map();
+
+function _sortKeys(obj) {
+  if (Array.isArray(obj)) return obj.map(_sortKeys);
+  if (obj && typeof obj === 'object') {
+    return Object.keys(obj).sort().reduce((acc,k) => { acc[k]=_sortKeys(obj[k]); return acc; }, {});
+  }
+  return obj;
+}
+
+function _hashRequest(endpoint, actorId, clubId, body) {
+  const canonical = JSON.stringify({ endpoint, actorId, clubId:clubId||'', body:_sortKeys(body||{}) });
+  return require('crypto').createHash('sha256').update(canonical).digest('hex').slice(0,32);
+}
+
+// Load an idempotency record (DB first, memory fallback)
+async function _idemLoad(key) {
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('idempotency_keys').select('*').eq('idempotency_key',key).limit(1);
+      if (data && data[0]) return data[0];
+    }
+  } catch(_e) {}
+  return _idemMemStore.get(key) || null;
+}
+
+// Save an idempotency record
+async function _idemSave(row) {
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('idempotency_keys').upsert(row, { onConflict:'idempotency_key' });
+  } catch(_e) {}
+  _idemMemStore.set(row.idempotency_key, row); // always update memory
+}
+
+// Core: check and reserve (or replay)
+async function _idemCheck(key, endpoint, actorId, clubId, body) {
+  if (!key) return { action:'execute', warn:'no_idempotency_key' };
+  const reqHash = _hashRequest(endpoint, actorId, clubId, body);
+  const nowMs   = Date.now();
+  const existing = await _idemLoad(key);
+
+  if (!existing) {
+    // Reserve as pending
+    const row = {
+      idempotency_key:key, actor_id:actorId, club_id:clubId||'', endpoint,
+      request_hash:reqHash, status:'pending',
+      response_status:null, response_body:null,
+      created_at:new Date(nowMs).toISOString(),
+      completed_at:null,
+      expires_at:new Date(nowMs+KEY_TTL_MS).toISOString()
+    };
+    await _idemSave(row);
+    return { action:'execute', row };
+  }
+
+  // Expired?
+  if (existing.expires_at && nowMs > new Date(existing.expires_at).getTime()) {
+    console.log('[idem] key expired, re-executing:', key);
+    return { action:'execute', warn:'key_expired_reused' };
+  }
+
+  // Actor/club/hash conflicts
+  if (existing.actor_id !== actorId)
+    return { action:'conflict', reason:'actor_mismatch', status:409 };
+  if (existing.club_id !== (clubId||''))
+    return { action:'conflict', reason:'club_mismatch', status:409 };
+  if (existing.request_hash !== reqHash)
+    return { action:'conflict', reason:'body_mismatch', status:409 };
+
+  if (existing.status === 'pending')
+    return { action:'in_progress', status:409, existingRow:existing };
+
+  // Completed or failed — replay
+  console.log('[idem] replaying key='+key+' status='+existing.status+
+    ' responseStatus='+existing.response_status);
+  return { action:'replay', existingRow:existing };
+}
+
+// Mark completed after execution
+async function _idemComplete(key, responseStatus, responseBody) {
+  const existing = await _idemLoad(key);
+  if (!existing) return;
+  const row = Object.assign({}, existing, {
+    status: (responseStatus >= 200 && responseStatus < 300) ? 'completed' : 'failed',
+    response_status: responseStatus,
+    response_body: responseBody,
+    completed_at: new Date().toISOString()
+  });
+  await _idemSave(row);
+}
+
+// Express middleware factory: enforce idempotency for money endpoints
+function requireIdempotency(opts) {
+  return async function(req, res, next) {
+    const key = (req.headers['idempotency-key'] || '').trim() ||
+                (req.body && req.body.idempotencyKey) || null;
+    if (!key && opts && opts.required) {
+      return res.status(400).json({ ok:false, error:'missing_idempotency_key',
+        hint:'Include Idempotency-Key header or idempotencyKey in body' });
+    }
+    if (!key) return next(); // optional endpoints skip
+
+    const actor  = req._actor || {};
+    const clubId = req._clubId || '';
+    const result = await _idemCheck(key, req.path, actor.actorId||'anon', clubId, req.body);
+
+    if (result.action === 'replay') {
+      const stored = result.existingRow;
+      console.log('[idem] REPLAY key='+key+' endpoint='+req.path);
+      return res.status(stored.response_status||200).json(stored.response_body);
+    }
+    if (result.action === 'conflict') {
+      console.log('[idem] CONFLICT key='+key+' reason='+result.reason);
+      return res.status(409).json({ ok:false, error:'idempotency_conflict', reason:result.reason });
+    }
+    if (result.action === 'in_progress') {
+      return res.status(409).json({ ok:false, error:'request_in_progress',
+        hint:'Identical request is being processed. Retry after 2s.' });
+    }
+
+    // Store key for completion after handler
+    req._idemKey = key;
+    // Monkey-patch res.json to auto-complete idempotency after response
+    const _origJson = res.json.bind(res);
+    res.json = function(body) {
+      _idemComplete(key, res.statusCode||200, body).catch(()=>{});
+      return _origJson(body);
+    };
+    next();
+  };
+}
+
+// Supabase migration DDL for idempotency_keys table (for reference/docs)
+const IDEMPOTENCY_TABLE_DDL = `
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+  idempotency_key  TEXT PRIMARY KEY,
+  actor_id         TEXT NOT NULL,
+  club_id          TEXT NOT NULL DEFAULT '',
+  endpoint         TEXT NOT NULL,
+  request_hash     TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'pending',
+  response_status  INTEGER,
+  response_body    JSONB,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at     TIMESTAMPTZ,
+  expires_at       TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idempotency_keys_expires_at ON idempotency_keys(expires_at);
+`;
+
+// ════════════════════════════════════════════════════════════════════════════
+
 function _safeClubId(req) {
   if (req._clubId !== undefined) return req._clubId;
   return (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
@@ -1499,7 +1659,7 @@ async function _sgFetchCompletedGames(daysBack) {
   });
 }
 
-app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), async (req, res) => {
+app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdempotency({required:false}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
 
@@ -1713,7 +1873,7 @@ app.get('/api/markets/health', (req, res) => {
 });
 
 // POST /api/markets/refresh — force cache refresh (dev/admin)
-app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh'), async (req, res) => {
+app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh'), requireIdempotency({required:false}), async (req, res) => {
   try {
     await pollLiveOddsLoop();
     const cache = LIVE_MARKET_CACHE;
@@ -1896,7 +2056,7 @@ app.get('/api/host/settlements-preview', requirePermissionScoped('view_settlemen
 });
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
-app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), async (req, res) => {
+app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -2013,7 +2173,7 @@ function _getISOWeek(date) {
 }
 
 // POST /api/host/weekly-rollover
-app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), async (req, res) => {
+app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -2136,7 +2296,7 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 
 // ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
 // POST /api/bets/place
-app.post('/api/bets/place', requirePermissionScoped('place_bet'), async (req, res) => {
+app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -2296,7 +2456,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), async (req, re
 // ───────────────────────────────────────────────────────────────────────═
 
 // POST /api/bets/cancel — DB-authoritative ticket cancellation
-app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), async (req, res) => {
+app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
