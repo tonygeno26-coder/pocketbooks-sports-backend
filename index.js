@@ -1206,6 +1206,111 @@ app.get('/api/host/settlements-preview', async (req, res) => {
   }
 });
 
+// POST /api/host/settle-player — execute settlement, write ledger + audit
+app.post('/api/host/settle-player', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
+
+  // Validate inputs
+  const VALID_DIR = new Set(['player_paid_host','host_paid_player']);
+  const errors = [];
+  if (!clubId)         errors.push('missing_clubId');
+  if (!playerId)       errors.push('missing_playerId');
+  if (!idempotencyKey) errors.push('missing_idempotencyKey');
+  if (!VALID_DIR.has(direction)) errors.push('invalid_direction:'+direction);
+  const amt = parseFloat(amount);
+  if (isNaN(amt) || amt <= 0) errors.push('invalid_amount');
+  if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  try {
+    // 1. Recalculate preview server-side
+    let tq = sb.from('tickets')
+      .select('id,status,risk_amount,potential_profit,player_id')
+      .eq('club_id', clubId).eq('player_id', playerId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+
+    var owesHost=0, hostOwes=0;
+    (tickets||[]).forEach(function(t){
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed'||s==='active'||s==='open') return;
+      if (s==='lost') owesHost += r;
+      if (s==='won')  hostOwes += p;
+    });
+    // Net
+    var net = hostOwes - owesHost; // positive = host owes player
+    if (net > 0) { hostOwes=net; owesHost=0; } else { owesHost=-net; hostOwes=0; }
+
+    // Direction / overpay validation
+    if (direction==='player_paid_host' && owesHost<=0)
+      return res.status(400).json({ ok:false, error:'player_does_not_owe_host', owesHost, hostOwes });
+    if (direction==='host_paid_player' && hostOwes<=0)
+      return res.status(400).json({ ok:false, error:'host_does_not_owe_player', owesHost, hostOwes });
+    var maxAmt = direction==='player_paid_host' ? owesHost : hostOwes;
+    if (amt > maxAmt + 0.01)
+      return res.status(400).json({ ok:false, error:'overpay_blocked', amount:amt, maxAmount:maxAmt });
+
+    // 2. Write ledger entry (idempotent via idempotencyKey)
+    var ledgerAmt = direction==='host_paid_player' ? amt : -amt;
+    var executedAt = new Date().toISOString();
+    const { error: lErr } = await sb.from('ledger_entries').upsert({
+      id:              idempotencyKey,
+      club_id:         clubId,
+      player_id:       playerId,
+      ticket_id:       null,
+      type:            'settlement',
+      amount:          Math.round(ledgerAmt*100)/100,
+      balance_before:  null,
+      balance_after:   null,
+      reason:          direction + (note ? ': '+note : ''),
+      created_at:      executedAt,
+      created_by:      'host',
+      settlement_week: settlementWeek||null,
+      preview_snapshot: JSON.stringify({ owesHost, hostOwes, net, maxAmt, direction, amount:amt })
+    }, { onConflict:'id' });
+    if (lErr) throw lErr;
+
+    // 3. Write audit event
+    await sb.from('audit_events').insert({
+      event_type: 'settlement_executed',
+      club_id: clubId, player_id: playerId,
+      payload: { direction, amount:amt, maxAmount:maxAmt, settlementWeek, idempotencyKey, note: note||null }
+    });
+
+    // 4. Return updated preview
+    const { data: updatedPreview } = await sb.from('tickets')
+      .select('id,status,risk_amount,potential_profit,player_id,placed_at')
+      .eq('club_id', clubId);
+    var byPid = {};
+    (updatedPreview||[]).forEach(function(t){
+      var pid=t.player_id; if(!byPid[pid]) byPid[pid]={owesHost:0,hostOwes:0,openRisk:0};
+      var s=t.status.toLowerCase(),r=parseFloat(t.risk_amount)||0,p=parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='pushed'||s==='push') return;
+      if (s==='active'||s==='open')  byPid[pid].openRisk+=r;
+      else if (s==='lost')           byPid[pid].owesHost+=r;
+      else if (s==='won')            byPid[pid].hostOwes+=p;
+    });
+    var rnd=function(v){return Math.round((isNaN(v)?0:v)*100)/100;};
+    Object.values(byPid).forEach(function(p){
+      var net=p.hostOwes-p.owesHost;
+      if(net>0){p.hostOwes=rnd(net);p.owesHost=0;}else{p.owesHost=rnd(-net);p.hostOwes=0;}
+      p.openRisk=rnd(p.openRisk);
+    });
+
+    console.log('[settle-player] success idempotencyKey='+idempotencyKey+' direction='+direction+' amount='+amt);
+    res.json({
+      ok: true, executed: true,
+      ledgerEntryId: idempotencyKey,
+      direction, amount: amt, settlementWeek,
+      previewAfter: byPid
+    });
+  } catch(e) {
+    console.error('[settle-player] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
