@@ -585,8 +585,10 @@ function _verifyToken(token) {
 }
 
 // Sign a session token for a player/host (called after login/pairing)
-function issueSessionToken(actorId, role, clubId, expiresInSec) {
-  return _signToken({ sub:actorId, actorId, role, clubId: clubId||'' }, expiresInSec);
+function issueSessionToken(actorId, role, clubId, expiresInSec, platformRole) {
+  const payload = { sub:actorId, actorId, role, clubId: clubId||'' };
+  if (platformRole) payload.platformRole = platformRole;
+  return _signToken(payload, expiresInSec);
 }
 
 // ── REQUIRE ACTOR (Phase C — token-trusted) ───────────────────────────────────────────
@@ -607,17 +609,20 @@ function requireActor(req) {
       return { error:result.error, status:401, auditEvent:evType };
     }
     const p    = result.payload;
-    const role = ROLE_RANK[p.role] != null ? p.role : 'view_only';
-    const club = reqClub || p.clubId || '';
-    if (IS_PRODUCTION) console.log('[auth] token ok actor='+p.sub+' role='+role+' club='+club);
-    return { actorId:p.sub||p.actorId, role, clubId:club, isDevBypass:false, fromToken:true };
+    const role  = ROLE_RANK[p.role] != null ? p.role : 'view_only';
+    const club  = p.clubId || '';
+    const platRole = p.platformRole || null;
+    if (IS_PRODUCTION) console.log('[auth] token ok actor='+p.sub+' role='+role+' club='+club+(platRole?'+'+platRole:''));
+    return { actorId:p.sub||p.actorId, role, clubId:club, platformRole:platRole,
+             isDevBypass:false, fromToken:true };
   }
 
   // 2. Dev bypass (no token provided)
   if (bypassAllowed) {
     const bypassClub = reqClub || 'dev-club';
     console.log('[auth] DEV BYPASS actor=dev-owner role=owner club='+bypassClub);
-    return { actorId:'dev-owner', role:'owner', clubId:bypassClub, isDevBypass:true };
+    return { actorId:'dev-owner', role:'owner', clubId:bypassClub,
+             platformRole:'platform_admin', isDevBypass:true };
   }
 
   // 3. Production, no token — x-actor-role is NOT trusted
@@ -626,14 +631,90 @@ function requireActor(req) {
   return { error:'unauthenticated', status:401, auditEvent:'unauthenticated' };
 }
 
-function _writeAuthAudit(eventType, actorId, clubId, endpoint) {
+function _writeAuthAudit(eventType, actorId, clubId, endpoint, extra) {
   try {
     const sb = getSupabase();
     if (sb) sb.from('audit_events').insert({
       event_type: eventType, player_id: actorId||null, club_id: clubId||null,
-      payload: { endpoint, eventType }
+      payload: Object.assign({ endpoint, eventType }, extra||{})
     }).then(()=>{}).catch(()=>{});
   } catch(_e){}
+}
+
+// ── CLUB SCOPE ENFORCEMENT ────────────────────────────────────────────────────────────────────
+function _checkClubScope(actor, requestedClubId) {
+  if (actor.error) return { ok:false, reason:actor.error, auditEvent:actor.error };
+  if (!requestedClubId) return { ok:true }; // no club in request — DB filter applies
+  if (actor.platformRole === 'platform_admin') return { ok:true, crossClub:true };
+  if (actor.isDevBypass) return { ok:true };
+  if (actor.clubId && actor.clubId !== requestedClubId) {
+    return {
+      ok:false, reason:'club_scope_mismatch', status:403,
+      auditEvent:'club_scope_mismatch',
+      actorClubId:actor.clubId, requestedClubId
+    };
+  }
+  return { ok:true };
+}
+
+// Derive canonical clubId for DB queries — never trust body/query in production
+function _deriveClubId(actor, req) {
+  if (!actor || actor.error) return null;
+  const bodyClub  = req.body  && req.body.clubId;
+  const queryClub = req.query && req.query.clubId;
+  // platform_admin and dev bypass may use body/query
+  if (actor.platformRole === 'platform_admin') return bodyClub || queryClub || actor.clubId;
+  if (actor.isDevBypass) return bodyClub || queryClub || actor.clubId;
+  // Production: ONLY trust token clubId
+  return actor.clubId || null;
+}
+
+// Extend requirePermission to enforce club scope
+// _safeClubId: get canonical clubId for a request (req._clubId set by scope middleware, or body/query in dev)
+function _safeClubId(req) {
+  if (req._clubId !== undefined) return req._clubId;
+  return (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
+}
+
+function requirePermissionScoped(action, getTargetPlayerId) {
+  return async function(req, res, next) {
+    const actor = requireActor(req);
+    // Club scope: derive from token; check against body/query value (must match)
+    const requestedClubId = (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
+    const scope = _checkClubScope(actor, requestedClubId);
+    if (!scope.ok) {
+      console.log('[auth] CLUB_SCOPE_MISMATCH actor='+(actor.actorId||'?')+
+        ' actorClub='+(actor.clubId||'?')+' requestedClub='+(requestedClubId||'?')+' action='+action);
+      _writeAuthAudit('club_scope_mismatch', actor.actorId, actor.clubId, req.path,
+        { requestedClubId, action, role:actor.role });
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+        actorClubId:actor.clubId, requestedClubId, action });
+    }
+    // Permission check (role)
+    const targetId = typeof getTargetPlayerId === 'function'
+      ? getTargetPlayerId(req) : (req.body && req.body.playerId) || (req.query && req.query.playerId);
+    const perm = _checkPermission(actor, action, targetId);
+    if (!perm.allowed) {
+      console.log('[auth] DENIED actor='+(actor.actorId||'?')+' role='+(actor.role||'?')+
+        ' action='+action+' reason='+perm.reason);
+      _writeAuthAudit('permission_denied', actor.actorId, actor.clubId, req.path,
+        { action, role:actor.role, reason:perm.reason, required:perm.required, requestedClubId });
+      return res.status(perm.status||403).json({ ok:false, error:'permission_denied',
+        reason:perm.reason, required:perm.required, actual:perm.actual });
+    }
+    // Stamp canonical clubId onto req for handler use
+    req._actor  = actor;
+    req._clubId = _deriveClubId(actor, req);
+    if (actor.isDevBypass) console.log('[auth] DEV BYPASS passthrough action='+action+' club='+req._clubId);
+    // Audit sensitive grants
+    const SENSITIVE = new Set(['settle_player','weekly_rollover','run_server_grade',
+                                'grade_trigger','force_market_refresh']);
+    if (SENSITIVE.has(action) && !actor.isDevBypass) {
+      _writeAuthAudit('permission_granted', actor.actorId, actor.clubId, req.path,
+        { action, role:actor.role, fromToken:!!actor.fromToken, requestedClubId });
+    }
+    next();
+  };
 }
 
 // Check permission for action; targetPlayerId for player-self actions
@@ -1418,7 +1499,7 @@ async function _sgFetchCompletedGames(daysBack) {
   });
 }
 
-app.post('/api/grade/run', requirePermission('grade_trigger'), async (req, res) => {
+app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
 
@@ -1632,7 +1713,7 @@ app.get('/api/markets/health', (req, res) => {
 });
 
 // POST /api/markets/refresh — force cache refresh (dev/admin)
-app.post('/api/markets/refresh', requirePermission('force_market_refresh'), async (req, res) => {
+app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh'), async (req, res) => {
   try {
     await pollLiveOddsLoop();
     const cache = LIVE_MARKET_CACHE;
@@ -1646,9 +1727,10 @@ app.post('/api/markets/refresh', requirePermission('force_market_refresh'), asyn
 // ───────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/dashboard?clubId=...
-app.get('/api/host/dashboard', requirePermission('view_host_dashboard'), async (req, res) => {
+app.get('/api/host/dashboard', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
   try {
     // Load tickets
@@ -1730,9 +1812,10 @@ app.get('/api/host/dashboard', requirePermission('view_host_dashboard'), async (
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
-app.get('/api/host/settlements-preview', requirePermission('view_settlement_history'), async (req, res) => {
+app.get('/api/host/settlements-preview', requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
   try {
     // Load all tickets for this club
@@ -1813,9 +1896,10 @@ app.get('/api/host/settlements-preview', requirePermission('view_settlement_hist
 });
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
-app.post('/api/host/settle-player', requirePermission('settle_player'), async (req, res) => {
+app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
 
   // Validate inputs
@@ -1929,9 +2013,10 @@ function _getISOWeek(date) {
 }
 
 // POST /api/host/weekly-rollover
-app.post('/api/host/weekly-rollover', requirePermission('weekly_rollover'), async (req, res) => {
+app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, rolloverWeek, performedBy } = req.body || {};
 
   if (!clubId) return res.status(400).json({ ok:false, errors:['missing_clubId'] });
@@ -2051,9 +2136,10 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 
 // ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
 // POST /api/bets/place
-app.post('/api/bets/place', requirePermission('place_bet'), async (req, res) => {
+app.post('/api/bets/place', requirePermissionScoped('place_bet'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, betType, stake, legs, payout, potentialProfit,
           idempotencyKey, playerUsername } = req.body || {};
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
@@ -2210,9 +2296,10 @@ app.post('/api/bets/place', requirePermission('place_bet'), async (req, res) => 
 // ───────────────────────────────────────────────────────────────────────═
 
 // POST /api/bets/cancel — DB-authoritative ticket cancellation
-app.post('/api/bets/cancel', requirePermission('cancel_bet'), async (req, res) => {
+app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, ticketId, idempotencyKey, reason } = req.body || {};
   const now = new Date().toISOString();
   const errors = [];
@@ -2282,9 +2369,10 @@ app.post('/api/bets/cancel', requirePermission('cancel_bet'), async (req, res) =
 });
 
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
-app.get('/api/player/dashboard', requirePermission('view_player_dashboard'), async (req, res) => {
+app.get('/api/player/dashboard', requirePermissionScoped('view_player_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', balance:null });
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
   if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
@@ -2373,9 +2461,10 @@ app.get('/api/player/dashboard', requirePermission('view_player_dashboard'), asy
 });
 
 // GET /api/host/settlement-reconciliation — read-only balance proof
-app.get('/api/host/settlement-reconciliation', requirePermission('view_settlement_history'), async (req, res) => {
+app.get('/api/host/settlement-reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   try {
