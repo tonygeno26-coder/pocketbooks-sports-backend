@@ -523,6 +523,103 @@ function fetchOdds(sport) {
 }
 
 
+// ── ODDS VALIDATION HELPERS ───────────────────────────────────────────────────────────────────────────
+const ODDS_TOLERANCE_PTS = 3; // ±3 American-odds-points drift allowed
+
+// Build a flat lookup map: "canonicalGameKey|market" -> { outcomes, suspended, closed }
+// from a raw Odds API response array.
+function buildLiveMarketMap(gamesArr, marketType) {
+  const map = {};
+  if (!Array.isArray(gamesArr)) return map;
+  for (const game of gamesArr) {
+    const homeTeam = (game.home_team||'').toLowerCase().replace(/\s+/g,'-');
+    const awayTeam = (game.away_team||'').toLowerCase().replace(/\s+/g,'-');
+    const sport    = (game.sport_key||'').split('_')[0];
+    const dateStr  = game.commence_time ? game.commence_time.slice(0,10) : '';
+    const cKey     = sport.toUpperCase()+'|'+awayTeam+'|'+homeTeam+'|'+dateStr;
+    // Also index by provider game id for fast lookup
+    const gameId   = game.id;
+
+    for (const bookmaker of (game.bookmakers||[])) {
+      for (const market of (bookmaker.markets||[])) {
+        const mLabel = market.key; // 'h2h' | 'spreads' | 'totals'
+        const normalized = mLabel === 'h2h' ? 'moneyline' : mLabel === 'spreads' ? 'spread' : mLabel === 'totals' ? 'total' : mLabel;
+        const mapKey = cKey + '|' + normalized;
+        if (!map[mapKey]) {
+          map[mapKey] = {
+            cKey, gameId, market: normalized,
+            suspended: false, closed: false,
+            outcomes: market.outcomes || []
+          };
+        }
+        // Also index by providerGameId for P1 match
+        const idKey = gameId + '|' + normalized;
+        if (!map[idKey]) map[idKey] = map[mapKey];
+      }
+    }
+  }
+  return map;
+}
+
+// Validate one leg vs live market map. Returns { ok, code, ... }
+function validateLegOdds(leg, liveMap, nowMs) {
+  nowMs = nowMs || Date.now();
+  // Game started?
+  if (leg.scheduledStart) {
+    const ct = new Date(leg.scheduledStart).getTime();
+    if (!isNaN(ct) && nowMs >= ct) return { ok:false, code:'game_started', leg:leg.pick };
+  }
+  // Find live market: try providerGameId first (P1), then cKey (P2)
+  const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
+  const liveMarket =
+    (leg.providerGameId && liveMap[leg.providerGameId+'|'+mLabel]) ||
+    (leg.canonicalGameKey && liveMap[leg.canonicalGameKey+'|'+mLabel]);
+
+  if (!liveMarket) return { ok:false, code:'market_closed', leg:leg.pick, reason:'not_found' };
+  if (liveMarket.suspended) return { ok:false, code:'market_closed', leg:leg.pick, reason:'suspended' };
+  if (liveMarket.closed)    return { ok:false, code:'market_closed', leg:leg.pick, reason:'closed' };
+
+  // Match outcome by pick name (case-insensitive)
+  const outcome = (liveMarket.outcomes||[]).find(o =>
+    o.name && leg.pick && o.name.toLowerCase() === leg.pick.toLowerCase()
+  );
+  if (!outcome) return { ok:false, code:'market_closed', leg:leg.pick, reason:'outcome_not_found' };
+
+  // Drift check (American points)
+  const drift = Math.abs(outcome.price - parseInt(leg.odds,10));
+  if (drift > ODDS_TOLERANCE_PTS) {
+    return { ok:false, code:'odds_changed', leg:leg.pick,
+             oldOdds: parseInt(leg.odds,10), newOdds: outcome.price, drift };
+  }
+  return { ok:true, liveOdds: outcome.price, leg: leg.pick };
+}
+
+// Validate all legs — first failure blocks ticket
+function validateAllLegsOdds(legs, liveMap, nowMs) {
+  for (let i=0; i<legs.length; i++) {
+    const r = validateLegOdds(legs[i], liveMap, nowMs);
+    if (!r.ok) return Object.assign(r, { legIndex:i });
+  }
+  return { ok:true };
+}
+
+// Build updated odds snapshot (for accept-new-odds resubmit)
+function buildAcceptedOddsSnapshot(legs, liveMap) {
+  const now = new Date().toISOString();
+  return legs.map(function(leg) {
+    const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
+    const liveMarket = (leg.providerGameId && liveMap[leg.providerGameId+'|'+mLabel]) ||
+                       (leg.canonicalGameKey && liveMap[leg.canonicalGameKey+'|'+mLabel]);
+    const outcome = liveMarket && (liveMarket.outcomes||[]).find(o =>
+      o.name && o.name.toLowerCase() === (leg.pick||'').toLowerCase());
+    return Object.assign({}, leg, {
+      odds: outcome ? outcome.price : leg.odds,
+      oddsAcceptedAt: now
+    });
+  });
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 // Debug: confirm env vars are set (no values exposed)
 app.get('/api/env-check', (req, res) => {
   res.json({
@@ -1579,7 +1676,48 @@ app.post('/api/bets/place', async (req, res) => {
     if (stakeAmt > available + 0.005)
       return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
 
-    // 3. Conflict check: active legs on same game+market
+    // 3. Odds validation — re-fetch live odds and verify each leg
+    // Skip if player explicitly accepted updated odds (oddsAccepted:true on body)
+    if (!body.oddsAccepted) {
+      try {
+        // Determine unique sports from legs
+        const sports = [...new Set(legsArr.map(l => (l.sport||'mlb').toLowerCase()))];
+        const marketsByKey = {};
+        await Promise.all(sports.map(async function(sport) {
+          const games = await fetchOdds(sport);
+          if (Array.isArray(games)) {
+            Object.assign(marketsByKey, buildLiveMarketMap(games, sport));
+          }
+        }));
+        const nowMs = Date.now();
+        const oddsCheck = validateAllLegsOdds(legsArr, marketsByKey, nowMs);
+        if (!oddsCheck.ok) {
+          console.log('[bets/place] odds validation failed:', oddsCheck.code, oddsCheck.leg);
+          if (oddsCheck.code === 'odds_changed') {
+            // Build updated snapshot so frontend can offer "accept new odds"
+            const updatedLegs = buildAcceptedOddsSnapshot(legsArr, marketsByKey);
+            return res.status(409).json({
+              ok: false, code: 'odds_changed',
+              leg: oddsCheck.leg, legIndex: oddsCheck.legIndex,
+              oldOdds: oddsCheck.oldOdds, newOdds: oddsCheck.newOdds,
+              drift: oddsCheck.drift, updatedLegs
+            });
+          }
+          return res.status(409).json({ ok:false, code: oddsCheck.code, leg: oddsCheck.leg,
+                                        legIndex: oddsCheck.legIndex, reason: oddsCheck.reason });
+        }
+        // Stamp legs with live odds (lock in what the server verified)
+        legsArr.forEach(function(leg, i) { leg.odds = oddsCheck.liveOdds || leg.odds; });
+        console.log('[bets/place] odds validation ok for', legsArr.length, 'legs');
+      } catch(oddsErr) {
+        // Odds API unavailable — log but do NOT block placement (fail open)
+        console.warn('[bets/place] odds validation skipped (API unavailable):', oddsErr.message);
+      }
+    } else {
+      console.log('[bets/place] oddsAccepted=true — skipping re-validation, using submitted odds');
+    }
+
+    // 3b. Conflict check: active legs on same game+market
     const { data: activeTix } = await sb.from('tickets').select('id')
       .eq('player_id', playerId).in('status',['active','open']);
     if (activeTix && activeTix.length) {
