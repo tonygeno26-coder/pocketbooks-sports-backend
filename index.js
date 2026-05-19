@@ -1311,6 +1311,138 @@ app.post('/api/host/settle-player', async (req, res) => {
   }
 });
 
+// ── WEEKLY ROLLOVER ENGINE (Phase C Step 5) ────────────────────────────────────────────────────
+
+function _getISOWeek(date) {
+  var d = new Date(date || Date.now()); d.setHours(0,0,0,0);
+  d.setDate(d.getDate() + 3 - (d.getDay()+6)%7);
+  var w1 = new Date(d.getFullYear(), 0, 4);
+  return d.getFullYear() + '-W' + String(1 + Math.round(
+    ((d.getTime() - w1.getTime()) / 86400000 - 3 + (w1.getDay()+6)%7) / 7
+  )).padStart(2,'0');
+}
+
+// POST /api/host/weekly-rollover
+app.post('/api/host/weekly-rollover', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { clubId, rolloverWeek, performedBy } = req.body || {};
+
+  if (!clubId) return res.status(400).json({ ok:false, errors:['missing_clubId'] });
+  const week = rolloverWeek || _getISOWeek();
+  if (!/^\d{4}-W\d{2}$/.test(week)) return res.status(400).json({ ok:false, errors:['invalid_rolloverWeek_format'] });
+
+  try {
+    // 1. Duplicate check
+    const { data: existing } = await sb.from('weekly_rollovers')
+      .select('id').eq('club_id', clubId).eq('rollover_week', week).limit(1);
+    if (existing && existing.length > 0)
+      return res.status(409).json({ ok:false, error:'rollover_already_executed_for_week:'+week });
+
+    // 2. Load current tickets for settlement preview
+    const { data: tickets } = await sb.from('tickets')
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at')
+      .eq('club_id', clubId);
+
+    // 3. Derive per-player snapshot
+    var byPlayer = {};
+    function goc(pid, uname) {
+      if (!byPlayer[pid]) byPlayer[pid] = { playerId:pid, username:uname||pid,
+        owesHost:0, hostOwes:0, openRisk:0, settledNet:0, activeBetCount:0 };
+      return byPlayer[pid];
+    }
+    var rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+    (tickets||[]).forEach(function(t) {
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      var pl = goc(t.player_id, t.player_username);
+      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
+      if (s==='active'||s==='open')  { pl.openRisk+=r; pl.activeBetCount++; }
+      else if (s==='lost')            { pl.settledNet-=r; }
+      else if (s==='won')             { pl.settledNet+=p; }
+    });
+    Object.values(byPlayer).forEach(function(pl) {
+      var net=pl.settledNet;
+      if (net<0) { pl.owesHost=rnd(-net); pl.hostOwes=0; }
+      else        { pl.hostOwes=rnd(net);  pl.owesHost=0; }
+      pl.openRisk=rnd(pl.openRisk); pl.settledNet=rnd(pl.settledNet);
+    });
+    var players = Object.values(byPlayer);
+    var playersOweTot = players.reduce(function(s,p){ return s+p.owesHost; },0);
+    var hostOwesTot   = players.reduce(function(s,p){ return s+p.hostOwes; },0);
+    var totals = { playersOwe:rnd(playersOweTot), hostOwes:rnd(hostOwesTot), net:rnd(playersOweTot-hostOwesTot) };
+    var performedAt = new Date().toISOString();
+
+    // 4. Write weekly_rollovers row (UNIQUE constraint prevents duplicates)
+    const { error: rrErr } = await sb.from('weekly_rollovers').insert({
+      club_id: clubId, rollover_week: week,
+      performed_at: performedAt, performed_by: performedBy||'host',
+      totals_snapshot: JSON.stringify(totals), players_count: players.length
+    });
+    if (rrErr) throw rrErr;
+
+    // 5. Write per-player snapshots (insert-only, UNIQUE constraint prevents duplicates)
+    if (players.length) {
+      const snapRows = players.map(function(p) { return {
+        rollover_week: week, club_id: clubId, player_id: p.playerId, username: p.username,
+        owes_host: p.owesHost, host_owes: p.hostOwes, open_risk: p.openRisk,
+        settled_net: p.settledNet, active_ticket_count: p.activeBetCount,
+        snapshotted_at: performedAt
+      }; });
+      const { error: snapErr } = await sb.from('weekly_player_snapshots').insert(snapRows);
+      if (snapErr) throw snapErr;
+    }
+
+    // 6. Audit event
+    await sb.from('audit_events').insert({
+      event_type: 'weekly_rollover_executed', club_id: clubId,
+      payload: { rolloverWeek:week, playersCount:players.length, totals, performedBy:performedBy||'host' }
+    });
+
+    console.log('[weekly-rollover] week='+week+' club='+clubId+' players='+players.length);
+    res.json({
+      ok: true, rolloverWeek: week, playersSnapshotted: players.length,
+      totals, nextWeekInitialized: true, performedAt
+    });
+  } catch(e) {
+    console.error('[weekly-rollover] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// GET /api/host/rollover-history?clubId=
+app.get('/api/host/rollover-history', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, history:[] });
+  const { clubId, limit:limitQ } = req.query;
+  try {
+    const limit = Math.min(parseInt(limitQ)||12, 52);
+    let q = sb.from('weekly_rollovers')
+      .select('id,club_id,rollover_week,performed_at,totals_snapshot,players_count')
+      .order('rollover_week', { ascending:false }).limit(limit);
+    if (clubId) q = q.eq('club_id', clubId);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ ok:true, history: data||[] });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/host/week-snapshot?clubId=&week=
+app.get('/api/host/week-snapshot', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, players:[] });
+  const { clubId, week } = req.query;
+  try {
+    let q = sb.from('weekly_player_snapshots')
+      .select('*').order('owes_host', { ascending:false });
+    if (clubId) q = q.eq('club_id', clubId);
+    if (week)   q = q.eq('rollover_week', week);
+    const { data, error } = await q;
+    if (error) throw error;
+    res.json({ ok:true, week:week||'all', players:data||[] });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
