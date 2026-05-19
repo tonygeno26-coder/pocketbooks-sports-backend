@@ -584,40 +584,137 @@ function _verifyToken(token) {
   return { ok:true, payload };
 }
 
-// Sign a session token for a player/host (called after login/pairing)
-function issueSessionToken(actorId, role, clubId, expiresInSec, platformRole) {
-  const payload = { sub:actorId, actorId, role, clubId: clubId||'' };
-  if (platformRole) payload.platformRole = platformRole;
-  return _signToken(payload, expiresInSec);
+// ── SESSION STORE ───────────────────────────────────────────────────────────────────────
+const _sessionMemStore = new Map(); // fallback when Supabase unavailable
+
+function _genJti() {
+  return 'jti_'+Date.now()+'_'+_crypto.randomBytes(8).toString('hex');
 }
 
-// ── REQUIRE ACTOR (Phase C — token-trusted) ───────────────────────────────────────────
+async function _sessionLoad(jti) {
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('sessions').select('*').eq('jti',jti).limit(1);
+      if (data && data[0]) { _sessionMemStore.set(jti, data[0]); return data[0]; }
+    }
+  } catch(_e) {}
+  return _sessionMemStore.get(jti) || null;
+}
+
+async function _sessionSave(row) {
+  _sessionMemStore.set(row.jti, row);
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('sessions').upsert(row, { onConflict:'jti' });
+  } catch(_e) {}
+}
+
+async function _sessionRevokeByActor(actorId, clubId, reason) {
+  // Revoke in memory
+  let count = 0;
+  _sessionMemStore.forEach(function(row) {
+    if (row && row.actor_id === actorId && row.club_id === (clubId||'') && row.status === 'active') {
+      row.status = 'revoked'; row.revoked_at = new Date().toISOString();
+      row.revoke_reason = reason||'role_changed'; count++;
+    }
+  });
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('sessions')
+      .update({ status:'revoked', revoked_at:new Date().toISOString(), revoke_reason:reason||'role_changed' })
+      .eq('actor_id',actorId).eq('club_id',clubId||'').eq('status','active');
+  } catch(_e) {}
+  return count;
+}
+
+// Issue a signed session token + persist session row
+async function issueSessionToken(actorId, role, clubId, expiresInSec, platformRole) {
+  const jti = _genJti();
+  const now = new Date().toISOString();
+  const expMs = (expiresInSec||86400)*1000;
+  const payload = { sub:actorId, actorId, role, clubId:clubId||'', jti };
+  if (platformRole) payload.platformRole = platformRole;
+  const token = _signToken(payload, expiresInSec);
+  const row = {
+    jti, actor_id:actorId, club_id:clubId||'', role,
+    platform_role: platformRole||null,
+    status:'active', issued_at:now,
+    expires_at: new Date(Date.now()+expMs).toISOString(),
+    revoked_at:null, revoke_reason:null, last_seen_at:now
+  };
+  await _sessionSave(row);
+  console.log('[session] issued jti='+jti+' actor='+actorId+' role='+role+' club='+(clubId||''));
+  _writeAuthAudit('session_created', actorId, clubId, '/auth/token',
+    { jti, role, expiresIn:expiresInSec||86400 });
+  return { token, jti };
+}
+
+// ── REQUIRE ACTOR (Phase F — session-verified) ────────────────────────────────────────
 function requireActor(req) {
   const authHeader = (req.headers['authorization'] || '').trim();
   const bypassAllowed = !IS_PRODUCTION || DEV_AUTH_BYPASS;
   const reqClub = (req.headers['x-club-id']||'').trim() ||
                   (req.body && req.body.clubId) || (req.query && req.query.clubId) || '';
 
-  // 1. Bearer token — only trusted source for role in production
+  // 1. Bearer token
   if (authHeader.startsWith('Bearer ')) {
     const token  = authHeader.slice(7);
     const result = _verifyToken(token);
     if (!result.ok) {
-      const evType = result.error; // 'invalid_token' | 'expired_token' | 'malformed_token'
-      console.log('[auth] '+evType+' token from '+req.path);
+      const evType = result.error;
+      console.log('[auth] '+evType+' from '+req.path);
       _writeAuthAudit(evType, null, reqClub, req.path);
       return { error:result.error, status:401, auditEvent:evType };
     }
-    const p    = result.payload;
-    const role  = ROLE_RANK[p.role] != null ? p.role : 'view_only';
-    const club  = p.clubId || '';
+    const p       = result.payload;
+    const role    = ROLE_RANK[p.role] != null ? p.role : 'view_only';
+    const club    = p.clubId || '';
     const platRole = p.platformRole || null;
-    if (IS_PRODUCTION) console.log('[auth] token ok actor='+p.sub+' role='+role+' club='+club+(platRole?'+'+platRole:''));
+    const jti     = p.jti || null;
+
+    // Phase F: production requires jti + session store check
+    if (IS_PRODUCTION && !jti) {
+      console.log('[auth] legacy_token_missing_jti from '+req.path);
+      _writeAuthAudit('legacy_token_missing_jti', p.sub||p.actorId, club, req.path);
+      return { error:'legacy_token_missing_jti', status:401, auditEvent:'legacy_token_missing_jti' };
+    }
+
+    // Attach session check as async side-effect — resolve synchronously from mem cache
+    if (jti) {
+      const memSession = _sessionMemStore.get(jti);
+      if (memSession === undefined) {
+        // Not in mem cache yet — trigger async load, fail-open for now (will be checked on next request)
+        _sessionLoad(jti).catch(()=>{});
+      } else if (memSession === null) {
+        _writeAuthAudit('session_not_found', p.sub, club, req.path, { jti });
+        return { error:'session_not_found', status:401, auditEvent:'session_not_found' };
+      } else {
+        if (memSession.status === 'revoked') {
+          _writeAuthAudit('session_revoked', p.sub, club, req.path, { jti, reason:memSession.revoke_reason });
+          return { error:'session_revoked', status:401, auditEvent:'session_revoked',
+                   revokeReason:memSession.revoke_reason };
+        }
+        if (memSession.status === 'expired') {
+          return { error:'expired_token', status:401, auditEvent:'session_expired' };
+        }
+        // Claim consistency
+        if (memSession.role !== role || memSession.club_id !== club) {
+          _writeAuthAudit('session_claim_mismatch', p.sub, club, req.path, { jti, storedRole:memSession.role });
+          return { error:'session_claim_mismatch', status:401, auditEvent:'session_claim_mismatch' };
+        }
+        // Update lastSeenAt (fire-and-forget)
+        memSession.last_seen_at = new Date().toISOString();
+        _sessionSave(memSession).catch(()=>{});
+      }
+    }
+
+    console.log('[auth] ok actor='+p.sub+' role='+role+' club='+club+(jti?' jti='+jti:''));
     return { actorId:p.sub||p.actorId, role, clubId:club, platformRole:platRole,
-             isDevBypass:false, fromToken:true };
+             jti, isDevBypass:false, fromToken:true };
   }
 
-  // 2. Dev bypass (no token provided)
+  // 2. Dev bypass
   if (bypassAllowed) {
     const bypassClub = reqClub || 'dev-club';
     console.log('[auth] DEV BYPASS actor=dev-owner role=owner club='+bypassClub);
@@ -625,7 +722,7 @@ function requireActor(req) {
              platformRole:'platform_admin', isDevBypass:true };
   }
 
-  // 3. Production, no token — x-actor-role is NOT trusted
+  // 3. No token in production
   console.log('[auth] unauthenticated request to '+req.path);
   _writeAuthAudit('unauthenticated', null, reqClub, req.path);
   return { error:'unauthenticated', status:401, auditEvent:'unauthenticated' };
@@ -1788,34 +1885,92 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
 // ── HOST DASHBOARD DB READ (Phase C Step 2) ────────────────────────────────────────────────────────
 // ══ SESSION TOKEN ISSUANCE ═══════════════════════════════════════════════════════════════════════════
 // POST /api/auth/token — issue a signed session token
-// Body: { actorId, clubId, role, secret? }
-// In production this should be called after real auth (club PIN, host code, etc.).
-// For now it validates against a CLUB_SECRET env var as a simple gate.
 app.post('/api/auth/token', async (req, res) => {
   const { actorId, clubId, role, secret: clientSecret } = req.body || {};
   if (!actorId) return res.status(400).json({ ok:false, error:'missing_actorId' });
   if (!clubId)  return res.status(400).json({ ok:false, error:'missing_clubId'  });
-
-  // Role validation: cannot self-issue owner/full_admin without server-side verification
-  // In Phase C, trust the caller's role unless ROLE_SECRET is set
-  const ROLE_SECRET = process.env.ROLE_ISSUE_SECRET;
+  const ROLE_SECRET   = process.env.ROLE_ISSUE_SECRET;
   const requestedRole = ROLE_RANK[role] != null ? role : 'player';
-  const highPriv = requestedRole === 'owner' || requestedRole === 'full_admin';
-  if (highPriv && ROLE_SECRET && clientSecret !== ROLE_SECRET) {
+  const highPriv      = requestedRole === 'owner' || requestedRole === 'full_admin';
+  if (highPriv && ROLE_SECRET && clientSecret !== ROLE_SECRET)
     return res.status(403).json({ ok:false, error:'cannot_self_issue_elevated_role' });
-  }
-
-  const token = issueSessionToken(actorId, requestedRole, clubId, 86400); // 24h
-  console.log('[auth] token issued actor='+actorId+' role='+requestedRole+' club='+clubId);
-  res.json({ ok:true, token, actorId, role:requestedRole, clubId, expiresIn:86400 });
+  const { token, jti } = await issueSessionToken(actorId, requestedRole, clubId, 86400);
+  res.json({ ok:true, token, jti, actorId, role:requestedRole, clubId, expiresIn:86400 });
 });
 
-// GET /api/auth/verify — verify a token and return actor info
+// POST /api/auth/refresh — rotate token (revoke old jti, issue new)
+app.post('/api/auth/refresh', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if (!actor.jti)  return res.status(400).json({ ok:false, error:'no_jti_to_rotate' });
+  // Revoke old session
+  const oldRow = _sessionMemStore.get(actor.jti);
+  if (oldRow) {
+    oldRow.status='revoked'; oldRow.revoked_at=new Date().toISOString();
+    oldRow.revoke_reason='rotated';
+    await _sessionSave(oldRow);
+  }
+  // Issue new session
+  const { token:newToken, jti:newJti } = await issueSessionToken(
+    actor.actorId, actor.role, actor.clubId, 86400, actor.platformRole);
+  _writeAuthAudit('session_refreshed', actor.actorId, actor.clubId, '/auth/refresh',
+    { oldJti:actor.jti, newJti });
+  console.log('[session] rotated oldJti='+actor.jti+' newJti='+newJti);
+  res.json({ ok:true, token:newToken, jti:newJti, expiresIn:86400 });
+});
+
+// POST /api/auth/logout — revoke current token
+app.post('/api/auth/logout', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if (actor.jti) {
+    const row = _sessionMemStore.get(actor.jti);
+    if (row) {
+      row.status='revoked'; row.revoked_at=new Date().toISOString();
+      row.revoke_reason='logout';
+      await _sessionSave(row);
+    }
+    _writeAuthAudit('session_revoked', actor.actorId, actor.clubId, '/auth/logout',
+      { jti:actor.jti, reason:'logout' });
+    console.log('[session] logout jti='+actor.jti+' actor='+actor.actorId);
+  }
+  res.json({ ok:true, loggedOut:true });
+});
+
+// POST /api/auth/revoke-session — admin revoke (owner/full_admin/platform_admin)
+app.post('/api/auth/revoke-session', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+  if (rank < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { targetActorId, targetClubId, reason, jti: targetJti } = req.body || {};
+  if (targetJti) {
+    // Revoke specific session
+    const row = await _sessionLoad(targetJti);
+    if (!row) return res.status(404).json({ ok:false, error:'session_not_found' });
+    row.status='revoked'; row.revoked_at=new Date().toISOString();
+    row.revoke_reason=reason||'admin_revoke';
+    await _sessionSave(row);
+    _writeAuthAudit('session_revoked', actor.actorId, actor.clubId, '/auth/revoke-session',
+      { targetJti, reason:reason||'admin_revoke', byActor:actor.actorId });
+    return res.json({ ok:true, revokedJti:targetJti });
+  }
+  if (targetActorId) {
+    const count = await _sessionRevokeByActor(targetActorId, targetClubId||'', reason||'admin_revoke');
+    _writeAuthAudit('session_revoked', actor.actorId, actor.clubId, '/auth/revoke-session',
+      { targetActorId, targetClubId, revokedCount:count, byActor:actor.actorId });
+    return res.json({ ok:true, revokedCount:count });
+  }
+  res.status(400).json({ ok:false, error:'missing targetActorId or jti' });
+});
+
+// GET /api/auth/verify — verify token + session, return actor info
 app.get('/api/auth/verify', (req, res) => {
   const actor = requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
   res.json({ ok:true, actorId:actor.actorId, role:actor.role, clubId:actor.clubId,
-             isDevBypass:actor.isDevBypass, fromToken:actor.fromToken||false });
+             jti:actor.jti, isDevBypass:actor.isDevBypass, fromToken:actor.fromToken||false });
 });
 // ───────────────────────────────────────────────────────────────────────────
 
