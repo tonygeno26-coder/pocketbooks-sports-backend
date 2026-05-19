@@ -965,6 +965,146 @@ async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
   return { ledgerBal, openRisk, available, rows };
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ODDS SNAPSHOT ENGINE (Phase K)
+// ════════════════════════════════════════════════════════════════════════════
+
+const SNAPSHOT_TTL_MS  = 5 * 60 * 1000;  // 5 min
+const SNAPSHOT_TOLERANCE = 3;             // ±3 American odds points
+
+function _snapKey(cKey, market, selection) {
+  return cKey+'|'+(market||'').toLowerCase()+'|'+(selection||'').toLowerCase();
+}
+
+// Build snapshot rows from LIVE_MARKET_CACHE and upsert into Supabase
+async function _upsertOddsSnapshots() {
+  const sb  = getSupabase();
+  const now = new Date().toISOString();
+  const exp = new Date(Date.now()+SNAPSHOT_TTL_MS).toISOString();
+  const cache = LIVE_MARKET_CACHE;
+  if (!sb || !cache.gameCount) return;
+  const rows = [];
+  Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
+    (entry.outcomes||[]).forEach(function(outcome) {
+      const sel = (outcome.name||'').toLowerCase();
+      rows.push({
+        snapshot_id:       entry.cKey+'|'+entry.market+'|'+sel+'|'+Date.now(),
+        sport:             entry.sport||'unknown',
+        event_id:          entry.gameId||null,
+        canonical_game_key:entry.cKey,
+        market_key:        entry.market,
+        selection_key:     sel,
+        odds_american:     Math.round(outcome.price||0),
+        odds_decimal:      Math.round(((outcome.price||0)>0?(outcome.price/100+1):(100/Math.abs(outcome.price||1)+1))*10000)/10000,
+        point_line:        outcome.point||null,
+        source:            entry.bookmaker||'odds-api',
+        fetched_at:        now,
+        expires_at:        exp,
+        commence_time:     entry.commenceTime||null,
+        suspended:         entry.suspended||false
+      });
+    });
+  });
+  if (!rows.length) return;
+  try {
+    await sb.from('odds_snapshots').upsert(rows,
+      { onConflict:'canonical_game_key,market_key,selection_key' });
+    console.log('[snapshot] upserted '+rows.length+' odds snapshots');
+  } catch(e) { console.warn('[snapshot] upsert error:', e.message); }
+}
+
+// Verify a submitted leg against the odds_snapshots table (Supabase)
+async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
+  nowMs = nowMs||Date.now();
+  const cKey   = leg.canonicalGameKey||'';
+  const market = (leg.market||'moneyline').toLowerCase();
+  const pick   = (leg.pick||'').toLowerCase();
+  try {
+    const { data } = await sb.from('odds_snapshots').select('*')
+      .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pick)
+      .limit(1);
+    const snap = data&&data[0];
+    if (!snap) return { ok:false, code:'odds_snapshot_missing', leg:leg.pick };
+    // Stale?
+    const ageMs = nowMs - new Date(snap.fetched_at).getTime();
+    if (ageMs > SNAPSHOT_TTL_MS) return { ok:false, code:'odds_stale', leg:leg.pick, ageMs };
+    if (snap.expires_at && nowMs > new Date(snap.expires_at).getTime())
+      return { ok:false, code:'odds_stale', leg:leg.pick, reason:'expired' };
+    // Suspended?
+    if (snap.suspended) return { ok:false, code:'market_closed', leg:leg.pick };
+    // Event started?
+    if (snap.commence_time) {
+      const ct = new Date(snap.commence_time).getTime();
+      if (!isNaN(ct) && nowMs >= ct)
+        return { ok:false, code:'event_started', leg:leg.pick, commenceTime:snap.commence_time };
+    }
+    // Odds drift
+    const submittedOdds = parseInt(leg.odds,10);
+    const serverOdds    = snap.odds_american;
+    const drift         = !isNaN(submittedOdds) ? Math.abs(submittedOdds-serverOdds) : 0;
+    if (!isNaN(submittedOdds) && drift > SNAPSHOT_TOLERANCE) {
+      // Apply oddsChangePolicy
+      const policy = oddsChangePolicy||'reject';
+      if (policy==='accept_any_with_confirm') {
+        // Allow but flag
+      } else if (policy==='accept_better') {
+        if (serverOdds <= submittedOdds)
+          return { ok:false, code:'odds_changed', leg:leg.pick,
+                   submittedOdds, serverOdds, drift };
+      } else {
+        return { ok:false, code:'odds_changed', leg:leg.pick,
+                 submittedOdds, serverOdds, drift };
+      }
+    }
+    return {
+      ok:true,
+      snapshotId:           snap.snapshot_id,
+      acceptedOddsAmerican: serverOdds,
+      acceptedOddsDecimal:  parseFloat(snap.odds_decimal),
+      acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
+      commenceTime:         snap.commence_time
+    };
+  } catch(e) {
+    console.warn('[snapshot] verify error:', e.message);
+    return null; // null = fail-open (snapshot table unavailable)
+  }
+}
+
+// Recalculate payout server-side from snapshots
+async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePolicy) {
+  let product = 1;
+  const enrichedLegs = [];
+  for (let i=0; i<legs.length; i++) {
+    const vr = await _verifyLegOddsSnapshot(sb, legs[i], nowMs, oddsChangePolicy);
+    if (vr===null) continue; // fail-open: snapshot unavailable
+    if (!vr.ok) return Object.assign(vr, { legIndex:i });
+    const dec = vr.acceptedOddsDecimal || (vr.acceptedOddsAmerican>0
+      ? vr.acceptedOddsAmerican/100+1 : 100/Math.abs(vr.acceptedOddsAmerican)+1);
+    product *= dec;
+    enrichedLegs.push(Object.assign({}, legs[i], {
+      accepted_odds_american: vr.acceptedOddsAmerican,
+      accepted_odds_decimal:  vr.acceptedOddsDecimal,
+      accepted_point_line:    vr.acceptedPointLine,
+      odds_snapshot_id:       vr.snapshotId,
+      accepted_at:            new Date(nowMs).toISOString()
+    }));
+  }
+  const payout = Math.round(stake*product*100)/100;
+  const profit = Math.round((payout-stake)*100)/100;
+  return { ok:true, payout, profit, legs:enrichedLegs };
+}
+
+// Wire snapshot upsert into live cache poll
+const _origPoll = pollLiveOddsLoop;
+const pollLiveOddsLoopWithSnapshots = async function() {
+  await _origPoll();
+  _upsertOddsSnapshots().catch(()=>{});
+};
+// Re-register poller with snapshot write
+if (ODDS_KEY) setInterval(pollLiveOddsLoopWithSnapshots, CACHE_POLL_INTERVAL);
+
+// ───────────────────────────────────────────────────────────────────────────
+
 // ── RISK LIMITS ENGINE ───────────────────────────────────────────────────────────────────────
 const RISK_CODE_STATUS = {
   player_suspended:         403,
@@ -3020,37 +3160,37 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
     }
 
-    // 3. Odds validation using LIVE_MARKET_CACHE (single source of truth)
-    // Skip if player explicitly accepted updated odds (oddsAccepted:true on body)
+    // 3. Phase K: snapshot-based odds verification + server payout recalculation
+    const nowMs = Date.now();
+    // Load club oddsChangePolicy
+    let oddsChangePolicy = 'reject';
+    try {
+      const { data:csData } = await sb.from('club_risk_settings').select('odds_change_policy')
+        .eq('club_id',clubId).limit(1);
+      if (csData&&csData[0]) oddsChangePolicy = csData[0].odds_change_policy||'reject';
+    } catch(_e){}
+
     if (!body.oddsAccepted) {
-      try {
-        const nowMs = Date.now();
-        const cache = LIVE_MARKET_CACHE;
-        if (cache.gameCount > 0) {
-          const oddsCheck = validateAllLegsOdds(legsArr, cache.marketsByCanonicalKey, cache.marketsByProviderGameId, nowMs);
-          if (!oddsCheck.ok) {
-            console.log('[bets/place] odds validation failed:', oddsCheck.code, oddsCheck.leg, 'cacheAge='+(Date.now()-new Date(cache.updatedAt).getTime())+'ms');
-            if (oddsCheck.code === 'odds_changed') {
-              const updatedLegs = buildAcceptedOddsSnapshotFromCache(legsArr, cache);
-              return res.status(409).json({
-                ok:false, code:'odds_changed',
-                leg:oddsCheck.leg, legIndex:oddsCheck.legIndex,
-                oldOdds:oddsCheck.oldOdds, newOdds:oddsCheck.newOdds,
-                drift:oddsCheck.drift, updatedLegs
-              });
-            }
-            return res.status(409).json({ ok:false, code:oddsCheck.code, leg:oddsCheck.leg,
-                                          legIndex:oddsCheck.legIndex, reason:oddsCheck.reason });
-          }
-          console.log('[bets/place] odds validation ok for', legsArr.length, 'legs (cache age='+(Date.now()-new Date(cache.updatedAt).getTime())+'ms)');
-        } else {
-          console.warn('[bets/place] odds cache empty — validation skipped (fail-open)');
-        }
-      } catch(oddsErr) {
-        console.warn('[bets/place] odds validation error — fail-open:', oddsErr.message);
+      // Verify all legs against odds_snapshots table
+      const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
+      if (payoutResult && !payoutResult.ok) {
+        const httpStatus = payoutResult.code==='odds_changed'?409
+          : payoutResult.code==='event_started'?409
+          : payoutResult.code==='market_closed'?409
+          : payoutResult.code==='odds_stale'?409 : 422;
+        console.log('[bets/place] snapshot validation failed:', payoutResult.code, payoutResult.leg);
+        return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult));
+      }
+      if (payoutResult && payoutResult.ok) {
+        // Override client-submitted payout with server-calculated value
+        // and stamp each leg with accepted snapshot data
+        legsArr = payoutResult.legs;
+        console.log('[bets/place] server payout recalculated:', payoutResult.payout, '(client:', parseFloat(payout)||0, ')');
+      } else {
+        console.warn('[bets/place] snapshot validation skipped (fail-open) — using client odds');
       }
     } else {
-      console.log('[bets/place] oddsAccepted=true — skipping re-validation');
+      console.log('[bets/place] oddsAccepted=true — skipping snapshot validation');
     }
 
     // 3b. Conflict check: active legs on same game+market
@@ -3073,14 +3213,23 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     // 4. Generate ticket ID
     const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
 
-    // 5. Write ticket_legs first (before RPC so they exist for game-started check)
+    // 5. Write ticket_legs (with accepted odds snapshot fields from Phase K)
     const legRows = legsArr.map(function(leg,i) { return {
       id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
       provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
       canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
       home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
-      scheduled_start: leg.scheduledStart, market: leg.market, pick: leg.pick,
-      odds: leg.odds, line: leg.line!=null?parseFloat(leg.line):null, side: leg.side||null
+      scheduled_start: leg.scheduledStart||leg.commenceTime||null,
+      market: leg.market, pick: leg.pick,
+      odds: leg.accepted_odds_american || leg.odds,
+      line: leg.accepted_point_line!=null ? leg.accepted_point_line : (leg.line!=null?parseFloat(leg.line):null),
+      side: leg.side||null,
+      // Phase K snapshot fields
+      accepted_odds_american: leg.accepted_odds_american||null,
+      accepted_odds_decimal:  leg.accepted_odds_decimal||null,
+      accepted_point_line:    leg.accepted_point_line||null,
+      odds_snapshot_id:       leg.odds_snapshot_id||null,
+      accepted_at:            leg.accepted_at||null
     }; });
     const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
     if (lErr) throw lErr;
