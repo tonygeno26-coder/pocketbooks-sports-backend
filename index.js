@@ -1519,6 +1519,97 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
+app.get('/api/player/dashboard', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, source:'supabase_not_configured', balance:null });
+  const { clubId, playerId } = req.query;
+  if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
+  const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+  try {
+    // Tickets for this player
+    let tq = sb.from('tickets').select(
+      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds'
+    ).eq('player_id', playerId);
+    if (clubId) tq = tq.eq('club_id', clubId);
+    tq = tq.order('placed_at', { ascending:false });
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+
+    // Starting balance from club_members
+    var startingBalance = 1000;
+    try {
+      const { data: mem } = await sb.from('club_members')
+        .select('balance_start').eq('player_id', playerId)
+        .limit(1);
+      if (mem && mem[0] && mem[0].balance_start) startingBalance = parseFloat(mem[0].balance_start)||1000;
+    } catch(_e) {}
+
+    // Derive balance
+    var openRisk=0, settledGains=0, settledLosses=0;
+    var active=[], settled=[], canceled=[];
+    var warnings = [];
+    (tickets||[]).forEach(function(t) {
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (isNaN(r)||r<0) { warnings.push('invalid_risk:'+t.id); r=0; }
+      if (s==='canceled'||s==='voided'||s==='deleted') { canceled.push(t); return; }
+      if (s==='active'||s==='open')   { openRisk+=r; active.push(t); }
+      else if (s==='won')             { settledGains+=p; settled.push(t); }
+      else if (s==='lost')            { settledLosses+=r; settled.push(t); }
+      else if (s==='push'||s==='pushed') { settled.push(t); } // push: no net change
+    });
+    var available = rnd(startingBalance - openRisk - settledLosses + settledGains);
+    if (available<0) warnings.push('available_negative:'+available);
+
+    // Weekly stats
+    var now = new Date();
+    now.setHours(0,0,0,0); now.setDate(now.getDate()+3-(now.getDay()+6)%7);
+    var w1 = new Date(now.getFullYear(),0,4);
+    var isoWeek = now.getFullYear()+'-W'+String(1+Math.round(((now.getTime()-w1.getTime())/86400000-3+(w1.getDay()+6)%7)/7)).padStart(2,'0');
+    var wStart = new Date(); wStart.setHours(0,0,0,0); wStart.setDate(wStart.getDate()-(wStart.getDay()+6)%7);
+    var wStartMs = wStart.getTime(), wEndMs = wStartMs+7*86400000;
+    var wNet=0, wRisk=0, wCount=0;
+    (tickets||[]).forEach(function(t){
+      var ts=new Date(t.placed_at||0).getTime();
+      if (ts<wStartMs||ts>=wEndMs) return;
+      wCount++;
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (s==='active'||s==='open') wRisk+=r;
+      else if (s==='won')  wNet+=p;
+      else if (s==='lost') wNet-=r;
+    });
+
+    res.json({
+      ok: true, source:'db', clubId:clubId||null, playerId,
+      balance: {
+        startingBalance: rnd(startingBalance),
+        availableBalance: available,
+        openRisk: rnd(openRisk),
+        settledGains: rnd(settledGains),
+        settledLosses: rnd(settledLosses),
+        pendingPayouts: rnd(openRisk),
+        refunds: 0  // push handled via openRisk exclusion
+      },
+      tickets: {
+        active,
+        settled,
+        canceled,
+        totalCount: (tickets||[]).length
+      },
+      weekly: {
+        currentWeek: isoWeek,
+        settledNet: rnd(wNet),
+        openRisk: rnd(wRisk),
+        ticketCount: wCount
+      },
+      warnings
+    });
+  } catch(e) {
+    console.error('[player/dashboard] error:', e.message);
+    res.status(500).json({ ok:false, source:'db_error', error:e.message, balance:null });
+  }
+});
+
 // GET /api/host/settlement-reconciliation — read-only balance proof
 app.get('/api/host/settlement-reconciliation', async (req, res) => {
   const sb = getSupabase();
