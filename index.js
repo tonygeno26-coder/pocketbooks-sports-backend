@@ -584,6 +584,80 @@ function _verifyToken(token) {
   return { ok:true, payload };
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// CLUB MEMBERSHIP ENGINE — authoritative role source
+// ════════════════════════════════════════════════════════════════════════════
+
+const _membershipMemCache = new Map(); // key = actorId+'|'+clubId
+const MEMBERSHIP_CACHE_TTL_MS = 60 * 1000; // 1 min freshness
+const PLATFORM_ADMIN_ALLOWLIST = (process.env.PLATFORM_ADMIN_ALLOWLIST||'').split(',').filter(Boolean);
+
+function _mKey(actorId, clubId) { return actorId+'|'+(clubId||''); }
+
+async function _membershipLoad(actorId, clubId) {
+  const cacheKey = _mKey(actorId, clubId);
+  const cached   = _membershipMemCache.get(cacheKey);
+  if (cached && (Date.now() - cached.cachedAt) < MEMBERSHIP_CACHE_TTL_MS) return cached.row;
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('club_memberships').select('*')
+        .eq('actor_id',actorId).eq('club_id',clubId).limit(1);
+      const row = data && data[0] ? data[0] : null;
+      _membershipMemCache.set(cacheKey, { row, cachedAt:Date.now() });
+      return row;
+    }
+  } catch(_e) { console.warn('[membership] load error:', _e.message); }
+  return null;
+}
+
+async function _membershipSave(row, updatedBy) {
+  const now = new Date().toISOString();
+  row.updated_at = now; if (updatedBy) row.updated_by = updatedBy;
+  _membershipMemCache.set(_mKey(row.actor_id||row.actorId, row.club_id||row.clubId),
+    { row, cachedAt:Date.now() });
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('club_memberships')
+      .upsert(row, { onConflict:'actor_id,club_id' });
+  } catch(_e) { console.warn('[membership] save error:', _e.message); }
+}
+
+function _membershipInvalidate(actorId, clubId) {
+  _membershipMemCache.delete(_mKey(actorId, clubId));
+}
+
+// Resolve role for token issuance (production: DB wins; dev: fallback allowed)
+async function _resolveTokenRole(actorId, clubId, requestedRole) {
+  if (!actorId) return { error:'missing_actorId' };
+  if (!clubId)  return { error:'missing_clubId' };
+  const m = await _membershipLoad(actorId, clubId);
+  if (IS_PRODUCTION) {
+    if (!m)                     return { error:'membership_not_found' };
+    if (m.status !== 'active')  return { error:'membership_inactive', status:m.status };
+    // platform_admin only from server allowlist
+    if (requestedRole === 'platform_admin' && !PLATFORM_ADMIN_ALLOWLIST.includes(actorId))
+      return { error:'cannot_self_issue_elevated_role' };
+    return { ok:true, role:m.role, membership:m };
+  }
+  // Dev: DB wins if available, else use requested or default
+  if (m && m.status === 'active') return { ok:true, role:m.role, membership:m };
+  const role = ROLE_RANK[requestedRole] != null ? requestedRole : 'player';
+  return { ok:true, role, membership:null };
+}
+
+// Re-check membership freshness at request time (called from requireActor)
+async function _checkMembershipFreshness(actorId, clubId, tokenRole) {
+  if (!actorId || !clubId) return { ok:true }; // dev-bypass actors skip
+  const m = await _membershipLoad(actorId, clubId);
+  if (!m)                     return { ok:false, reason:'membership_not_found' };
+  if (m.status !== 'active')  return { ok:false, reason:'membership_inactive', status:m.status };
+  const dbRole = m.role;
+  if (dbRole !== tokenRole)   return { ok:false, reason:'membership_role_changed',
+                                        tokenRole, dbRole };
+  return { ok:true };
+}
+
 // ── SESSION STORE ───────────────────────────────────────────────────────────────────────
 const _sessionMemStore = new Map(); // fallback when Supabase unavailable
 
@@ -706,6 +780,28 @@ function requireActor(req) {
         // Update lastSeenAt (fire-and-forget)
         memSession.last_seen_at = new Date().toISOString();
         _sessionSave(memSession).catch(()=>{});
+      }
+    }
+
+    // Phase G: membership freshness check (async, mem-cache backed, fire-and-forget on miss)
+    if (jti && IS_PRODUCTION) {
+      const mCheck = _membershipMemCache.get(_mKey(p.sub||p.actorId, club));
+      if (mCheck && mCheck.row) {
+        const m = mCheck.row;
+        if (m.status !== 'active') {
+          _writeAuthAudit('membership_inactive', p.sub, club, req.path, { status:m.status, jti });
+          return { error:'membership_inactive', status:401, auditEvent:'membership_inactive' };
+        }
+        if (m.role !== role) {
+          // Role changed in DB — revoke session and reject
+          _sessionRevokeByActor(p.sub||p.actorId, club, 'role_changed').catch(()=>{});
+          _writeAuthAudit('membership_role_changed', p.sub, club, req.path,
+            { tokenRole:role, dbRole:m.role, jti });
+          return { error:'membership_role_changed', status:401, auditEvent:'membership_role_changed' };
+        }
+      } else {
+        // Trigger async load for next request
+        _membershipLoad(p.sub||p.actorId, club).catch(()=>{});
       }
     }
 
@@ -1883,19 +1979,161 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
 });
 
 // ── HOST DASHBOARD DB READ (Phase C Step 2) ────────────────────────────────────────────────────────
+// ══ CLUB MEMBERSHIP MANAGEMENT ENDPOINTS ═══════════════════════════════════════════════════════════════════════
+
+// Helper: assert actor is owner/full_admin in the scoped club
+function _requireMemberAdmin(actor) {
+  if (actor.error) return actor;
+  const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+  if (rank < ROLE_RANK.full_admin) return { error:'insufficient_role', required:'full_admin', status:403 };
+  return null;
+}
+
+// GET /api/club/members
+app.get('/api/club/members', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    const sb = getSupabase();
+    let members = [];
+    if (sb) {
+      const { data } = await sb.from('club_memberships').select('*').eq('club_id',clubId).order('joined_at');
+      members = data || [];
+    }
+    res.json({ ok:true, members, clubId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/invite
+app.post('/api/club/members/invite', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, targetActorId, role } = req.body || {};
+  if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  const inviteRole = ROLE_RANK[role] != null ? role : 'player';
+  const now = new Date().toISOString();
+  const row = { actor_id:targetActorId, club_id:clubId, role:inviteRole, status:'pending',
+                joined_at:now, updated_at:now, updated_by:actor.actorId||'system' };
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('club_memberships').upsert(row, { onConflict:'actor_id,club_id' });
+    _membershipInvalidate(targetActorId, clubId);
+    _writeAuthAudit('member_invited', actor.actorId, clubId, '/club/members/invite',
+      { targetActorId, role:inviteRole });
+    res.json({ ok:true, targetActorId, role:inviteRole, status:'pending' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/approve
+app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, targetActorId } = req.body || {};
+  if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('club_memberships')
+      .update({ status:'active', updated_at:new Date().toISOString(), updated_by:actor.actorId })
+      .eq('actor_id',targetActorId).eq('club_id',clubId).eq('status','pending');
+    _membershipInvalidate(targetActorId, clubId);
+    _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', { targetActorId });
+    res.json({ ok:true, targetActorId, status:'active' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/update-role
+app.post('/api/club/members/update-role', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, targetActorId, newRole } = req.body || {};
+  if (!targetActorId || !newRole) return res.status(400).json({ ok:false, error:'missing_fields' });
+  if (!ROLE_RANK.hasOwnProperty(newRole)) return res.status(400).json({ ok:false, error:'invalid_role:'+newRole });
+  try {
+    const sb = getSupabase();
+    let oldRole = null;
+    if (sb) {
+      const { data } = await sb.from('club_memberships').select('role').eq('actor_id',targetActorId).eq('club_id',clubId).limit(1);
+      if (data && data[0]) oldRole = data[0].role;
+      await sb.from('club_memberships')
+        .update({ role:newRole, updated_at:new Date().toISOString(), updated_by:actor.actorId })
+        .eq('actor_id',targetActorId).eq('club_id',clubId);
+    }
+    _membershipInvalidate(targetActorId, clubId);
+    // Revoke sessions so next token fetch gets new role
+    await _sessionRevokeByActor(targetActorId, clubId, 'role_changed');
+    _writeAuthAudit('member_role_updated', actor.actorId, clubId, '/club/members/update-role',
+      { targetActorId, oldRole, newRole });
+    res.json({ ok:true, targetActorId, oldRole, newRole });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/suspend
+app.post('/api/club/members/suspend', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, targetActorId, reason } = req.body || {};
+  if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('club_memberships')
+      .update({ status:'suspended', updated_at:new Date().toISOString(), updated_by:actor.actorId })
+      .eq('actor_id',targetActorId).eq('club_id',clubId);
+    _membershipInvalidate(targetActorId, clubId);
+    await _sessionRevokeByActor(targetActorId, clubId, 'suspended');
+    _writeAuthAudit('member_suspended', actor.actorId, clubId, '/club/members/suspend',
+      { targetActorId, reason });
+    res.json({ ok:true, targetActorId, status:'suspended' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/remove
+app.post('/api/club/members/remove', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, targetActorId } = req.body || {};
+  if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('club_memberships')
+      .update({ status:'removed', updated_at:new Date().toISOString(), updated_by:actor.actorId })
+      .eq('actor_id',targetActorId).eq('club_id',clubId);
+    _membershipInvalidate(targetActorId, clubId);
+    await _sessionRevokeByActor(targetActorId, clubId, 'removed');
+    _writeAuthAudit('member_removed', actor.actorId, clubId, '/club/members/remove', { targetActorId });
+    res.json({ ok:true, targetActorId, status:'removed' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // ══ SESSION TOKEN ISSUANCE ═══════════════════════════════════════════════════════════════════════════
-// POST /api/auth/token — issue a signed session token
+// POST /api/auth/token — issue a signed session token (role from DB in production)
 app.post('/api/auth/token', async (req, res) => {
-  const { actorId, clubId, role, secret: clientSecret } = req.body || {};
+  const { actorId, clubId, role: requestedRole } = req.body || {};
   if (!actorId) return res.status(400).json({ ok:false, error:'missing_actorId' });
   if (!clubId)  return res.status(400).json({ ok:false, error:'missing_clubId'  });
-  const ROLE_SECRET   = process.env.ROLE_ISSUE_SECRET;
-  const requestedRole = ROLE_RANK[role] != null ? role : 'player';
-  const highPriv      = requestedRole === 'owner' || requestedRole === 'full_admin';
-  if (highPriv && ROLE_SECRET && clientSecret !== ROLE_SECRET)
-    return res.status(403).json({ ok:false, error:'cannot_self_issue_elevated_role' });
-  const { token, jti } = await issueSessionToken(actorId, requestedRole, clubId, 86400);
-  res.json({ ok:true, token, jti, actorId, role:requestedRole, clubId, expiresIn:86400 });
+  // Phase G: DB is source of truth for role
+  const resolved = await _resolveTokenRole(actorId, clubId, requestedRole);
+  if (!resolved.ok) {
+    console.log('[auth/token] denied actor='+actorId+' club='+clubId+' reason='+resolved.error);
+    _writeAuthAudit(resolved.error, actorId, clubId, '/auth/token', { requestedRole });
+    return res.status(403).json({ ok:false, error:resolved.error, status:resolved.status });
+  }
+  const finalRole   = resolved.role;
+  const platRole    = PLATFORM_ADMIN_ALLOWLIST.includes(actorId) ? 'platform_admin' : null;
+  const { token, jti } = await issueSessionToken(actorId, finalRole, clubId, 86400, platRole);
+  console.log('[auth/token] issued actor='+actorId+' role='+finalRole+' club='+clubId+(platRole?' [platform_admin]':''));
+  res.json({ ok:true, token, jti, actorId, role:finalRole, clubId, expiresIn:86400 });
 });
 
 // POST /api/auth/refresh — rotate token (revoke old jti, issue new)
