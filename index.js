@@ -501,6 +501,210 @@ async function _cleanupEventFeed() {
 // ───────────────────────────────────────────────────────────────────────────
 
 // ════════════════════════════════════════════════════════════════════════════
+// PHASE W: CRYPTO DEPOSIT INTENTS
+// ════════════════════════════════════════════════════════════════════════════
+
+const CRYPTO_WALLETS = {
+  USDT: { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
+  USDC: { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
+  ETH:  { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
+  BTC:  { Bitcoin_SegWit: process.env.WALLET_BTC || 'bc1qu6um0h9qdy8nn6w3m2t4x3ava8lp6tm96erwc4' }
+};
+const INTENT_TTL_MS     = 60 * 60 * 1000;
+const FLAG_MISSING_MS   = 30 * 60 * 1000;
+const FLAG_UNCONF_MS    = 30 * 60 * 1000;
+
+function _resolveWallet(symbol, network) {
+  const s = CRYPTO_WALLETS[symbol];
+  return s ? s[network]||null : null;
+}
+
+// POST /api/crypto/deposits/create-intent
+app.post('/api/crypto/deposits/create-intent', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const { clubId, playerId, packageAmountDiamonds, expectedUsd, cryptoSymbol, network } = req.body||{};
+  const errors = [];
+  if (!clubId||!playerId)               errors.push('missing_clubId_or_playerId');
+  if (!packageAmountDiamonds||parseFloat(packageAmountDiamonds)<=0) errors.push('invalid_package');
+  if (!CRYPTO_WALLETS[cryptoSymbol])    errors.push('invalid_cryptoSymbol:'+cryptoSymbol);
+  if (errors.length) return res.status(400).json({ ok:false, errors });
+  const wallet = _resolveWallet(cryptoSymbol, network);
+  if (!wallet) return res.status(400).json({ ok:false, error:'wallet_not_configured_for:'+cryptoSymbol+'/'+network });
+  const now = new Date().toISOString();
+  const intentId = 'DI_'+playerId+'_'+Date.now();
+  const intent = {
+    intent_id:intentId, club_id:clubId, player_id:playerId,
+    package_amount_diamonds:parseFloat(packageAmountDiamonds),
+    expected_usd:parseFloat(expectedUsd)||0, crypto_symbol:cryptoSymbol, network,
+    assigned_wallet_address:wallet,
+    qr_payload: cryptoSymbol==='BTC' ? 'bitcoin:'+wallet+'?amount='+expectedUsd
+                                     : 'ethereum:'+wallet+'?value='+expectedUsd+'&token='+cryptoSymbol,
+    status:'created', tx_hash:null, tx_hash_submitted_at:null,
+    credited_at:null, credited_by:null, reject_reason:null,
+    metadata_json:{}, created_at:now,
+    expires_at: new Date(Date.now()+INTENT_TTL_MS).toISOString(),
+    updated_at:now
+  };
+  const sb = getSupabase();
+  if (sb) {
+    try { await sb.from('crypto_deposit_intents').insert(intent); }
+    catch(e) { return res.status(500).json({ ok:false, error:e.message }); }
+  }
+  console.log('[crypto/intent] created '+intentId+' player='+playerId+' '+cryptoSymbol+' '+packageAmountDiamonds+'d');
+  emitEvent('balance_changed',{ playerId, event:'intent_created' },{ clubId, playerId });
+  res.json({ ok:true, intentId, wallet, qrPayload:intent.qr_payload,
+             expiresAt:intent.expires_at, cryptoSymbol, network });
+});
+
+// POST /api/crypto/deposits/submit-hash
+app.post('/api/crypto/deposits/submit-hash', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const { intentId, txHash } = req.body||{};
+  if (!intentId||!txHash) return res.status(400).json({ ok:false, error:'missing_intentId_or_txHash' });
+  if (txHash.trim().length<10) return res.status(400).json({ ok:false, error:'invalid_txHash' });
+  const sb = getSupabase();
+  const now = new Date().toISOString();
+  try {
+    // Load intent
+    let intent;
+    if (sb) {
+      const { data } = await sb.from('crypto_deposit_intents').select('*').eq('intent_id',intentId).limit(1);
+      intent = data&&data[0];
+    }
+    if (!intent) return res.status(404).json({ ok:false, error:'intent_not_found' });
+    // Ownership
+    if (intent.player_id !== actor.actorId && actor.platformRole!=='platform_admin')
+      return res.status(403).json({ ok:false, error:'not_owner' });
+    if (intent.status==='credited') return res.status(409).json({ ok:false, error:'already_credited' });
+    if (intent.status==='rejected') return res.status(409).json({ ok:false, error:'intent_rejected' });
+    if (new Date(intent.expires_at).getTime() <= Date.now())
+      return res.status(409).json({ ok:false, error:'intent_expired' });
+    // Duplicate tx hash check
+    if (sb) {
+      const { data:dup } = await sb.from('crypto_deposit_intents').select('intent_id')
+        .eq('tx_hash',txHash.trim()).neq('intent_id',intentId)
+        .not('status','in','(rejected,expired)').limit(1);
+      if (dup&&dup[0]) return res.status(409).json({ ok:false, error:'duplicate_txHash' });
+      await sb.from('crypto_deposit_intents').update({
+        tx_hash:txHash.trim(), tx_hash_submitted_at:now,
+        status:'hash_submitted', updated_at:now
+      }).eq('intent_id',intentId);
+    }
+    emitEvent('balance_changed',{ playerId:intent.player_id, event:'hash_submitted' },
+      { clubId:intent.club_id, playerId:intent.player_id }, req.requestId);
+    _writeAuthAudit('crypto_hash_submitted', actor.actorId, intent.club_id, '/crypto/deposits/submit-hash',
+      { intentId, txHash:txHash.trim() });
+    console.log('[crypto/hash] submitted intentId='+intentId+' tx='+txHash.trim().slice(0,20)+'...');
+    res.json({ ok:true, intentId, status:'hash_submitted' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/admin/crypto/deposits
+app.get('/api/admin/crypto/deposits', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const clubId  = req._clubId || req.query.clubId;
+  const statusF = req.query.status;
+  const nowMs   = Date.now();
+  const sb      = getSupabase();
+  try {
+    let intents = [];
+    if (sb) {
+      let q = sb.from('crypto_deposit_intents').select('*').order('created_at',{ ascending:false }).limit(50);
+      if (clubId && actor.platformRole!=='platform_admin') q=q.eq('club_id',clubId);
+      if (statusF) q=q.eq('status',statusF);
+      const { data } = await q;
+      intents = data||[];
+    }
+    // Flag intents
+    intents = intents.map(function(i) {
+      const flags = [];
+      if (i.status==='created' && nowMs-new Date(i.created_at).getTime()>FLAG_MISSING_MS) flags.push('missing_hash');
+      if (i.status==='hash_submitted' && i.tx_hash_submitted_at &&
+          nowMs-new Date(i.tx_hash_submitted_at).getTime()>FLAG_UNCONF_MS) flags.push('awaiting_review');
+      return Object.assign({},i,{ flags, ageMs:nowMs-new Date(i.created_at).getTime() });
+    });
+    const counts = { created:0,hash_submitted:0,credited:0,rejected:0,expired:0 };
+    intents.forEach(function(i){ counts[i.status]=(counts[i.status]||0)+1; });
+    res.json({ ok:true, intents, counts });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/admin/crypto/deposits/confirm
+app.post('/api/admin/crypto/deposits/confirm', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { intentId } = req.body||{};
+  if (!intentId) return res.status(400).json({ ok:false, error:'missing_intentId' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const { data } = await sb.from('crypto_deposit_intents').select('*').eq('intent_id',intentId).limit(1);
+    const intent = data&&data[0];
+    if (!intent) return res.status(404).json({ ok:false, error:'intent_not_found' });
+    if (intent.status==='credited') return res.json({ ok:true, idempotent:true, intentId });
+    if (intent.status==='rejected') return res.status(409).json({ ok:false, error:'intent_rejected' });
+    if (!['hash_submitted','pending_review','confirmed'].includes(intent.status))
+      return res.status(409).json({ ok:false, error:'invalid_status_for_confirm:'+intent.status });
+    const iKey = 'CRYPTO_CONF_'+intentId;
+    // Write canonical ledger credit (BALANCE_ADJUSTMENT for diamond purchase)
+    await _writeLedgerEntry({
+      clubId:intent.club_id, playerId:intent.player_id,
+      eventType:'BALANCE_ADJUSTMENT', amount:intent.package_amount_diamonds,
+      idempotencyKey:iKey, createdBy:actor.actorId||'admin',
+      reason:'crypto_deposit_credited:'+intentId,
+      metadataJson:{ intentId, cryptoSymbol:intent.crypto_symbol, txHash:intent.tx_hash }
+    });
+    const now = new Date().toISOString();
+    await sb.from('crypto_deposit_intents').update({
+      status:'credited', credited_at:now, credited_by:actor.actorId||'admin',
+      idempotency_key:iKey, updated_at:now
+    }).eq('intent_id',intentId);
+    emitEvent('balance_changed',{ playerId:intent.player_id, diamonds:intent.package_amount_diamonds },
+      { clubId:intent.club_id, playerId:intent.player_id }, req.requestId);
+    _writeAuthAudit('crypto_deposit_credited', actor.actorId, intent.club_id,
+      '/admin/crypto/deposits/confirm', { intentId, diamonds:intent.package_amount_diamonds });
+    console.log('[crypto/confirm] '+intentId+' +'+intent.package_amount_diamonds+'d player='+intent.player_id);
+    res.json({ ok:true, intentId, diamonds:intent.package_amount_diamonds, status:'credited' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/admin/crypto/deposits/reject
+app.post('/api/admin/crypto/deposits/reject', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { intentId, reason } = req.body||{};
+  if (!intentId||!reason||!reason.trim()) return res.status(400).json({ ok:false, error:'missing_intentId_or_reason' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const { data } = await sb.from('crypto_deposit_intents').select('*').eq('intent_id',intentId).limit(1);
+    const intent = data&&data[0];
+    if (!intent) return res.status(404).json({ ok:false, error:'intent_not_found' });
+    if (intent.status==='credited') return res.status(409).json({ ok:false, error:'already_credited' });
+    const now = new Date().toISOString();
+    await sb.from('crypto_deposit_intents').update({
+      status:'rejected', reject_reason:reason.trim(), updated_at:now
+    }).eq('intent_id',intentId);
+    emitEvent('balance_changed',{ playerId:intent.player_id, event:'deposit_rejected' },
+      { clubId:intent.club_id, playerId:intent.player_id }, req.requestId);
+    _writeAuthAudit('crypto_deposit_rejected', actor.actorId, intent.club_id,
+      '/admin/crypto/deposits/reject', { intentId, reason:reason.trim() });
+    res.json({ ok:true, intentId, status:'rejected' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
 // PHASE V: FRAUD/ABUSE SIGNALS
 // ════════════════════════════════════════════════════════════════════════════
 
