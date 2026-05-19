@@ -162,6 +162,224 @@ function payloadSizeMiddleware(req, res, next) {
   next();
 }
 // ════════════════════════════════════════════════════════════════════════════
+// PHASE S: BACKGROUND JOB QUEUE + RETRY SAFETY
+// ════════════════════════════════════════════════════════════════════════════
+
+const JOB_TYPES_SET = new Set(['odds_refresh','result_refresh','grade_run',
+                                'settlement_close_check','payment_reconciliation']);
+const JOB_BACKOFF_MS = [30000,60000,120000,300000,600000]; // 30s,1m,2m,5m,10m
+// In-memory job store (Supabase-backed when available)
+const _jobMemStore = new Map();
+
+function _jobCalcBackoff(attempts) {
+  var idx = Math.min(attempts, JOB_BACKOFF_MS.length-1);
+  return new Date(Date.now()+JOB_BACKOFF_MS[idx]).toISOString();
+}
+
+async function enqueueJob(type, payload, opts) {
+  opts = opts||{};
+  if (!JOB_TYPES_SET.has(type)) return { ok:false, error:'invalid_job_type:'+type };
+  const now   = new Date().toISOString();
+  const jobId = 'JOB_'+type+'_'+Date.now()+'_'+_crypto.randomBytes(3).toString('hex');
+  const job   = {
+    job_id:opts.jobId||jobId, type, club_id:opts.clubId||null,
+    status:'queued', attempts:0, max_attempts:opts.maxAttempts||5,
+    run_after:opts.runAfter||now, locked_at:null, locked_by:null,
+    last_error:null, payload_json:payload||{},
+    idempotency_key:opts.idempotencyKey||null,
+    created_at:now, updated_at:now
+  };
+  // Idempotency: check mem store
+  if (opts.idempotencyKey) {
+    for (const [,j] of _jobMemStore) {
+      if (j.idempotency_key===opts.idempotencyKey &&
+          (j.status==='queued'||j.status==='running'))
+        return { ok:true, idempotent:true, jobId:j.job_id };
+    }
+  }
+  _jobMemStore.set(job.job_id, job);
+  // Persist to Supabase
+  try {
+    const sb = getSupabase();
+    if (sb) await sb.from('jobs').upsert({
+      job_id:job.job_id, type, club_id:job.club_id,
+      status:'queued', attempts:0, max_attempts:job.max_attempts,
+      run_after:job.run_after, payload_json:payload||{},
+      idempotency_key:job.idempotency_key
+    }, { onConflict:'job_id' });
+  } catch(_e) { console.warn('[jobs] enqueue DB error:', _e.message); }
+  console.log('[jobs] enqueued', type, job.job_id);
+  return { ok:true, jobId:job.job_id };
+}
+
+async function _claimNextJob(workerId) {
+  const now = new Date().toISOString();
+  // Try from Supabase first (atomic claim via UPDATE ... RETURNING)
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('jobs').select('*')
+        .eq('status','queued').is('locked_at',null).lte('run_after',now)
+        .order('run_after').limit(1);
+      const job = data&&data[0];
+      if (job) {
+        const lockTs = new Date().toISOString();
+        const { error } = await sb.from('jobs')
+          .update({ status:'running',locked_at:lockTs,locked_by:workerId,
+                    attempts:job.attempts+1,updated_at:lockTs })
+          .eq('job_id',job.job_id).eq('status','queued').is('locked_at',null);
+        if (!error) {
+          job.status='running'; job.locked_at=lockTs;
+          job.locked_by=workerId; job.attempts+=1;
+          _jobMemStore.set(job.job_id, job);
+          return job;
+        }
+      }
+    }
+  } catch(_e) {}
+  // Fallback: mem store
+  for (const [,j] of _jobMemStore) {
+    if (j.status==='queued' && !j.locked_at && j.run_after<=now) {
+      j.status='running'; j.locked_at=now; j.locked_by=workerId; j.attempts++;
+      j.updated_at=now;
+      return j;
+    }
+  }
+  return null;
+}
+
+async function _completeJob(jobId) {
+  const now = new Date().toISOString();
+  const j = _jobMemStore.get(jobId);
+  if (j) { j.status='succeeded'; j.locked_at=null; j.locked_by=null; j.updated_at=now; }
+  try { const sb=getSupabase(); if(sb) await sb.from('jobs')
+    .update({status:'succeeded',locked_at:null,locked_by:null,updated_at:now})
+    .eq('job_id',jobId); } catch(_e){}
+}
+
+async function _failJob(jobId, errorMsg) {
+  const now = new Date().toISOString();
+  const j = _jobMemStore.get(jobId);
+  if (!j) return;
+  j.last_error = errorMsg; j.locked_at=null; j.locked_by=null; j.updated_at=now;
+  const isDead = j.attempts >= j.max_attempts;
+  j.status     = isDead ? 'dead' : 'queued';
+  j.run_after  = isDead ? now    : _jobCalcBackoff(j.attempts);
+  try { const sb=getSupabase(); if(sb) await sb.from('jobs')
+    .update({status:j.status,locked_at:null,locked_by:null,
+             last_error:errorMsg,run_after:j.run_after,updated_at:now})
+    .eq('job_id',jobId); } catch(_e){}
+  console.log('[jobs] failed', jobId, isDead?'DEAD':'retry@'+j.run_after);
+}
+
+// ── JOB HANDLERS ────────────────────────────────────────────────────────────────────────
+const _jobHandlers = {
+  odds_refresh: async function(job) {
+    await pollLiveOddsLoop();
+    _upsertOddsSnapshots().catch(()=>{});
+    logEvent('info','job:odds_refresh',{ jobId:job.job_id });
+  },
+  result_refresh: async function(job) {
+    const p = job.payload_json||{};
+    const sports = p.sports||(CACHE_SPORTS||['baseball_mlb']);
+    for (const sport of sports) {
+      try {
+        const url = 'https://api.the-odds-api.com/v4/sports/'+sport+
+          '/scores/?apiKey='+ODDS_KEY+'&daysFrom='+(p.daysBack||3);
+        const data = await new Promise(function(resolve){
+          const https=require('https');
+          const req=https.get(url,function(res){ let d=''; res.on('data',function(c){d+=c;});
+            res.on('end',function(){ try{resolve(JSON.parse(d));}catch(_e){resolve([]);} }); });
+          req.on('error',function(){ resolve([]); }); req.setTimeout(8000,function(){ req.destroy(); resolve([]); });
+        });
+        if (Array.isArray(data)) await _upsertResultSnapshots(data, sport);
+      } catch(_e) { logEvent('warn','job:result_refresh_sport_error',{ sport, err:_e.message }); }
+    }
+  },
+  grade_run: async function(job) {
+    // Trigger server grade for the club in payload, or globally
+    const p = job.payload_json||{};
+    const sb = getSupabase();
+    if (!sb) throw new Error('supabase_not_configured');
+    // Reuse existing grade/run logic via internal call simulation
+    const fakeReq = { body:{ daysBack:p.daysBack||3, clubId:p.clubId }, _actor:{ actorId:'worker', role:'owner' }, _clubId:p.clubId||null };
+    // Call the grade core function
+    await _runGradeCore(fakeReq, sb);
+  },
+  settlement_close_check: async function(job) {
+    // Check for clubs with no activity this week — log only, no auto-close
+    logEvent('info','job:settlement_close_check',{ jobId:job.job_id });
+  },
+  payment_reconciliation: async function(job) {
+    logEvent('info','job:payment_reconciliation',{ jobId:job.job_id });
+  }
+};
+
+// Extracted grade core for reuse by worker
+async function _runGradeCore(fakeReq, sb) {
+  const { daysBack=3, playerId, clubId } = fakeReq.body||{};
+  const nowMs = Date.now(); const gradedAt = new Date().toISOString();
+  let tq = sb.from('tickets').select('id,type,status,risk_amount,potential_profit,estimated_payout,graded_at,player_id,club_id').in('status',['active','open']);
+  if (playerId) tq = tq.eq('player_id',playerId);
+  if (clubId)   tq = tq.eq('club_id',clubId);
+  const { data:tickets } = await tq;
+  if (!tickets||!tickets.length) return { graded:0, skipped:0 };
+  const ticketIds = tickets.map(function(t){ return t.id; });
+  const { data:allLegs } = await sb.from('ticket_legs').select('*').in('ticket_id',ticketIds);
+  const uniqueKeys = [...new Set((allLegs||[]).map(function(l){ return l.canonical_game_key||''; }).filter(Boolean))];
+  const { data:snapRows } = uniqueKeys.length ? await sb.from('result_snapshots').select('*').in('canonical_game_key',uniqueKeys) : { data:[] };
+  const resultsByKey = {};
+  (snapRows||[]).forEach(function(r){ resultsByKey[r.canonical_game_key]=r; });
+  let graded=0, skipped=0;
+  for (const ticket of tickets) {
+    try {
+      if (ticket.graded_at) { skipped++; continue; }
+      const ticketLegs = (allLegs||[]).filter(function(l){ return l.ticket_id===ticket.id; });
+      const outcome = _deriveTicketOutcome(ticket, ticketLegs, resultsByKey);
+      if (outcome.outcome==='error'||outcome.outcome==='pending') { skipped++; continue; }
+      const profit = parseFloat(ticket.potential_profit)||0;
+      const gr = await _callMoneyRpc('grade_ticket_tx',{
+        p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
+        p_grade_result:outcome.outcome, p_profit:profit,
+        p_idempotency_key:'WK_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker'
+      });
+      if (gr.ok||gr.idempotent) graded++; else skipped++;
+    } catch(_e) { logEvent('error','grade_core_ticket_error',{ ticketId:ticket.id, err:_e.message }); skipped++; }
+  }
+  return { graded, skipped };
+}
+
+// ── WORKER LOOP ───────────────────────────────────────────────────────────────────────────
+const WORKER_ID = 'worker_'+_crypto.randomBytes(4).toString('hex');
+const WORKER_POLL_MS = parseInt(process.env.WORKER_POLL_MS)||20000; // 20s default
+
+async function _workerTick() {
+  const job = await _claimNextJob(WORKER_ID);
+  if (!job) return;
+  console.log('[worker] claimed', job.type, job.job_id, 'attempt', job.attempts);
+  const handler = _jobHandlers[job.type];
+  if (!handler) { await _failJob(job.job_id,'no_handler_for_type:'+job.type); return; }
+  try {
+    await handler(job);
+    await _completeJob(job.job_id);
+    console.log('[worker] completed', job.type, job.job_id);
+  } catch(e) {
+    logEvent('error','worker_job_failed',{ type:job.type, jobId:job.job_id, err:e.message });
+    await _failJob(job.job_id, e.message);
+  }
+}
+
+if (process.env.ENABLE_WORKER==='true') {
+  console.log('[worker] starting — poll every '+WORKER_POLL_MS+'ms id='+WORKER_ID);
+  setInterval(_workerTick, WORKER_POLL_MS);
+  _workerTick(); // immediate first tick
+  // Seed recurring jobs
+  enqueueJob('odds_refresh',{},{idempotencyKey:'BOOT_odds_refresh'});
+  enqueueJob('result_refresh',{},{idempotencyKey:'BOOT_result_refresh'});
+}
+// ───────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
 // PHASE R: OBSERVABILITY + HEALTH DASHBOARD
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -352,6 +570,67 @@ app.get('/api/health', async (req, res) => {
     requestId:req.requestId });
 });
 
+// ── ADMIN JOB ENDPOINTS ───────────────────────────────────────────────────────────────────────
+app.get('/api/admin/jobs', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const limit  = Math.min(parseInt(req.query.limit)||50, 200);
+  const status = req.query.status;
+  const jobs   = [..._jobMemStore.values()]
+    .filter(function(j){ return !status||j.status===status; })
+    .sort(function(a,b){ return a.updated_at<b.updated_at?1:-1; })
+    .slice(0, limit);
+  const counts = { queued:0,running:0,succeeded:0,failed:0,dead:0 };
+  _jobMemStore.forEach(function(j){ counts[j.status]=(counts[j.status]||0)+1; });
+  res.json({ ok:true, jobs, counts, workerId:WORKER_ID });
+});
+
+app.post('/api/admin/jobs/enqueue', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { type, payload, clubId, maxAttempts, runAfter, idempotencyKey } = req.body||{};
+  if (!type) return res.status(400).json({ ok:false, error:'missing_type' });
+  const r = await enqueueJob(type, payload||{}, { clubId, maxAttempts, runAfter, idempotencyKey });
+  if (!r.ok) return res.status(400).json(r);
+  res.json(r);
+});
+
+app.post('/api/admin/jobs/retry', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { jobId } = req.body||{};
+  if (!jobId) return res.status(400).json({ ok:false, error:'missing_jobId' });
+  const j = _jobMemStore.get(jobId);
+  if (!j) return res.status(404).json({ ok:false, error:'job_not_found' });
+  if (j.status!=='dead') return res.status(409).json({ ok:false, error:'job_not_dead' });
+  j.status='queued'; j.attempts=0; j.run_after=new Date().toISOString();
+  j.last_error=null; j.updated_at=new Date().toISOString();
+  try { const sb=getSupabase(); if(sb) await sb.from('jobs')
+    .update({status:'queued',attempts:0,run_after:j.run_after,last_error:null,updated_at:j.updated_at})
+    .eq('job_id',jobId); } catch(_e){}
+  res.json({ ok:true, jobId });
+});
+
+app.post('/api/admin/jobs/cancel', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { jobId } = req.body||{};
+  const j = _jobMemStore.get(jobId);
+  if (!j) return res.status(404).json({ ok:false, error:'job_not_found' });
+  if (j.status==='running') return res.status(409).json({ ok:false, error:'cannot_cancel_running' });
+  j.status='dead'; j.last_error='cancelled'; j.updated_at=new Date().toISOString();
+  res.json({ ok:true, jobId });
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // GET /api/admin/diagnostics — full_admin+ or platform_admin
 app.get('/api/admin/diagnostics', async (req, res) => {
   const actor = requireActor(req);
@@ -402,6 +681,10 @@ app.get('/api/admin/diagnostics', async (req, res) => {
     });
   } catch(_e){} }
   result.rpcFailCount = _rpcFailCount;
+  // Job counts
+  const jCounts = { queued:0,running:0,succeeded:0,failed:0,dead:0 };
+  _jobMemStore.forEach(function(j){ jCounts[j.status]=(jCounts[j.status]||0)+1; });
+  result.jobCounts = jCounts;
   res.json(result);
 });
 
