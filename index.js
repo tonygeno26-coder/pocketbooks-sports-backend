@@ -1123,6 +1123,89 @@ app.get('/api/host/dashboard', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
+app.get('/api/host/settlements-preview', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
+  const { clubId } = req.query;
+  try {
+    // Load all tickets for this club
+    let tq = sb.from('tickets')
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,type');
+    if (clubId) tq = tq.eq('club_id', clubId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+
+    // Load club members for balance/username
+    var memberMap = {};
+    try {
+      let mq = sb.from('club_members').select('player_id,balance_start');
+      if (clubId) mq = mq.eq('club_id', clubId);
+      const { data: members } = await mq;
+      (members||[]).forEach(function(m){ memberMap[m.player_id] = m; });
+    } catch(_e) {}
+
+    // Derive per-player settlement from tickets
+    var byPlayer = {};
+    function getOrCreate(pid, username) {
+      if (!byPlayer[pid]) {
+        var meta = memberMap[pid] || {};
+        byPlayer[pid] = {
+          playerId:     pid,
+          username:     username || pid,
+          balance:      parseFloat(meta.balance_start || 1000),
+          openRisk:     0,
+          settledNet:   0,
+          owesHost:     0,
+          hostOwes:     0,
+          lastTicketAt: null
+        };
+      }
+      return byPlayer[pid];
+    }
+
+    function rnd(v){ return Math.round((isNaN(v)?0:v)*100)/100; }
+
+    (tickets||[]).forEach(function(t) {
+      var pid  = t.player_id || 'unknown';
+      var s    = (t.status||'').toLowerCase();
+      var risk = parseFloat(t.risk_amount)||0;
+      var prof = parseFloat(t.potential_profit)||0;
+      var p    = getOrCreate(pid, t.player_username);
+      var pMs  = t.placed_at ? new Date(t.placed_at).getTime() : 0;
+      if (pMs && (!p.lastTicketAt || pMs > new Date(p.lastTicketAt).getTime())) p.lastTicketAt = t.placed_at;
+      if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
+      if (s==='active'||s==='open')  { p.openRisk   += risk; }
+      else if (s==='won')             { p.settledNet += prof; }
+      else if (s==='lost')            { p.settledNet -= risk; }
+    });
+
+    Object.values(byPlayer).forEach(function(p) {
+      p.settledNet = rnd(p.settledNet);
+      p.openRisk   = rnd(p.openRisk);
+      if (p.settledNet < 0) { p.owesHost = rnd(Math.abs(p.settledNet)); p.hostOwes = 0; }
+      else                  { p.hostOwes = rnd(p.settledNet); p.owesHost = 0; }
+    });
+
+    var players = Object.values(byPlayer).sort(function(a,b){ return (b.owesHost+b.hostOwes)-(a.owesHost+a.hostOwes); });
+    var playersOweTot = players.reduce(function(s,p){ return s+p.owesHost; },0);
+    var hostOwesTot   = players.reduce(function(s,p){ return s+p.hostOwes; },0);
+
+    res.json({
+      ok: true, source:'db', clubId: clubId||null,
+      players,
+      totals: {
+        playersOwe: rnd(playersOweTot),
+        hostOwes:   rnd(hostOwesTot),
+        net:        rnd(playersOweTot - hostOwesTot)
+      }
+    });
+  } catch(e) {
+    console.error('[settlements-preview] error:', e.message);
+    res.status(500).json({ ok:false, source:'db_error', error:e.message, players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
+  }
+});
+
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
