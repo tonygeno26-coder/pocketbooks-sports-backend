@@ -162,6 +162,47 @@ function payloadSizeMiddleware(req, res, next) {
   next();
 }
 // ════════════════════════════════════════════════════════════════════════════
+// PHASE R: OBSERVABILITY + HEALTH DASHBOARD
+// ════════════════════════════════════════════════════════════════════════════
+
+const _SENSITIVE_LOG_KEYS = new Set(['authorization','x-actor-role','token','password',
+                                      'secret','jwt','bearer','SERVICE_ROLE_KEY']);
+const _SERVER_START = Date.now();
+let   _rpcFailCount = 0;
+
+function _sanitizeLog(data) {
+  if (!data||typeof data!=='object') return data;
+  const out = {};
+  Object.keys(data).forEach(function(k) {
+    if (_SENSITIVE_LOG_KEYS.has(k.toLowerCase())) out[k]='[REDACTED]';
+    else if (data[k]&&typeof data[k]==='object') out[k]=_sanitizeLog(data[k]);
+    else out[k]=data[k];
+  });
+  return out;
+}
+
+function logEvent(level, event, data, requestId) {
+  const LEVELS = new Set(['info','warn','error']);
+  if (!LEVELS.has(level)) level='info';
+  const entry = { ts:new Date().toISOString(), level, event,
+    requestId:requestId||null, data:_sanitizeLog(data||{}) };
+  if (level==='error') console.error('['+level.toUpperCase()+']', event, JSON.stringify(entry.data));
+  else if (level==='warn') console.warn('[WARN]', event, JSON.stringify(entry.data));
+  else if (process.env.LOG_VERBOSE) console.log('[INFO]', event, JSON.stringify(entry.data));
+  return entry;
+}
+
+// Request ID middleware
+const _SAFE_REQ_ID_RE = /^[a-zA-Z0-9_\-]{6,64}$/;
+function requestIdMiddleware(req, res, next) {
+  const incoming = (req.headers['x-request-id']||'').trim();
+  req.requestId = _SAFE_REQ_ID_RE.test(incoming)
+    ? incoming
+    : 'req_'+Date.now().toString(36)+'_'+_crypto.randomBytes(4).toString('hex');
+  res.setHeader('x-request-id', req.requestId);
+  next();
+}
+// ───────────────────────────────────────────────────────────────────────────
 
 // ── Supabase mirror client (Phase A — passive write only) ─────────────────────
 // Loaded lazily so missing env never crashes startup.
@@ -285,14 +326,86 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
 
-// Phase Q: hardened CORS, security headers, payload size, rate limiter
+// Phase Q+R: request ID → CORS → security headers → payload → rate limit
+app.use(requestIdMiddleware);
 app.use(_hardenedCors);
-app.use(express.json({ limit:'100kb' })); // body-parser limit as first guard
+app.use(express.json({ limit:'100kb' }));
 app.use(securityHeadersMiddleware);
 app.use(payloadSizeMiddleware);
 app.use(rateLimitMiddleware);
 
-// ===== HEALTH (first route) =====
+// ===== HEALTH + DIAGNOSTICS (Phase R) =====
+
+// GET /api/health — public, safe
+app.get('/api/health', async (req, res) => {
+  const uptime = Math.round((Date.now()-_SERVER_START)/1000);
+  let dbStatus='unknown', dbOk=false;
+  try { const sb=getSupabase(); if(sb){await sb.from('tickets').select('id').limit(1);dbStatus='connected';dbOk=true;}
+        else dbStatus='not_configured'; } catch(_e){ dbStatus='error'; }
+  const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
+  const oddsStatus = cache&&cache.sourceStatus||'unknown';
+  const lastOdds   = cache&&cache.lastSuccessAt||null;
+  res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
+    commit:process.env.COMMIT_SHA||null, dbStatus, oddsStatus,
+    resultStatus:'unknown', queueStatus:'not_implemented',
+    lastOddsSuccessAt:lastOdds, lastResultSuccessAt:null,
+    requestId:req.requestId });
+});
+
+// GET /api/admin/diagnostics — full_admin+ or platform_admin
+app.get('/api/admin/diagnostics', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const rank = ROLE_RANK[actor.role]||0;
+  if (rank < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const sb = getSupabase();
+  const result = { ok:true, generatedAt:new Date().toISOString(), requestId:req.requestId };
+  // Rate limit stats snapshot
+  result.rateLimitStats = { totalKeys:_rlWindows.size };
+  // Market status
+  try {
+    const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:{};
+    result.marketStatus = { sourceStatus:cache.sourceStatus, gameCount:cache.gameCount,
+      marketCount:cache.marketCount, cacheAgeMs:cache.updatedAt?Date.now()-new Date(cache.updatedAt).getTime():null };
+  } catch(_e){ result.marketStatus={}; }
+  // Result snapshot count
+  result.resultStatus = {};
+  if (sb) { try {
+    const { count } = await sb.from('result_snapshots').select('*',{count:'exact',head:true});
+    result.resultStatus = { snapshotCount:count||0 };
+  } catch(_e){} }
+  // Audit event counts (last 24h)
+  result.auditEventCounts = {};
+  if (sb) { try {
+    const since = new Date(Date.now()-86400000).toISOString();
+    const { data:evts } = await sb.from('audit_events').select('event_type')
+      .gte('created_at',since);
+    (evts||[]).forEach(function(e){
+      result.auditEventCounts[e.event_type]=(result.auditEventCounts[e.event_type]||0)+1;
+    });
+  } catch(_e){} }
+  // Session counts
+  result.sessionCounts = { active:0, revoked:0 };
+  _sessionMemStore.forEach(function(s){
+    if (!s) return;
+    if (s.status==='active') result.sessionCounts.active++;
+    else if (s.status==='revoked') result.sessionCounts.revoked++;
+  });
+  // Settlement stats
+  result.settlementStats = { openPeriods:0, closedPeriods:0 };
+  if (sb) { try {
+    const { data:periods } = await sb.from('settlement_periods').select('status');
+    (periods||[]).forEach(function(p){
+      if (p.status==='open') result.settlementStats.openPeriods++;
+      else result.settlementStats.closedPeriods++;
+    });
+  } catch(_e){} }
+  result.rpcFailCount = _rpcFailCount;
+  res.json(result);
+});
+
+// GET /health — legacy shorthand
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
 // ===== ENV CHECK (safe — returns boolean flags only, no secret values) =====
@@ -1417,11 +1530,13 @@ async function _callMoneyRpc(rpcName, params) {
   if (!sb) throw new Error('supabase_not_configured');
   const { data, error } = await sb.rpc(rpcName, params);
   if (error) {
+    _rpcFailCount++;
     if (error.code==='23505') return { ok:false, error:'duplicate_ledger_entry' };
     if (error.message&&error.message.includes('insufficient_balance'))
       return { ok:false, error:'insufficient_balance' };
     if (error.message&&error.message.includes('invalid_transition'))
       return { ok:false, error:'invalid_transition', detail:error.message };
+    logEvent('error','rpc_failure',{ rpcName, code:error.code, msg:error.message });
     throw error;
   }
   return data || { ok:false, error:'rpc_no_response' };
