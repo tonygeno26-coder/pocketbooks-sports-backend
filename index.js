@@ -965,6 +965,112 @@ async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
   return { ledgerBal, openRisk, available, rows };
 }
 
+// ── RISK LIMITS ENGINE ───────────────────────────────────────────────────────────────────────
+const RISK_CODE_STATUS = {
+  player_suspended:         403,
+  stake_below_min:          422,
+  stake_above_max:          422,
+  payout_above_max:         422,
+  parlays_disabled:         422,
+  teasers_disabled:         422,
+  round_robins_disabled:    422,
+  too_many_parlay_legs:     422,
+  sport_blocked:            422,
+  sport_not_allowed:        422,
+  market_blocked:           422,
+  live_betting_disabled:    422,
+  player_open_risk_exceeded:422,
+  club_open_risk_exceeded:  422,
+  event_risk_exceeded:      422,
+  market_risk_exceeded:     422
+};
+
+// JS-side risk check (runs before RPC, using cached limits + live exposure query)
+async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
+  const { stake, potentialPayout, betType, legs } = params;
+  const nowMs = Date.now();
+  let pl = {}, cs = {};
+  try {
+    const { data:plData } = await sb.from('player_limits').select('*')
+      .eq('club_id',clubId).eq('player_id',playerId).limit(1);
+    if (plData&&plData[0]) pl = plData[0];
+  } catch(_e){}
+  try {
+    const { data:csData } = await sb.from('club_risk_settings').select('*')
+      .eq('club_id',clubId).limit(1);
+    if (csData&&csData[0]) cs = csData[0];
+  } catch(_e){}
+
+  const s   = parseFloat(stake)||0;
+  const pay = parseFloat(potentialPayout)||0;
+  const type= (betType||'').toLowerCase();
+  const legsArr = legs||[];
+
+  // Player suspended
+  if (pl.suspended_until && nowMs < new Date(pl.suspended_until).getTime())
+    return { ok:false, code:'player_suspended', suspendedUntil:pl.suspended_until };
+
+  // Stake bounds
+  if (cs.min_stake && s < parseFloat(cs.min_stake))
+    return { ok:false, code:'stake_below_min', min:cs.min_stake, stake:s };
+  if (cs.max_stake && s > parseFloat(cs.max_stake))
+    return { ok:false, code:'stake_above_max', max:cs.max_stake, stake:s, source:'club_settings' };
+  if (pl.max_single_bet && s > parseFloat(pl.max_single_bet))
+    return { ok:false, code:'stake_above_max', max:pl.max_single_bet, stake:s, source:'player_limit' };
+
+  // Payout cap
+  const maxPayout = Math.min(
+    parseFloat(cs.max_payout)||999999,
+    parseFloat(pl.max_payout)||999999
+  );
+  if (pay > maxPayout)
+    return { ok:false, code:'payout_above_max', max:maxPayout, payout:pay };
+
+  // Bet type gates
+  if ((type==='parlay'||type==='roundrobin') && cs.allow_parlays===false)
+    return { ok:false, code:'parlays_disabled' };
+  if (type==='teaser' && cs.allow_teasers===false)
+    return { ok:false, code:'teasers_disabled' };
+  if (type==='roundrobin' && cs.allow_round_robins===false)
+    return { ok:false, code:'round_robins_disabled' };
+  if ((type==='parlay'||type==='roundrobin') && cs.max_parlay_legs && legsArr.length > cs.max_parlay_legs)
+    return { ok:false, code:'too_many_parlay_legs', max:cs.max_parlay_legs, legs:legsArr.length };
+
+  // Per-leg sport/market/live checks
+  for (let i=0; i<legsArr.length; i++) {
+    const leg = legsArr[i];
+    const sport  = (leg.sport||'').toLowerCase();
+    const market = (leg.market||'moneyline').toLowerCase();
+    if (cs.blocked_sports && cs.blocked_sports.includes(sport))
+      return { ok:false, code:'sport_blocked', sport, legIndex:i, source:'club_settings' };
+    if (pl.blocked_sports && pl.blocked_sports.includes(sport))
+      return { ok:false, code:'sport_blocked', sport, legIndex:i, source:'player_limit' };
+    if (cs.blocked_markets && cs.blocked_markets.includes(market))
+      return { ok:false, code:'market_blocked', market, legIndex:i, source:'club_settings' };
+    if (pl.blocked_markets && pl.blocked_markets.includes(market))
+      return { ok:false, code:'market_blocked', market, legIndex:i, source:'player_limit' };
+    if (pl.allowed_sports && !pl.allowed_sports.includes(sport))
+      return { ok:false, code:'sport_not_allowed', sport, legIndex:i };
+    if (cs.allow_live_betting===false && leg.isLive)
+      return { ok:false, code:'live_betting_disabled', legIndex:i };
+  }
+
+  // Player open risk
+  if (pl.max_open_risk) {
+    try {
+      const { data } = await sb.from('tickets').select('risk_amount')
+        .eq('club_id',clubId).eq('player_id',playerId).in('status',['active','open']);
+      const cur = (data||[]).reduce(function(acc,t){ return acc+parseFloat(t.risk_amount||0); },0);
+      if (cur + s > parseFloat(pl.max_open_risk))
+        return { ok:false, code:'player_open_risk_exceeded',
+                 max:pl.max_open_risk, current:cur, stake:s };
+    } catch(_e){}
+  }
+
+  return { ok:true };
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 // Call a Postgres money RPC (place_bet_tx, cancel_bet_tx, etc.)
 async function _callMoneyRpc(rpcName, params) {
   const sb = getSupabase();
@@ -2899,6 +3005,21 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     if (stakeAmt > available + 0.005)
       return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
 
+    // 2b. Risk limits check (JS-side; Postgres RPC also enforces, this gives early rejection)
+    try {
+      const riskCheck = await _checkRiskLimitsJs(sb, clubId, playerId, {
+        stake: stakeAmt, potentialPayout: parseFloat(payout)||0,
+        betType, legs: legsArr
+      });
+      if (!riskCheck.ok) {
+        const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
+        console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
+        return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
+      }
+    } catch(riskErr) {
+      console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
+    }
+
     // 3. Odds validation using LIVE_MARKET_CACHE (single source of truth)
     // Skip if player explicitly accepted updated odds (oddsAccepted:true on body)
     if (!body.oddsAccepted) {
@@ -2964,22 +3085,33 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
     if (lErr) throw lErr;
 
-    // 6. Phase I: call place_bet_tx RPC (atomic ticket + canonical ledger in one DB transaction)
+    // 6. Phase I+J: call place_bet_tx RPC (atomic ticket + canonical ledger + risk limits)
     const rpcResult = await _callMoneyRpc('place_bet_tx', {
-      p_ticket_id:       ticketId,
-      p_club_id:         clubId||'',
-      p_player_id:       playerId,
-      p_player_username: playerUsername||null,
-      p_bet_type:        betType,
-      p_stake:           rnd(stakeAmt),
+      p_ticket_id:        ticketId,
+      p_club_id:          clubId||'',
+      p_player_id:        playerId,
+      p_player_username:  playerUsername||null,
+      p_bet_type:         betType,
+      p_stake:            rnd(stakeAmt),
       p_potential_profit: rnd(parseFloat(potentialProfit)||0),
       p_estimated_payout: rnd(parseFloat(payout)||0),
-      p_idempotency_key: idempotencyKey,
-      p_created_by:      playerId
+      p_idempotency_key:  idempotencyKey,
+      p_created_by:       playerId,
+      // Phase J risk limit params
+      p_leg_count:        legsArr.length,
+      p_sports:           legsArr.map(function(l){ return (l.sport||'').toLowerCase(); }),
+      p_markets:          legsArr.map(function(l){ return (l.market||'moneyline').toLowerCase(); }),
+      p_canonical_keys:   legsArr.map(function(l){ return l.canonicalGameKey||''; }),
+      p_is_live:          legsArr.some(function(l){ return !!l.isLive; })
     });
     if (!rpcResult.ok && !rpcResult.idempotent) {
       // RPC rejected — remove the legs we just inserted
       await sb.from('ticket_legs').delete().eq('ticket_id',ticketId).catch(()=>{});
+      // Risk limit rejection from Postgres
+      if (rpcResult.code && RISK_CODE_STATUS[rpcResult.code]) {
+        return res.status(RISK_CODE_STATUS[rpcResult.code]).json(
+          Object.assign({ ok:false }, rpcResult));
+      }
       if (rpcResult.error==='insufficient_balance')
         return res.status(400).json({ ok:false, error:'insufficient_balance',
           available:rpcResult.available, stake:stakeAmt });
@@ -3187,6 +3319,73 @@ app.get('/api/player/dashboard', requirePermissionScoped('view_player_dashboard'
     res.status(500).json({ ok:false, source:'db_error', error:e.message, balance:null });
   }
 });
+
+// ══ RISK SETTINGS ENDPOINTS (Phase J) ═══════════════════════════════════════════════════════════════════════
+
+app.get('/api/club/risk-settings', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId } = req.query;
+  const sb = getSupabase();
+  if (!sb||!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    const { data } = await sb.from('club_risk_settings').select('*').eq('club_id',clubId).limit(1);
+    res.json({ ok:true, settings: data&&data[0] || null, clubId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/api/club/risk-settings', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if (ROLE_RANK[actor.role]<ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const { clubId, ...settings } = req.body||{};
+  const sb = getSupabase();
+  if (!sb||!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    const row = Object.assign({ club_id:clubId, updated_at:new Date().toISOString() }, settings);
+    await sb.from('club_risk_settings').upsert(row, { onConflict:'club_id' });
+    _writeAuthAudit('risk_settings_updated', actor.actorId, clubId, '/club/risk-settings',
+      { updatedBy:actor.actorId, fields:Object.keys(settings) });
+    res.json({ ok:true, clubId, settings:row });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if (ROLE_RANK[actor.role]<ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { clubId, playerId, ...limits } = req.body||{};
+  if (!clubId||!playerId) return res.status(400).json({ ok:false, error:'missing fields' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const row = Object.assign({ club_id:clubId, player_id:playerId }, limits);
+    await sb.from('player_limits').upsert(row, { onConflict:'club_id,player_id' });
+    _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/club/player-limits',
+      { playerId, fields:Object.keys(limits) });
+    res.json({ ok:true, clubId, playerId, limits:row });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.get('/api/club/exposure', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId, playerId } = req.query;
+  const sb = getSupabase();
+  if (!sb||!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    let q = sb.from('risk_exposure').select('*').eq('club_id',clubId);
+    if (playerId) q = q.eq('player_id',playerId);
+    const { data } = await q;
+    const summary = (data||[]).reduce(function(acc,row) {
+      acc.totalOpenRisk    = (acc.totalOpenRisk||0)    + parseFloat(row.open_risk||0);
+      acc.totalPotentialPayout = (acc.totalPotentialPayout||0) + parseFloat(row.potential_payout||0);
+      return acc;
+    }, {});
+    res.json({ ok:true, clubId, rows:data||[], summary });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ───────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/reconciliation — Phase H atomic ledger balance reconciliation
 app.get('/api/host/reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
