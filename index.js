@@ -1646,6 +1646,78 @@ app.post('/api/bets/place', async (req, res) => {
 });
 // ───────────────────────────────────────────────────────────────────────═
 
+// POST /api/bets/cancel — DB-authoritative ticket cancellation
+app.post('/api/bets/cancel', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { clubId, playerId, ticketId, idempotencyKey, reason } = req.body || {};
+  const now = new Date().toISOString();
+  const errors = [];
+  if (!ticketId)       errors.push('missing_ticketId');
+  if (!playerId)       errors.push('missing_playerId');
+  if (!idempotencyKey) errors.push('missing_idempotencyKey');
+  if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  try {
+    // 1. Idempotency: if already canceled with this key, return success
+    const { data: existLedger } = await sb.from('ledger_entries')
+      .select('id,ticket_id').eq('id', idempotencyKey).limit(1);
+    if (existLedger && existLedger[0])
+      return res.json({ ok:true, idempotent:true, ticketId, ledgerEntryId:idempotencyKey });
+
+    // 2. Load ticket + legs
+    const { data: tickets, error: tErr } = await sb.from('tickets')
+      .select('id,status,risk_amount,player_id,club_id').eq('id', ticketId).limit(1);
+    if (tErr) throw tErr;
+    const ticket = tickets && tickets[0];
+    if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    if (ticket.player_id !== playerId) return res.status(403).json({ ok:false, error:'not_owner' });
+    if (clubId && ticket.club_id && ticket.club_id !== clubId) return res.status(403).json({ ok:false, error:'wrong_club' });
+    const s = ticket.status.toLowerCase();
+    if (s === 'canceled' || s === 'voided') return res.json({ ok:true, idempotent:true, ticketId, message:'already_canceled' });
+    if (s !== 'active' && s !== 'open') return res.status(400).json({ ok:false, error:'cannot_cancel_settled:status='+s });
+
+    // 3. Game started check via ticket_legs
+    const { data: legs } = await sb.from('ticket_legs').select('scheduled_start').eq('ticket_id', ticketId);
+    const nowMs = Date.now();
+    for (const leg of (legs||[])) {
+      if (!leg.scheduled_start) continue;
+      const ctMs = new Date(leg.scheduled_start).getTime();
+      if (!isNaN(ctMs) && nowMs >= ctMs)
+        return res.status(400).json({ ok:false, error:'game_already_started:'+leg.scheduled_start });
+    }
+
+    // 4. Update ticket to canceled (status=active guard prevents double-cancel race)
+    const { error: uErr } = await sb.from('tickets')
+      .update({ status:'canceled', canceled_at:now, canceled_by:playerId,
+                cancellation_reason:reason||'player_request' })
+      .eq('id', ticketId).eq('status','active');
+    if (uErr) throw uErr;
+
+    // 5. Write refund ledger entry (idempotent)
+    const riskAmt = parseFloat(ticket.risk_amount)||0;
+    const { error: leErr } = await sb.from('ledger_entries').upsert({
+      id: idempotencyKey, club_id: clubId||ticket.club_id||null,
+      player_id: playerId, ticket_id: ticketId,
+      type: 'bet_canceled', amount: riskAmt,  // positive = refund to player
+      reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: playerId
+    }, { onConflict:'id' });
+    if (leErr) throw leErr;
+
+    // 6. Audit event
+    await sb.from('audit_events').insert({
+      event_type: 'ticket_canceled', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
+      payload: { reason: reason||'player_request', refundAmount: riskAmt, idempotencyKey }
+    });
+
+    console.log('[bets/cancel] ticketId='+ticketId+' playerId='+playerId+' refund=$'+riskAmt);
+    res.json({ ok:true, ticketId, status:'canceled', refundAmount:riskAmt, ledgerEntryId:idempotencyKey });
+  } catch(e) {
+    console.error('[bets/cancel] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
 app.get('/api/player/dashboard', async (req, res) => {
   const sb = getSupabase();
