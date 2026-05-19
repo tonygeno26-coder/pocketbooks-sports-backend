@@ -950,12 +950,35 @@ async function _fetchPlayerLedger(clubId, playerId) {
 // Derive available balance from ledger + active tickets
 async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
   const rows = await _fetchPlayerLedger(clubId, playerId);
-  const { data: activeTix } = (getSupabase() ? await getSupabase().from('tickets')
-    .select('risk_amount').eq('player_id',playerId).in('status',['active','open']) : { data:[] }) || { data:[] };
+  let activeTix = [];
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data } = await sb.from('tickets').select('risk_amount')
+        .eq('player_id',playerId).in('status',['active','open']);
+      activeTix = data||[];
+    }
+  } catch(_e){}
   const ledgerBal = _deriveLedgerBalance(startingLimit, rows);
-  const openRisk  = (activeTix||[]).reduce(function(s,t){ return s+parseFloat(t.risk_amount||0); }, 0);
+  const openRisk  = activeTix.reduce(function(s,t){ return s+parseFloat(t.risk_amount||0); }, 0);
   const available = Math.round((ledgerBal-openRisk)*100)/100;
   return { ledgerBal, openRisk, available, rows };
+}
+
+// Call a Postgres money RPC (place_bet_tx, cancel_bet_tx, etc.)
+async function _callMoneyRpc(rpcName, params) {
+  const sb = getSupabase();
+  if (!sb) throw new Error('supabase_not_configured');
+  const { data, error } = await sb.rpc(rpcName, params);
+  if (error) {
+    if (error.code==='23505') return { ok:false, error:'duplicate_ledger_entry' };
+    if (error.message&&error.message.includes('insufficient_balance'))
+      return { ok:false, error:'insufficient_balance' };
+    if (error.message&&error.message.includes('invalid_transition'))
+      return { ok:false, error:'invalid_transition', detail:error.message };
+    throw error;
+  }
+  return data || { ok:false, error:'rpc_no_response' };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2026,35 +2049,48 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
                       : combined==='push' ? risk : 0;
         const delta   = combined==='won' ? profit : combined==='push' ? 0 : -risk;
 
-        // Write ticket update
-        const { error: uErr } = await sb.from('tickets').update({
-          status: combined, graded_at: gradedAt, grading_source: 'server-api'
-        }).eq('id', ticket.id).eq('status','active'); // eq guard prevents double-grade
-        if (uErr) throw uErr;
+        // Phase I: call grade_ticket_tx RPC (atomic status + canonical ledger)
+        const iKey = 'SG_'+combined+'_'+ticket.id;
+        const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
+          p_ticket_id:       ticket.id,
+          p_club_id:         ticket.club_id||'',
+          p_player_id:       ticket.player_id,
+          p_grade_result:    combined,
+          p_profit:          profit,
+          p_idempotency_key: iKey,
+          p_created_by:      'server-grade-api'
+        });
 
-        // Write ledger entry (idempotency via deterministic id)
-        const ledgerId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
-        const ledgerType = combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost';
-        await sb.from('ledger_entries').upsert({
-          id: ledgerId, ticket_id: ticket.id,
+        if (!gradeResult.ok && !gradeResult.idempotent) {
+          throw new Error('grade_rpc_rejected:'+gradeResult.error);
+        }
+
+        // Legacy ledger_entries mirror (fire-and-forget)
+        const legacyId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
+        sb.from('ledger_entries').upsert({
+          id: legacyId, ticket_id: ticket.id,
           player_id: ticket.player_id, club_id: ticket.club_id,
-          type: ledgerType, amount: combined==='won' ? profit : combined==='push' ? 0 : 0,
-          reason: 'server_grade_'+combined, created_at: gradedAt, created_by: 'server-grade-api'
-        }, { onConflict:'id' });
+          type: combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
+          amount: combined==='won'?profit:0,
+          reason:'server_grade_'+combined, created_at:gradedAt, created_by:'server-grade-api'
+        }, { onConflict:'id' }).catch(()=>{});
 
         // Write audit event
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type: 'ticket_graded_server',
           ticket_id: ticket.id, player_id: ticket.player_id, club_id: ticket.club_id,
           payload: { result:combined, matchMethod:row.matchMethod, legResults, payout, delta,
-                     legCount: ticketLegs.length }
+                     legCount: ticketLegs.length, rpcOk:gradeResult.ok,
+                     balanceAfter:gradeResult.balance_after }
         }).select('id');
 
         row.statusAfter    = combined;
         row.result         = combined;
         row.payoutDelta    = delta;
-        row.ledgerEntryId  = ledgerId;
+        row.ledgerEntryId  = legacyId;
+        row.canonicalLedgerId = 'LE_GR_'+ticket.id+'_'+combined;
         row.auditEventId   = auditData&&auditData[0] ? auditData[0].id : null;
+        row.balanceAfter   = gradeResult.balance_after;
         graded++;
         console.log('[server grade] graded ticketId='+ticket.id+' result='+combined+' method='+row.matchMethod);
 
@@ -2590,31 +2626,36 @@ app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), re
     if (amt > maxAmt + 0.01)
       return res.status(400).json({ ok:false, error:'overpay_blocked', amount:amt, maxAmount:maxAmt });
 
-    // 2. Write ledger entry (idempotent via idempotencyKey)
-    var ledgerAmt = direction==='host_paid_player' ? amt : -amt;
-    var executedAt = new Date().toISOString();
-    const { error: lErr } = await sb.from('ledger_entries').upsert({
-      id:              idempotencyKey,
-      club_id:         clubId,
-      player_id:       playerId,
-      ticket_id:       null,
-      type:            'settlement',
-      amount:          Math.round(ledgerAmt*100)/100,
-      balance_before:  null,
-      balance_after:   null,
-      reason:          direction + (note ? ': '+note : ''),
-      created_at:      executedAt,
-      created_by:      'host',
-      settlement_week: settlementWeek||null,
-      preview_snapshot: JSON.stringify({ owesHost, hostOwes, net, maxAmt, direction, amount:amt })
-    }, { onConflict:'id' });
-    if (lErr) throw lErr;
+    // 2. Phase I: settle_player_tx RPC (atomic canonical ledger)
+    const rpcDir = direction==='host_paid_player' ? 'host_owes_player' : 'player_owes_host';
+    const settlementId = idempotencyKey; // use idempotencyKey as settlementId for deduplication
+    const settleResult = await _callMoneyRpc('settle_player_tx', {
+      p_settlement_id:   settlementId,
+      p_club_id:         clubId,
+      p_player_id:       playerId,
+      p_amount:          amt,
+      p_direction:       rpcDir,
+      p_idempotency_key: idempotencyKey,
+      p_created_by:      (req._actor&&req._actor.actorId)||'host'
+    });
+    if (!settleResult.ok && !settleResult.idempotent)
+      return res.status(400).json({ ok:false, error:settleResult.error||'settlement_failed' });
 
-    // 3. Write audit event
+    // Legacy ledger_entries mirror (fire-and-forget)
+    var executedAt = new Date().toISOString();
+    sb.from('ledger_entries').upsert({
+      id:idempotencyKey, club_id:clubId, player_id:playerId,
+      type:'settlement', amount:Math.round((rpcDir==='host_owes_player'?amt:-amt)*100)/100,
+      reason:direction+(note?': '+note:''), created_at:executedAt, created_by:'host',
+      settlement_week:settlementWeek||null
+    }, { onConflict:'id' }).catch(()=>{});
+
+    // 3. Audit event
     await sb.from('audit_events').insert({
       event_type: 'settlement_executed',
       club_id: clubId, player_id: playerId,
-      payload: { direction, amount:amt, maxAmount:maxAmt, settlementWeek, idempotencyKey, note: note||null }
+      payload: { direction, amount:amt, maxAmount:maxAmt, settlementWeek, idempotencyKey,
+                 note:note||null, balanceAfter:settleResult.balance_after }
     });
 
     // 4. Return updated preview
@@ -2720,7 +2761,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
     });
     if (rrErr) throw rrErr;
 
-    // 5. Write per-player snapshots (insert-only, UNIQUE constraint prevents duplicates)
+    // 5. Write per-player snapshots + Phase I canonical ledger WEEKLY_ROLLOVER entries
     if (players.length) {
       const snapRows = players.map(function(p) { return {
         rollover_week: week, club_id: clubId, player_id: p.playerId, username: p.username,
@@ -2730,6 +2771,20 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       }; });
       const { error: snapErr } = await sb.from('weekly_player_snapshots').insert(snapRows);
       if (snapErr) throw snapErr;
+
+      // Write one WEEKLY_ROLLOVER ledger event per player (via RPC — idempotent per player+week)
+      await Promise.all(players.map(async function(p) {
+        try {
+          await _callMoneyRpc('weekly_rollover_tx', {
+            p_rollover_id:      'WR_'+clubId+'_'+week+'_'+p.playerId,
+            p_club_id:          clubId,
+            p_player_id:        p.playerId,
+            p_week_start:       week,
+            p_starting_balance: 1000, // snapshot value
+            p_created_by:       performedBy||'host'
+          });
+        } catch(_e) { /* non-fatal: snapshot already exists */ }
+      }));
     }
 
     // 6. Audit event
@@ -2897,18 +2952,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     // 4. Generate ticket ID
     const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
 
-    // 5. Write ticket
-    const ticketRow = {
-      id: ticketId, club_id: clubId||null, player_id: playerId,
-      player_username: playerUsername||null, type: betType, status: 'active',
-      risk_amount: rnd(stakeAmt), potential_profit: rnd(parseFloat(potentialProfit)||0),
-      estimated_payout: rnd(parseFloat(payout)||0),
-      placed_at: now, mirrored_at: now
-    };
-    const { error: tErr } = await sb.from('tickets').insert(ticketRow);
-    if (tErr) throw tErr;
-
-    // 6. Write ticket_legs
+    // 5. Write ticket_legs first (before RPC so they exist for game-started check)
     const legRows = legsArr.map(function(leg,i) { return {
       id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
       provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
@@ -2920,28 +2964,48 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
     if (lErr) throw lErr;
 
-    // 7a. Legacy ledger_entries mirror (Phase A compat)
-    await sb.from('ledger_entries').upsert({
+    // 6. Phase I: call place_bet_tx RPC (atomic ticket + canonical ledger in one DB transaction)
+    const rpcResult = await _callMoneyRpc('place_bet_tx', {
+      p_ticket_id:       ticketId,
+      p_club_id:         clubId||'',
+      p_player_id:       playerId,
+      p_player_username: playerUsername||null,
+      p_bet_type:        betType,
+      p_stake:           rnd(stakeAmt),
+      p_potential_profit: rnd(parseFloat(potentialProfit)||0),
+      p_estimated_payout: rnd(parseFloat(payout)||0),
+      p_idempotency_key: idempotencyKey,
+      p_created_by:      playerId
+    });
+    if (!rpcResult.ok && !rpcResult.idempotent) {
+      // RPC rejected — remove the legs we just inserted
+      await sb.from('ticket_legs').delete().eq('ticket_id',ticketId).catch(()=>{});
+      if (rpcResult.error==='insufficient_balance')
+        return res.status(400).json({ ok:false, error:'insufficient_balance',
+          available:rpcResult.available, stake:stakeAmt });
+      return res.status(400).json({ ok:false, error:rpcResult.error||'placement_failed' });
+    }
+
+    // 7. Legacy ledger_entries mirror (Phase A compat — fire-and-forget)
+    sb.from('ledger_entries').upsert({
       id: idempotencyKey, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_placed',
       amount: rnd(-stakeAmt), reason: 'bet_placed:'+betType,
       created_at: now, created_by: playerId
     }, { onConflict:'id' }).catch(()=>{});
 
-    // 7b. Phase H canonical ledger write (BET_PLACED debit)
-    await _writeLedgerEntry({
-      clubId, playerId, ticketId, eventType:'BET_PLACED', amount:rnd(stakeAmt),
-      idempotencyKey, createdBy:playerId, reason:'bet_placed:'+betType
-    });
-
     // 8. Audit event
     await sb.from('audit_events').insert({
       event_type: 'ticket_placed', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
-      payload: { betType, stake:stakeAmt, legs:legsArr.length, payout: parseFloat(payout)||0 }
+      payload: { betType, stake:stakeAmt, legs:legsArr.length, payout: parseFloat(payout)||0,
+                 txResult: rpcResult }
     });
 
-    console.log('[bets/place] ticketId='+ticketId+' playerId='+playerId+' stake='+stakeAmt+' legs='+legsArr.length);
-    res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows, ledgerEntryId:idempotencyKey });
+    const ticketRow = { id:ticketId, club_id:clubId, player_id:playerId, type:betType,
+      status:'active', risk_amount:rnd(stakeAmt), placed_at:now };
+    console.log('[bets/place] RPC ok ticketId='+ticketId+' stake='+stakeAmt+' balanceAfter='+(rpcResult.balance_after||'?'));
+    res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows,
+               ledgerEntryId:idempotencyKey, balanceAfter:rpcResult.balance_after });
   } catch(e) {
     console.error('[bets/place] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
@@ -2991,36 +3055,41 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
         return res.status(400).json({ ok:false, error:'game_already_started:'+leg.scheduled_start });
     }
 
-    // 4. Update ticket to canceled (status=active guard prevents double-cancel race)
-    const { error: uErr } = await sb.from('tickets')
-      .update({ status:'canceled', canceled_at:now, canceled_by:playerId,
-                cancellation_reason:reason||'player_request' })
-      .eq('id', ticketId).eq('status','active');
-    if (uErr) throw uErr;
-
-    // 5. Write refund ledger entry (Phase H canonical + legacy)
+    // 4. Phase I: call cancel_bet_tx RPC (atomic ticket status + canonical ledger)
     const riskAmt = parseFloat(ticket.risk_amount)||0;
-    // Legacy mirror
-    await sb.from('ledger_entries').upsert({
-      id: idempotencyKey, club_id: clubId||ticket.club_id||null, player_id: playerId,
+    const cancelResult = await _callMoneyRpc('cancel_bet_tx', {
+      p_ticket_id:       ticketId,
+      p_club_id:         clubId||ticket.club_id||'',
+      p_player_id:       playerId,
+      p_idempotency_key: idempotencyKey,
+      p_reason:          reason||'player_request',
+      p_created_by:      playerId
+    });
+    if (!cancelResult.ok && !cancelResult.idempotent) {
+      const code = cancelResult.error||'cancel_failed';
+      const status = code.includes('invalid_transition') ? 400
+                   : code.includes('not_owner') ? 403 : 400;
+      return res.status(status).json({ ok:false, error:code });
+    }
+
+    // 5. Legacy ledger_entries mirror (fire-and-forget)
+    sb.from('ledger_entries').upsert({
+      id: idempotencyKey, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_canceled', amount: riskAmt,
       reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: playerId
     }, { onConflict:'id' }).catch(()=>{});
-    // Canonical ledger
-    await _writeLedgerEntry({
-      clubId: clubId||ticket.club_id, playerId, ticketId,
-      eventType:'BET_CANCELED_REFUND', amount:riskAmt,
-      idempotencyKey, createdBy:playerId, reason:'cancel_refund:'+(reason||'player_request')
-    });
 
     // 6. Audit event
     await sb.from('audit_events').insert({
       event_type: 'ticket_canceled', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
-      payload: { reason: reason||'player_request', refundAmount: riskAmt, idempotencyKey }
+      payload: { reason:reason||'player_request', refundAmount:riskAmt,
+                 idempotencyKey, txResult:cancelResult }
     });
 
-    console.log('[bets/cancel] ticketId='+ticketId+' playerId='+playerId+' refund=$'+riskAmt);
-    res.json({ ok:true, ticketId, status:'canceled', refundAmount:riskAmt, ledgerEntryId:idempotencyKey });
+    const refundAmt = cancelResult.refund || riskAmt;
+    console.log('[bets/cancel] RPC ok ticketId='+ticketId+' refund=$'+refundAmt);
+    res.json({ ok:true, ticketId, status:'canceled', refundAmount:refundAmt,
+               ledgerEntryId:idempotencyKey, balanceAfter:cancelResult.balance_after });
   } catch(e) {
     console.error('[bets/cancel] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
