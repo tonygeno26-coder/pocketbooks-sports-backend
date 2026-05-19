@@ -3762,6 +3762,187 @@ app.get('/api/club/exposure', requirePermissionScoped('view_host_dashboard'), as
 });
 // ───────────────────────────────────────────────────────────────────────────
 
+// ══ SETTLEMENT PERIODS + CLOSEOUT (Phase N) ═══════════════════════════════════════════════════════════════════════
+
+// GET /api/host/settlements/periods
+app.get('/api/host/settlements/periods', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId } = req.query;
+  const sb = getSupabase();
+  if (!sb||!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    const { data } = await sb.from('settlement_periods').select('*')
+      .eq('club_id',clubId).order('week_start',{ ascending:false }).limit(52);
+    res.json({ ok:true, periods:data||[], clubId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/host/settlements/:periodId/snapshots
+app.get('/api/host/settlements/:periodId/snapshots', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { periodId } = req.params;
+  const revision = req.query.revision != null ? parseInt(req.query.revision,10) : null;
+  try {
+    let q = sb.from('settlement_snapshots').select('*').eq('period_id',periodId);
+    if (revision != null) q = q.eq('revision',revision);
+    else {
+      // Get latest revision
+      const { data:maxRev } = await sb.from('settlement_snapshots')
+        .select('revision').eq('period_id',periodId).order('revision',{ascending:false}).limit(1);
+      if (maxRev&&maxRev[0]) q = q.eq('revision',maxRev[0].revision);
+    }
+    const { data } = await q.order('player_id');
+    res.json({ ok:true, periodId, snapshots:data||[] });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/host/settlements/close-week
+app.post('/api/host/settlements/close-week', requirePermissionScoped('settlement_manager'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor   = req._actor||{};
+  const actorRank = ROLE_RANK[actor.role]||0;
+  const { clubId, weekStart, forceClose } = req.body||{};
+  if (!clubId||!weekStart) return res.status(400).json({ ok:false, error:'missing_clubId_or_weekStart' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const now = new Date().toISOString();
+  try {
+    // Ensure period exists
+    const periodId = 'SP_'+clubId+'_'+weekStart;
+    await sb.from('settlement_periods').upsert({
+      period_id:periodId, club_id:clubId, week_start:weekStart,
+      week_end: new Date(new Date(weekStart).getTime()+6*86400000).toISOString().slice(0,10),
+      status:'open'
+    }, { onConflict:'club_id,week_start', ignoreDuplicates:true });
+
+    // Load period
+    const { data:pData } = await sb.from('settlement_periods').select('*')
+      .eq('period_id',periodId).limit(1);
+    const period = pData&&pData[0];
+    if (!period) return res.status(404).json({ ok:false, error:'period_not_found' });
+    if (period.status==='closed')
+      return res.status(409).json({ ok:false, code:'period_already_closed', periodId });
+
+    // Check open tickets
+    const { data:openTix } = await sb.from('tickets').select('id,player_id')
+      .eq('club_id',clubId).in('status',['active','open']);
+    const openCount = (openTix||[]).length;
+    if (openCount>0 && !forceClose)
+      return res.status(409).json({ ok:false, code:'open_tickets_exist', openCount,
+        hint:'Set forceClose:true with full_admin+ to override' });
+    if (openCount>0 && forceClose && actorRank < ROLE_RANK.full_admin)
+      return res.status(403).json({ ok:false, code:'insufficient_role_for_force_close', required:'full_admin' });
+
+    // Compute player snapshots from canonical ledger
+    const { data:members } = await sb.from('club_memberships')
+      .select('actor_id').eq('club_id',clubId).eq('status','active');
+    const { data:limits } = await sb.from('player_limits')
+      .select('player_id,balance_start').eq('club_id',clubId);
+    const balMap = {}; (limits||[]).forEach(function(l){ balMap[l.player_id]=parseFloat(l.balance_start)||1000; });
+    const { data:allTix } = await sb.from('tickets')
+      .select('player_id,status,risk_amount,potential_profit').eq('club_id',clubId);
+    const nextRevision = (period.revision||0) + 1;
+    const snapRows = [];
+    for (const m of (members||[])) {
+      const pid = m.actor_id;
+      const starting = balMap[pid]||1000;
+      const { data:lRows } = await sb.from('ledger').select('amount,direction')
+        .eq('club_id',clubId).eq('player_id',pid);
+      const ptix = (allTix||[]).filter(function(t){ return t.player_id===pid; });
+      let cred=0,deb=0,openRisk=0,gains=0,losses=0,openCt=0,closedCt=0;
+      (lRows||[]).forEach(function(r){
+        if(r.direction==='credit') cred+=parseFloat(r.amount||0);
+        else if(r.direction==='debit') deb+=parseFloat(r.amount||0);
+      });
+      ptix.forEach(function(t){
+        var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount||0), p=parseFloat(t.potential_profit||0);
+        if(s==='active'||s==='open'){openRisk+=r;openCt++;}
+        else closedCt++;
+        if(s==='won') gains+=p;
+        if(s==='lost') losses+=r;
+      });
+      const ledBal  = Math.round((starting+cred-deb)*100)/100;
+      const netRes  = Math.round((gains-losses)*100)/100;
+      const finBal  = Math.round((ledBal-Math.round(openRisk*100)/100)*100)/100;
+      snapRows.push({
+        period_id:periodId, revision:nextRevision, club_id:clubId, player_id:pid,
+        starting_limit:starting,
+        ledger_credits:Math.round(cred*100)/100,
+        ledger_debits:Math.round(deb*100)/100,
+        ledger_balance:ledBal,
+        open_risk:Math.round(openRisk*100)/100,
+        net_result:netRes,
+        final_balance:finBal,
+        amount_owed_by_player:netRes<0?Math.round(Math.abs(netRes)*100)/100:0,
+        amount_owed_to_player:netRes>0?Math.round(netRes*100)/100:0,
+        ticket_count:ptix.length,
+        closed_ticket_count:closedCt,
+        open_ticket_count:openCt
+      });
+    }
+
+    if (snapRows.length) {
+      const { error:sErr } = await sb.from('settlement_snapshots').insert(snapRows);
+      if (sErr) throw sErr;
+    }
+
+    // Update period status
+    const { error:pErr } = await sb.from('settlement_periods')
+      .update({ status:'closed', closed_at:now, closed_by:actor.actorId||'host',
+                revision:nextRevision })
+      .eq('period_id',periodId);
+    if (pErr) throw pErr;
+
+    // Audit event
+    await sb.from('audit_events').insert({
+      event_type:'settlement_period_closed', club_id:clubId,
+      payload:{ periodId, weekStart, closedBy:actor.actorId, forceClose:!!forceClose,
+                playerCount:snapRows.length, revision:nextRevision }
+    });
+
+    console.log('[close-week] periodId='+periodId+' players='+snapRows.length+' rev='+nextRevision);
+    res.json({ ok:true, periodId, weekStart, revision:nextRevision,
+               playerCount:snapRows.length, forceClose:!!forceClose });
+  } catch(e) {
+    console.error('[close-week] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// POST /api/host/settlements/reopen-week
+app.post('/api/host/settlements/reopen-week', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const { clubId, weekStart, reason } = req.body||{};
+  if (!clubId||!weekStart) return res.status(400).json({ ok:false, error:'missing_fields' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const periodId = 'SP_'+clubId+'_'+weekStart;
+  const now = new Date().toISOString();
+  try {
+    const { data:pData } = await sb.from('settlement_periods').select('*')
+      .eq('period_id',periodId).limit(1);
+    const period = pData&&pData[0];
+    if (!period) return res.status(404).json({ ok:false, error:'period_not_found' });
+    if (period.status!=='closed'&&period.status!=='reopened')
+      return res.status(409).json({ ok:false, code:'period_not_closed', status:period.status });
+    await sb.from('settlement_periods')
+      .update({ status:'reopened', reopened_at:now, reopened_by:actor.actorId||'host',
+                reason:reason||null })
+      .eq('period_id',periodId);
+    await sb.from('audit_events').insert({
+      event_type:'settlement_period_reopened', club_id:clubId,
+      payload:{ periodId, weekStart, reopenedBy:actor.actorId, reason:reason||null }
+    });
+    console.log('[reopen-week] periodId='+periodId+' by='+actor.actorId);
+    res.json({ ok:true, periodId, weekStart, status:'reopened' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // GET /api/host/reconciliation — Phase H atomic ledger balance reconciliation
 app.get('/api/host/reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
