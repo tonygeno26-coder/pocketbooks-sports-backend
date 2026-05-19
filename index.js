@@ -1038,6 +1038,91 @@ app.post('/api/grade/run', async (req, res) => {
   }
 });
 
+// ── HOST DASHBOARD DB READ (Phase C Step 2) ────────────────────────────────────────────────────────
+// GET /api/host/dashboard?clubId=...
+app.get('/api/host/dashboard', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
+  const { clubId, playerId } = req.query;
+  try {
+    // Load tickets
+    let tq = sb.from('tickets')
+      .select('id,status,type,risk_amount,potential_profit,estimated_payout,player_id,placed_at,graded_at');
+    if (clubId)   tq = tq.eq('club_id',   clubId);
+    if (playerId) tq = tq.eq('player_id', playerId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+
+    // Load recent ledger entries
+    let lq = sb.from('ledger_entries')
+      .select('id,ticket_id,player_id,type,amount,balance_before,balance_after,reason,created_at')
+      .order('created_at', { ascending:false }).limit(200);
+    if (clubId)   lq = lq.eq('club_id',   clubId);
+    if (playerId) lq = lq.eq('player_id', playerId);
+    const { data: ledger, error: lErr } = await lq;
+    if (lErr) throw lErr;
+
+    // Derive stats from tickets only (source of truth)
+    var handle=0, activeRisk=0, hostAtRisk=0, settledGain=0, settledLoss=0;
+    var activeBetCount=0, gradedCount=0, canceledCount=0;
+    const active=[], graded=[];
+
+    (tickets||[]).forEach(function(t) {
+      var s      = (t.status||'').toLowerCase();
+      var risk   = parseFloat(t.risk_amount)||0;
+      var profit = parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='deleted') { canceledCount++; return; }
+      if (s==='active'||s==='open') {
+        handle+=risk; activeRisk+=risk; hostAtRisk+=profit; activeBetCount++; active.push(t);
+      } else if (s==='won') {
+        handle+=risk; settledLoss+=profit; gradedCount++; graded.push(t);
+      } else if (s==='lost') {
+        handle+=risk; settledGain+=risk; gradedCount++; graded.push(t);
+      } else if (s==='push'||s==='pushed') {
+        handle+=risk; gradedCount++; graded.push(t);
+      }
+    });
+
+    function rnd(v) { return Math.round((isNaN(v)?0:v)*100)/100; }
+    const settledHandle = handle - activeRisk;
+    const profit        = rnd(settledGain - settledLoss);
+    const holdPct       = settledHandle>0 ? rnd(profit/settledHandle*100) : null;
+
+    const stats = {
+      handle:         rnd(handle),
+      activeRisk:     rnd(activeRisk),
+      hostAtRisk:     rnd(hostAtRisk),
+      settledGain:    rnd(settledGain),
+      settledLoss:    rnd(settledLoss),
+      profit:         profit,
+      holdPct:        holdPct,
+      activeBetCount: activeBetCount,
+      gradedCount:    gradedCount,
+      canceledCount:  canceledCount
+    };
+
+    // Warnings
+    const warnings = [];
+    if (isNaN(stats.handle))     warnings.push('handle_NaN');
+    if (stats.activeRisk < 0)   warnings.push('activeRisk_negative');
+    if (stats.activeBetCount !== active.length) warnings.push('activeBetCount_mismatch');
+
+    res.json({
+      ok: true, source: 'db', clubId: clubId||null,
+      players:        [], // reserved for Phase C Step 3
+      activeTickets:  active,
+      gradedTickets:  graded,
+      ledgerEntries:  ledger||[],
+      stats,
+      warnings
+    });
+  } catch(e) {
+    console.error('[host/dashboard] error:', e.message);
+    res.status(500).json({ ok:false, source:'db_error', error:e.message, stats:null });
+  }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
