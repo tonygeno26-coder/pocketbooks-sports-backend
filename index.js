@@ -250,6 +250,82 @@ async function initDB() {
   console.log('[db] migrations complete');
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// PERMISSION ENGINE
+// Roles: owner(5) > full_admin(4) > settlement_manager(3) > risk_viewer(2) > view_only(1)
+// ════════════════════════════════════════════════════════════════════════════
+const ROLE_LEVELS = { owner:5, full_admin:4, settlement_manager:3, risk_viewer:2, view_only:1 };
+const ACTION_MIN_LEVEL = {
+  settle_player:3, weekly_rollover:3, approve_cancel:4, deny_cancel:4,
+  set_player_limits:4, add_player:4, remove_player:5, manage_staff:5,
+  view_host_dashboard:1, view_active_bets:1, view_history:1,
+  view_exposure:2, view_settlement_preview:2, view_player_limits:2,
+  grade_trigger:4
+};
+
+function _canDo(role, action) {
+  const rl = ROLE_LEVELS[role];
+  const ml = ACTION_MIN_LEVEL[action];
+  if (!rl) return { allowed:false, reason:'unknown_role:'+role };
+  if (ml===undefined) return { allowed:false, reason:'unknown_action:'+action };
+  const allowed = rl >= ml;
+  return { allowed, role, action, roleLevel:rl, requiredLevel:ml,
+    reason: allowed ? 'permitted' : 'insufficient_role:needs_level_'+ml+'_have_'+rl+'_role_'+role };
+}
+
+// requirePermission(action) middleware factory
+// Reads X-Staff-Role header (or falls back to default 'owner' for existing JWT auth)
+function requirePermission(action) {
+  return function(req, res, next) {
+    // Phase A compat: if no role header, treat existing JWT users as owner
+    const staffRole = req.headers['x-staff-role'] || 'owner';
+    const actorId   = req.headers['x-staff-id']   || (req.user && req.user.id) || 'unknown';
+    const clubId    = req.query.clubId || (req.body && req.body.clubId) || null;
+    const check = _canDo(staffRole, action);
+    // Audit log every permission check
+    console.log('[permission check] actor='+actorId+' role='+staffRole+' action='+action+
+      ' clubId='+(clubId||'?')+' allowed='+check.allowed+
+      (check.allowed ? '' : ' reason='+check.reason));
+    if (!check.allowed) {
+      // Write audit event to Supabase if available (fire-and-forget)
+      const sb = getSupabase();
+      if (sb) sb.from('audit_events').insert({
+        event_type:'permission_denied', actor_id:actorId, club_id:clubId,
+        payload:{ action, role:staffRole, reason:check.reason }
+      }).then(function(){}).catch(function(){});
+      return res.status(403).json({ ok:false, error:'permission_denied',
+        action, role:staffRole, reason:check.reason });
+    }
+    req.staffRole = staffRole;
+    req.actorId   = actorId;
+    next();
+  };
+}
+
+// Permission management endpoints
+// GET /api/permissions/roles — list all roles and their capabilities
+app.get('/api/permissions/roles', function(req, res) {
+  res.json({
+    ok: true,
+    roles: Object.keys(ROLE_LEVELS).map(function(r) {
+      var level = ROLE_LEVELS[r];
+      return {
+        role: r, level,
+        canDo: Object.keys(ACTION_MIN_LEVEL).filter(function(a){ return level >= ACTION_MIN_LEVEL[a]; })
+      };
+    }).sort(function(a,b){ return b.level-a.level; })
+  });
+});
+
+// POST /api/permissions/check — check a role/action combination
+app.post('/api/permissions/check', function(req, res) {
+  const { role, action } = req.body || {};
+  if (!role || !action) return res.status(400).json({ ok:false, error:'missing role or action' });
+  const r = _canDo(role, action);
+  res.json({ ok:true, ...r });
+});
+// ════════════════════════════════════════════════════════════════════════════
+
 // ===== AUTH MIDDLEWARE =====
 function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
@@ -912,7 +988,7 @@ async function _sgFetchCompletedGames(daysBack) {
   });
 }
 
-app.post('/api/grade/run', async (req, res) => {
+app.post('/api/grade/run', requirePermission('grade_trigger'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
 
@@ -1207,7 +1283,7 @@ app.get('/api/host/settlements-preview', async (req, res) => {
 });
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
-app.post('/api/host/settle-player', async (req, res) => {
+app.post('/api/host/settle-player', requirePermission('settle_player'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
@@ -1323,7 +1399,7 @@ function _getISOWeek(date) {
 }
 
 // POST /api/host/weekly-rollover
-app.post('/api/host/weekly-rollover', async (req, res) => {
+app.post('/api/host/weekly-rollover', requirePermission('weekly_rollover'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { clubId, rolloverWeek, performedBy } = req.body || {};
