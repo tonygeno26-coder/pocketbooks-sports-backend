@@ -635,6 +635,141 @@ app.get('/api/admin/crypto/deposits', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+// ── SCANNER ENGINE ───────────────────────────────────────────────────────────────────────────
+const SCANNER_ENABLED   = process.env.BLOCKCHAIN_SCANNER_ENABLED === 'true';
+const AUTO_CREDIT_CRYPTO= process.env.AUTO_CREDIT_CONFIRMED_CRYPTO === 'true';
+const AMOUNT_TOLERANCE  = 0.02; // 2% underpay tolerance
+const MIN_CONFIRMATIONS = 3;
+
+function _verifyCryptoTx(txHash, network, mockResult) {
+  if (!SCANNER_ENABLED) {
+    return { txHash, network, status:'scan_error', confirmations:0,
+             amountCrypto:null, amountUsdEstimate:null,
+             fromAddress:null, toAddress:null,
+             errorMessage:'scanner_not_configured' };
+  }
+  if (mockResult) {
+    return Object.assign({ txHash, network, errorMessage:null }, mockResult);
+  }
+  // Real scanner would call Etherscan/BlockCypher API here
+  return { txHash, network, status:'not_found', confirmations:0,
+           amountCrypto:null, amountUsdEstimate:null,
+           fromAddress:null, toAddress:null, errorMessage:null };
+}
+
+function _matchScanToIntent(scanResult, intent) {
+  if (!intent) return { matched:false, reason:'no_intent' };
+  if (scanResult.status==='scan_error') return { matched:false, reason:'scan_error' };
+  if (scanResult.status==='not_found')  return { matched:false, reason:'not_found' };
+  const expectedWallet = intent.assigned_wallet_address;
+  const actualWallet   = (scanResult.toAddress||'').toLowerCase();
+  if (actualWallet && expectedWallet && actualWallet !== expectedWallet.toLowerCase())
+    return { matched:false, reason:'wallet_mismatch', expected:expectedWallet, actual:scanResult.toAddress };
+  const expectedUsd = parseFloat(intent.expected_usd||0);
+  const actualUsd   = parseFloat(scanResult.amountUsdEstimate||0);
+  if (expectedUsd>0 && actualUsd>0) {
+    const minAcceptable = expectedUsd*(1-AMOUNT_TOLERANCE);
+    if (actualUsd<minAcceptable)
+      return { matched:false, reason:'amount_short', expectedUsd, actualUsd, minAcceptable };
+  }
+  return { matched:true,
+           matchedIntentId:intent.intent_id, matchedPlayerId:intent.player_id,
+           matchedClubId:intent.club_id, scanStatus:scanResult.status,
+           confirmations:scanResult.confirmations };
+}
+
+// POST /api/admin/crypto/deposits/scan
+app.post('/api/admin/crypto/deposits/scan', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { intentId, txHash, mockResult } = req.body||{};
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    // Load intent
+    let intent = null;
+    if (intentId) {
+      const { data } = await sb.from('crypto_deposit_intents').select('*').eq('intent_id',intentId).limit(1);
+      intent = data&&data[0];
+    } else if (txHash) {
+      const { data } = await sb.from('crypto_deposit_intents').select('*').eq('tx_hash',txHash).limit(1);
+      intent = data&&data[0];
+    }
+    if (!intent) return res.status(404).json({ ok:false, error:'intent_not_found' });
+    const hash    = txHash || intent.tx_hash;
+    const network = intent.network;
+    if (!hash) return res.status(400).json({ ok:false, error:'no_tx_hash_on_intent' });
+
+    // Run scanner
+    const scanResult = _verifyCryptoTx(hash, network, mockResult||null);
+    const matchResult= _matchScanToIntent(scanResult, intent);
+
+    // Build and persist scan row
+    const now    = new Date().toISOString();
+    const scanId = 'SCAN_'+hash.slice(0,16)+'_'+Date.now();
+    const scanRow = {
+      scan_id:scanId, tx_hash:hash, network, crypto_symbol:intent.crypto_symbol,
+      status:scanResult.status, confirmations:scanResult.confirmations||0,
+      amount_crypto:scanResult.amountCrypto||null,
+      amount_usd_estimate:scanResult.amountUsdEstimate||null,
+      from_address:scanResult.fromAddress||null,
+      to_address:scanResult.toAddress||null,
+      matched_intent_id:  matchResult.matched?matchResult.matchedIntentId:null,
+      matched_player_id:  matchResult.matched?matchResult.matchedPlayerId:null,
+      matched_club_id:    matchResult.matched?matchResult.matchedClubId:null,
+      scanned_at:now, raw_json:scanResult,
+      error_message:scanResult.errorMessage||null
+    };
+    await sb.from('crypto_tx_scans').insert(scanRow);
+
+    // Update intent status based on scan
+    let newIntentStatus = intent.status;
+    if (matchResult.matched && scanResult.status==='found_pending') newIntentStatus='pending_review';
+    if (matchResult.matched && scanResult.status==='found_confirmed') newIntentStatus='pending_review';
+    if (!matchResult.matched && scanResult.status==='not_found') newIntentStatus=intent.status; // no change
+    await sb.from('crypto_deposit_intents')
+      .update({ status:newIntentStatus, updated_at:now })
+      .eq('intent_id',intent.intent_id);
+
+    // Auto-credit if enabled and confirmed
+    let autoCredited = false;
+    if (AUTO_CREDIT_CRYPTO && matchResult.matched &&
+        scanResult.status==='found_confirmed' &&
+        scanResult.confirmations>=MIN_CONFIRMATIONS) {
+      const iKey = 'AUTO_CRYPTO_'+intent.intent_id;
+      try {
+        await _writeLedgerEntry({
+          clubId:intent.club_id, playerId:intent.player_id,
+          eventType:'BALANCE_ADJUSTMENT', amount:intent.package_amount_diamonds,
+          idempotencyKey:iKey, createdBy:'scanner',
+          reason:'auto_crypto_credit:'+intent.intent_id
+        });
+        await sb.from('crypto_deposit_intents').update({
+          status:'credited', credited_at:now, credited_by:'scanner', updated_at:now
+        }).eq('intent_id',intent.intent_id);
+        autoCredited = true;
+        console.log('[crypto/scan] auto-credited +'+intent.package_amount_diamonds+'d player='+intent.player_id);
+        emitEvent('balance_changed',{ playerId:intent.player_id, diamonds:intent.package_amount_diamonds },
+          { clubId:intent.club_id, playerId:intent.player_id }, req.requestId);
+      } catch(_e) { console.warn('[crypto/scan] auto-credit error:', _e.message); }
+    }
+
+    console.log('[crypto/scan] '+hash.slice(0,20)+'... status='+scanResult.status+
+      ' match='+(matchResult.matched?'YES '+matchResult.matchedPlayerId:'NO '+matchResult.reason));
+    res.json({ ok:true, scanId, scanStatus:scanResult.status,
+      matched:matchResult.matched, matchReason:matchResult.reason||null,
+      matchedPlayerId:matchResult.matchedPlayerId||null,
+      autoCredited, confirmations:scanResult.confirmations||0,
+      intentStatus:newIntentStatus });
+  } catch(e) {
+    console.error('[crypto/scan] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // POST /api/admin/crypto/deposits/confirm
 app.post('/api/admin/crypto/deposits/confirm', requirePermissionScoped('settle_player'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
