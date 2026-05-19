@@ -523,8 +523,142 @@ function fetchOdds(sport) {
 }
 
 
+// ════════════════════════════════════════════════════════════════════════════
+// LIVE MARKET CACHE ENGINE
+// Single source of truth for all odds data on this server instance.
+// Atomic replace only — never partially mutated.
+// ════════════════════════════════════════════════════════════════════════════
+
+const ODDS_TOLERANCE_PTS  = 3;
+const CACHE_POLL_INTERVAL = 30 * 1000;        // 30s poll
+const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
+const CACHE_SPORTS = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
+
+function _sportPrefix(sportKey) {
+  const k = (sportKey||'').toLowerCase();
+  if (k.startsWith('baseball'))             return 'MLB';
+  if (k.startsWith('basketball_nba'))       return 'NBA';
+  if (k.startsWith('americanfootball_nfl')) return 'NFL';
+  if (k.startsWith('icehockey'))            return 'NHL';
+  if (k.startsWith('soccer'))               return 'SOCCER';
+  return k.split('_')[0].toUpperCase();
+}
+function _normalizeMarketKey(key) {
+  return key === 'h2h' ? 'moneyline' : key === 'spreads' ? 'spread' : key === 'totals' ? 'total' : key;
+}
+function _buildCKeyFromGame(game) {
+  const sport    = _sportPrefix(game.sport_key);
+  const awayTeam = (game.away_team||'').toLowerCase().replace(/\s+/g,'-');
+  const homeTeam = (game.home_team||'').toLowerCase().replace(/\s+/g,'-');
+  const dateStr  = (game.commence_time||'').slice(0,10);
+  return sport+'|'+awayTeam+'|'+homeTeam+'|'+dateStr;
+}
+
+function _makeEmptyCache() {
+  return {
+    updatedAt:null, lastSuccessAt:null, games:[], marketsByCanonicalKey:{},
+    marketsByProviderGameId:{}, gameCount:0, marketCount:0,
+    fetchDurationMs:null, sourceStatus:'empty', warnings:[]
+  };
+}
+
+function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
+  const now = new Date().toISOString();
+  if (!Array.isArray(gamesArr) || !gamesArr.length) {
+    return Object.assign({}, prevCache || _makeEmptyCache(), {
+      sourceStatus: prevCache && prevCache.lastSuccessAt ? 'stale_preserved' : 'empty',
+      warnings:['fetch_returned_empty']
+    });
+  }
+  const byKey = {}, byId = {};
+  let marketCount = 0;
+  for (const game of gamesArr) {
+    const cKey   = _buildCKeyFromGame(game);
+    const gameId = game.id;
+    for (const bookmaker of (game.bookmakers||[])) {
+      for (const market of (bookmaker.markets||[])) {
+        const mLabel   = _normalizeMarketKey(market.key);
+        const mapKeyC  = cKey + '|' + mLabel;
+        const mapKeyI  = gameId + '|' + mLabel;
+        const entry = {
+          cKey, gameId, sport:game.sport_key, market:mLabel,
+          bookmaker:bookmaker.key, outcomes:market.outcomes||[],
+          commenceTime:game.commence_time, suspended:false, closed:false,
+          state:'open', updatedAt:now
+        };
+        if (!byKey[mapKeyC]) { byKey[mapKeyC]=entry; marketCount++; }
+        if (!byId[mapKeyI])  { byId[mapKeyI]=entry; }
+      }
+    }
+  }
+  return {
+    updatedAt:now, lastSuccessAt:now, games:gamesArr,
+    marketsByCanonicalKey:byKey, marketsByProviderGameId:byId,
+    gameCount:gamesArr.length, marketCount, fetchDurationMs:fetchDurationMs||0,
+    sourceStatus:'healthy', warnings:[]
+  };
+}
+
+// Single shared cache instance — replaced atomically
+let LIVE_MARKET_CACHE = _makeEmptyCache();
+
+function _normalizeMarketState(entry, nowMs) {
+  nowMs = nowMs || Date.now();
+  if (!entry) return { state:'suspended', reason:'not_found' };
+  if (entry.suspended) return { state:'suspended', reason:'provider_suspended' };
+  if (entry.closed)    return { state:'closed',    reason:'provider_closed' };
+  if (entry.commenceTime) {
+    const ct = new Date(entry.commenceTime).getTime();
+    if (!isNaN(ct) && nowMs >= ct) return { state:'closed', reason:'game_started' };
+  }
+  if (entry.updatedAt) {
+    const age = nowMs - new Date(entry.updatedAt).getTime();
+    if (age > CACHE_STALE_THRESHOLD) return { state:'stale', reason:'cache_stale', ageMs:age };
+  }
+  return { state:'open', reason:'ok' };
+}
+
+function _getSuspendedMarkets(cache, nowMs) {
+  nowMs = nowMs || Date.now();
+  return Object.entries(cache.marketsByCanonicalKey)
+    .map(function([key, entry]) {
+      const ms = _normalizeMarketState(entry, nowMs);
+      return ms.state !== 'open' ? { key, state:ms.state, reason:ms.reason, cKey:entry.cKey } : null;
+    }).filter(Boolean);
+}
+
+// Poll live odds and atomically replace cache
+async function pollLiveOddsLoop() {
+  if (!ODDS_KEY) { console.log('[live cache] ODDS_API_KEY not set — skipping poll'); return; }
+  const start = Date.now();
+  const allGames = [];
+  try {
+    await Promise.all(CACHE_SPORTS.map(async function(sport) {
+      const games = await fetchOdds(sport);
+      if (Array.isArray(games)) allGames.push(...games);
+    }));
+    const fetchDurationMs = Date.now() - start;
+    const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+    if (newCache.sourceStatus === 'healthy') {
+      LIVE_MARKET_CACHE = newCache; // atomic replace
+      console.log('[live cache] updated games='+newCache.gameCount+' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
+    } else {
+      console.warn('[live cache] fetch returned empty — preserving previous cache ('+LIVE_MARKET_CACHE.gameCount+' games)');
+    }
+  } catch(e) {
+    console.error('[live cache] poll error — preserving previous cache:', e.message);
+  }
+}
+
+// Start poller on boot
+if (ODDS_KEY) {
+  pollLiveOddsLoop(); // immediate
+  setInterval(pollLiveOddsLoop, CACHE_POLL_INTERVAL);
+}
+
 // ── ODDS VALIDATION HELPERS ───────────────────────────────────────────────────────────────────────────
-const ODDS_TOLERANCE_PTS = 3; // ±3 American-odds-points drift allowed
+// (kept for bets/place validation — now uses LIVE_MARKET_CACHE instead of per-request fetch)
+// ODDS_TOLERANCE_PTS is declared above in the cache engine block
 
 // Build a flat lookup map: "canonicalGameKey|market" -> { outcomes, suspended, closed }
 // from a raw Odds API response array.
@@ -594,16 +728,38 @@ function validateLegOdds(leg, liveMap, nowMs) {
   return { ok:true, liveOdds: outcome.price, leg: leg.pick };
 }
 
-// Validate all legs — first failure blocks ticket
-function validateAllLegsOdds(legs, liveMap, nowMs) {
+// Validate all legs — now uses dual maps (canonical + providerGameId)
+function validateAllLegsOdds(legs, byCanonical, byProvider, nowMs) {
+  // Support legacy single-map call (byProvider omitted)
+  if (typeof byProvider === 'number') { nowMs = byProvider; byProvider = {}; }
+  byCanonical = byCanonical || {};
+  byProvider  = byProvider  || {};
+  nowMs = nowMs || Date.now();
   for (let i=0; i<legs.length; i++) {
-    const r = validateLegOdds(legs[i], liveMap, nowMs);
+    const leg = legs[i];
+    const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
+    const merged = Object.assign({}, byCanonical, byProvider); // providerGameId keys override on collision
+    const r = validateLegOdds(leg, merged, nowMs);
     if (!r.ok) return Object.assign(r, { legIndex:i });
   }
   return { ok:true };
 }
 
-// Build updated odds snapshot (for accept-new-odds resubmit)
+// Build updated odds snapshot from LIVE_MARKET_CACHE
+function buildAcceptedOddsSnapshotFromCache(legs, cache) {
+  const now = new Date().toISOString();
+  return legs.map(function(leg) {
+    const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
+    const entry =
+      (leg.providerGameId && cache.marketsByProviderGameId[leg.providerGameId+'|'+mLabel]) ||
+      (leg.canonicalGameKey && cache.marketsByCanonicalKey[leg.canonicalGameKey+'|'+mLabel]);
+    const outcome = entry && (entry.outcomes||[]).find(o =>
+      o.name && o.name.toLowerCase() === (leg.pick||'').toLowerCase());
+    return Object.assign({}, leg, { odds: outcome ? outcome.price : leg.odds, oddsAcceptedAt: now });
+  });
+}
+
+// Legacy: flat-map snapshot (kept for grading paths)
 function buildAcceptedOddsSnapshot(legs, liveMap) {
   const now = new Date().toISOString();
   return legs.map(function(leg) {
@@ -612,10 +768,7 @@ function buildAcceptedOddsSnapshot(legs, liveMap) {
                        (leg.canonicalGameKey && liveMap[leg.canonicalGameKey+'|'+mLabel]);
     const outcome = liveMarket && (liveMarket.outcomes||[]).find(o =>
       o.name && o.name.toLowerCase() === (leg.pick||'').toLowerCase());
-    return Object.assign({}, leg, {
-      odds: outcome ? outcome.price : leg.odds,
-      oddsAcceptedAt: now
-    });
+    return Object.assign({}, leg, { odds: outcome ? outcome.price : leg.odds, oddsAcceptedAt: now });
   });
 }
 // ───────────────────────────────────────────────────────────────────────────
@@ -1212,6 +1365,73 @@ app.post('/api/grade/run', requirePermission('grade_trigger'), async (req, res) 
 });
 
 // ── HOST DASHBOARD DB READ (Phase C Step 2) ────────────────────────────────────────────────────────
+// ══ LIVE MARKETS API ═══════════════════════════════════════════════════════════════════════════
+app.get('/api/markets/live', (req, res) => {
+  const nowMs = Date.now();
+  const cache = LIVE_MARKET_CACHE;
+  const cacheAgeMs = cache.updatedAt ? nowMs - new Date(cache.updatedAt).getTime() : null;
+  const sport = req.query.sport;
+  const since = req.query.since ? new Date(req.query.since).getTime() : null;
+  const minimal = req.query.minimal === 'true';
+
+  // Collect suspended/closed markets
+  const suspendedMarkets = _getSuspendedMarkets(cache, nowMs);
+
+  // Filter games by sport if requested
+  let games = cache.games;
+  if (sport) games = games.filter(g => g.sport_key && g.sport_key.toLowerCase().includes(sport.toLowerCase()));
+
+  // Filter by since timestamp
+  if (since) games = games.filter(g => g.commence_time && new Date(g.commence_time).getTime() >= since);
+
+  // Build warnings
+  const warnings = [];
+  if (cacheAgeMs !== null && cacheAgeMs > CACHE_STALE_THRESHOLD) warnings.push('cache_stale');
+  if (cache.sourceStatus === 'stale_preserved') warnings.push('using_preserved_cache');
+  if (cache.gameCount === 0) warnings.push('cache_empty');
+
+  res.json({
+    updatedAt:  cache.updatedAt,
+    cacheAgeMs, fetchDurationMs: cache.fetchDurationMs,
+    source: 'server_cache', sourceStatus: cache.sourceStatus,
+    gameCount: cache.gameCount, marketCount: cache.marketCount,
+    games: minimal ? [] : games,
+    suspendedMarkets,
+    warnings,
+    lastSuccessAt: cache.lastSuccessAt
+  });
+});
+
+// GET /api/markets/health — cache health widget for host dashboard
+app.get('/api/markets/health', (req, res) => {
+  const nowMs = Date.now();
+  const cache = LIVE_MARKET_CACHE;
+  const cacheAgeMs = cache.updatedAt ? nowMs - new Date(cache.updatedAt).getTime() : null;
+  const suspendedCount = _getSuspendedMarkets(cache, nowMs).length;
+  res.json({
+    status: cache.sourceStatus,
+    gameCount: cache.gameCount, marketCount: cache.marketCount,
+    suspendedMarkets: suspendedCount,
+    cacheAgeMs, fetchDurationMs: cache.fetchDurationMs,
+    lastSuccessAt: cache.lastSuccessAt, updatedAt: cache.updatedAt,
+    healthy: cache.sourceStatus === 'healthy' && (cacheAgeMs === null || cacheAgeMs < CACHE_STALE_THRESHOLD)
+  });
+});
+
+// POST /api/markets/refresh — force cache refresh (dev/admin)
+app.post('/api/markets/refresh', async (req, res) => {
+  try {
+    await pollLiveOddsLoop();
+    const cache = LIVE_MARKET_CACHE;
+    console.log('[live cache] forced refresh: games='+cache.gameCount+' markets='+cache.marketCount);
+    res.json({ ok:true, gameCount:cache.gameCount, marketCount:cache.marketCount,
+               updatedAt:cache.updatedAt, sourceStatus:cache.sourceStatus });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // GET /api/host/dashboard?clubId=...
 app.get('/api/host/dashboard', async (req, res) => {
   const sb = getSupabase();
@@ -1676,45 +1896,37 @@ app.post('/api/bets/place', async (req, res) => {
     if (stakeAmt > available + 0.005)
       return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
 
-    // 3. Odds validation — re-fetch live odds and verify each leg
+    // 3. Odds validation using LIVE_MARKET_CACHE (single source of truth)
     // Skip if player explicitly accepted updated odds (oddsAccepted:true on body)
     if (!body.oddsAccepted) {
       try {
-        // Determine unique sports from legs
-        const sports = [...new Set(legsArr.map(l => (l.sport||'mlb').toLowerCase()))];
-        const marketsByKey = {};
-        await Promise.all(sports.map(async function(sport) {
-          const games = await fetchOdds(sport);
-          if (Array.isArray(games)) {
-            Object.assign(marketsByKey, buildLiveMarketMap(games, sport));
-          }
-        }));
         const nowMs = Date.now();
-        const oddsCheck = validateAllLegsOdds(legsArr, marketsByKey, nowMs);
-        if (!oddsCheck.ok) {
-          console.log('[bets/place] odds validation failed:', oddsCheck.code, oddsCheck.leg);
-          if (oddsCheck.code === 'odds_changed') {
-            // Build updated snapshot so frontend can offer "accept new odds"
-            const updatedLegs = buildAcceptedOddsSnapshot(legsArr, marketsByKey);
-            return res.status(409).json({
-              ok: false, code: 'odds_changed',
-              leg: oddsCheck.leg, legIndex: oddsCheck.legIndex,
-              oldOdds: oddsCheck.oldOdds, newOdds: oddsCheck.newOdds,
-              drift: oddsCheck.drift, updatedLegs
-            });
+        const cache = LIVE_MARKET_CACHE;
+        if (cache.gameCount > 0) {
+          const oddsCheck = validateAllLegsOdds(legsArr, cache.marketsByCanonicalKey, cache.marketsByProviderGameId, nowMs);
+          if (!oddsCheck.ok) {
+            console.log('[bets/place] odds validation failed:', oddsCheck.code, oddsCheck.leg, 'cacheAge='+(Date.now()-new Date(cache.updatedAt).getTime())+'ms');
+            if (oddsCheck.code === 'odds_changed') {
+              const updatedLegs = buildAcceptedOddsSnapshotFromCache(legsArr, cache);
+              return res.status(409).json({
+                ok:false, code:'odds_changed',
+                leg:oddsCheck.leg, legIndex:oddsCheck.legIndex,
+                oldOdds:oddsCheck.oldOdds, newOdds:oddsCheck.newOdds,
+                drift:oddsCheck.drift, updatedLegs
+              });
+            }
+            return res.status(409).json({ ok:false, code:oddsCheck.code, leg:oddsCheck.leg,
+                                          legIndex:oddsCheck.legIndex, reason:oddsCheck.reason });
           }
-          return res.status(409).json({ ok:false, code: oddsCheck.code, leg: oddsCheck.leg,
-                                        legIndex: oddsCheck.legIndex, reason: oddsCheck.reason });
+          console.log('[bets/place] odds validation ok for', legsArr.length, 'legs (cache age='+(Date.now()-new Date(cache.updatedAt).getTime())+'ms)');
+        } else {
+          console.warn('[bets/place] odds cache empty — validation skipped (fail-open)');
         }
-        // Stamp legs with live odds (lock in what the server verified)
-        legsArr.forEach(function(leg, i) { leg.odds = oddsCheck.liveOdds || leg.odds; });
-        console.log('[bets/place] odds validation ok for', legsArr.length, 'legs');
       } catch(oddsErr) {
-        // Odds API unavailable — log but do NOT block placement (fail open)
-        console.warn('[bets/place] odds validation skipped (API unavailable):', oddsErr.message);
+        console.warn('[bets/place] odds validation error — fail-open:', oddsErr.message);
       }
     } else {
-      console.log('[bets/place] oddsAccepted=true — skipping re-validation, using submitted odds');
+      console.log('[bets/place] oddsAccepted=true — skipping re-validation');
     }
 
     // 3b. Conflict check: active legs on same game+market
