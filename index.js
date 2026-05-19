@@ -70,6 +70,8 @@ function rateLimitMiddleware(req, res, next) {
         payload:{ key, count:result.count, path:req.path } }).then(()=>{}).catch(()=>{});
     } catch(_e){}
     res.setHeader('Retry-After', result.retryAfterSec);
+    // Emit risk alert for repeated rate limits
+    emitRiskAlert('repeated_rate_limit', null, keyId, { path:req.path, count:result.count });
     return res.status(429).json({ ok:false, error:'rate_limited',
       retryAfterSec:result.retryAfterSec, limitKey:key });
   }
@@ -496,6 +498,143 @@ async function _cleanupEventFeed() {
     if(sb) await sb.from('event_feed').delete().lt('created_at',cutoff);
   } catch(_e){}
 }
+// ───────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE V: FRAUD/ABUSE SIGNALS
+// ════════════════════════════════════════════════════════════════════════════
+
+const ALERT_TYPES = new Set([
+  'rapid_bet_velocity','repeated_rate_limit','repeated_failed_auth',
+  'odds_change_rejections','stale_line_attempts','large_payout_attempt',
+  'over_limit_attempt','repeated_cancel_attempts',
+  'settlement_overpayment_attempt','manual_override_used'
+]);
+
+const ALERT_SEVERITY = {
+  rapid_bet_velocity:             { medium:5,  high:10 },
+  repeated_rate_limit:            { medium:3,  high:10 },
+  repeated_failed_auth:           { medium:3,  high:8  },
+  odds_change_rejections:         { medium:3,  high:8  },
+  stale_line_attempts:            { medium:3,  high:8  },
+  large_payout_attempt:           { medium:1,  high:3  },
+  over_limit_attempt:             { medium:2,  high:5  },
+  repeated_cancel_attempts:       { medium:4,  high:8  },
+  settlement_overpayment_attempt: { medium:1,  high:3  },
+  manual_override_used:           { medium:1,  high:3  }
+};
+
+const ALERT_COALESCE_MS = 24*60*60*1000; // 24h
+const _alertMemStore   = new Map(); // key = clubId|actorId|type
+
+function _alertKey(clubId, actorId, type) { return (clubId||'')+'|'+(actorId||'')+'|'+type; }
+
+function _calcAlertSeverity(type, count) {
+  const thr = ALERT_SEVERITY[type];
+  if (!thr) return 'low';
+  if (count >= thr.high)   return 'high';
+  if (count >= thr.medium) return 'medium';
+  return 'low';
+}
+
+// Fire-and-forget risk alert emission with 24h coalescing
+function emitRiskAlert(type, clubId, actorId, metadata) {
+  if (!ALERT_TYPES.has(type)) return;
+  const nowMs = Date.now();
+  const now   = new Date(nowMs).toISOString();
+  const key   = _alertKey(clubId, actorId, type);
+  const existing = _alertMemStore.get(key);
+
+  let alert;
+  if (existing && existing.status==='open' &&
+      (nowMs-new Date(existing.first_seen_at).getTime()) < ALERT_COALESCE_MS) {
+    existing.count++;
+    existing.severity    = _calcAlertSeverity(type, existing.count);
+    existing.last_seen_at= now; existing.updated_at=now;
+    if (metadata) existing.metadata_json=Object.assign({},existing.metadata_json,metadata);
+    alert = existing;
+  } else {
+    alert = {
+      alert_id:     'ALERT_'+type+'_'+(actorId||'anon')+'_'+nowMs,
+      club_id:      clubId||null, actor_id:actorId||null, player_id:actorId||null,
+      type, severity:_calcAlertSeverity(type,1), status:'open', count:1,
+      first_seen_at:now, last_seen_at:now, metadata_json:metadata||{},
+      created_at:now, updated_at:now
+    };
+  }
+  _alertMemStore.set(key, alert);
+
+  // Persist fire-and-forget
+  try {
+    const sb=getSupabase();
+    if (sb) sb.from('risk_alerts').upsert(alert,{ onConflict:'alert_id' })
+      .then(()=>{}).catch(()=>{});
+  } catch(_e){}
+
+  if (alert.severity!=='low') {
+    logEvent('warn','risk_alert',{ type, clubId, actorId, count:alert.count, severity:alert.severity });
+  }
+}
+
+// Admin endpoints
+app.get('/api/admin/risk-alerts', (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const clubId   = req._clubId || req.query.clubId;
+  const statusF  = req.query.status;
+  const limit    = Math.min(parseInt(req.query.limit)||50,200);
+  let alerts = [..._alertMemStore.values()]
+    .filter(function(a){
+      if (actor.platformRole!=='platform_admin' && clubId && a.club_id!==clubId) return false;
+      if (statusF && a.status!==statusF) return false;
+      return true;
+    })
+    .sort(function(a,b){ return a.last_seen_at<b.last_seen_at?1:-1; })
+    .slice(0,limit);
+  const counts = { open:0,acknowledged:0,dismissed:0,high:0,medium:0,low:0 };
+  _alertMemStore.forEach(function(a){
+    if (!clubId||a.club_id===clubId||actor.platformRole==='platform_admin') {
+      counts[a.status]=(counts[a.status]||0)+1;
+      if (a.status==='open') counts[a.severity]=(counts[a.severity]||0)+1;
+    }
+  });
+  res.json({ ok:true, alerts, counts });
+});
+
+app.post('/api/admin/risk-alerts/ack', (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { alertId } = req.body||{};
+  if (!alertId) return res.status(400).json({ ok:false, error:'missing_alertId' });
+  for (const [key,a] of _alertMemStore) {
+    if (a.alert_id===alertId) {
+      if (a.status!=='open') return res.status(409).json({ ok:false, error:'alert_not_open' });
+      a.status='acknowledged'; a.updated_at=new Date().toISOString();
+      return res.json({ ok:true, alertId });
+    }
+  }
+  res.status(404).json({ ok:false, error:'alert_not_found' });
+});
+
+app.post('/api/admin/risk-alerts/dismiss', (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { alertId } = req.body||{};
+  if (!alertId) return res.status(400).json({ ok:false, error:'missing_alertId' });
+  for (const [key,a] of _alertMemStore) {
+    if (a.alert_id===alertId) {
+      a.status='dismissed'; a.updated_at=new Date().toISOString();
+      return res.json({ ok:true, alertId });
+    }
+  }
+  res.status(404).json({ ok:false, error:'alert_not_found' });
+});
 // ───────────────────────────────────────────────────────────────────────────
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3079,6 +3218,8 @@ app.post('/api/grade/manual', requirePermissionScoped('run_server_grade'), async
       player_id:ticket.player_id, club_id:ticket.club_id||clubId,
       payload:{ result, reason, overrideCode, createdBy:actor.actorId, actorRole:actor.role }
     });
+    emitRiskAlert('manual_override_used', clubId||ticket.club_id, actor.actorId,
+      { ticketId, result, overrideCode });
     console.log('[grade/manual] ticketId='+ticketId+' result='+result+' by='+(actor.actorId||'?')+' code='+overrideCode);
     res.json({ ok:true, ticketId, result, overrideCode, balanceAfter:gradeResult.balance_after });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -4061,6 +4202,14 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       if (!riskCheck.ok) {
         const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
         console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
+        // Emit risk alert based on rejection code
+        var _raType = {
+          payout_above_max:'large_payout_attempt', player_open_risk_exceeded:'over_limit_attempt',
+          club_open_risk_exceeded:'over_limit_attempt', event_risk_exceeded:'over_limit_attempt',
+          market_risk_exceeded:'over_limit_attempt', stake_above_max:'over_limit_attempt'
+        }[riskCheck.code];
+        if (_raType) emitRiskAlert(_raType, clubId, playerId,
+          { code:riskCheck.code, stake:stakeAmt, payout:parseFloat(payout)||0 });
         return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
       }
     } catch(riskErr) {
@@ -4086,6 +4235,12 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
             ||payoutResult.code==='market_closed'||payoutResult.code==='odds_stale')?409 : 422;
         console.log('[bets/place] snapshot validation failed:', payoutResult.code,
           payoutResult.leg, '('+httpStatus+')');
+        // Emit risk alert for snapshot rejection
+        var _snapRaType = { odds_changed:'odds_change_rejections',
+          odds_stale:'stale_line_attempts', event_started:'stale_line_attempts',
+          market_closed:'stale_line_attempts', odds_service_unavailable:null }[payoutResult.code];
+        if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
+          { code:payoutResult.code, leg:payoutResult.leg });
         return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult));
       }
       if (payoutResult && payoutResult.ok) {
@@ -4195,6 +4350,8 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       { clubId, actorId:playerId, playerId }, req.requestId);
     emitEvent('balance_changed',{ playerId, balanceAfter:rpcResult.balance_after },
       { clubId, playerId }, req.requestId);
+    // Velocity signal: track rapid bet placement
+    emitRiskAlert('rapid_bet_velocity', clubId, playerId, { ticketId, stake:stakeAmt });
     res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows,
                ledgerEntryId:idempotencyKey, balanceAfter:rpcResult.balance_after });
   } catch(e) {
@@ -4526,6 +4683,8 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
     const alreadyPaid = await _calcTotalPaid(sb, periodId, playerId, direction);
     const remaining  = Math.round((amountOwed-alreadyPaid)*100)/100;
     if (amt > remaining+0.005 && !adminOverride) {
+      emitRiskAlert('settlement_overpayment_attempt', clubId, actor.actorId,
+        { attempted:amt, remaining, amountOwed });
       return res.status(409).json({ ok:false, code:'overpayment_blocked',
         amountOwed, alreadyPaid, remaining, attempted:amt });
     }
