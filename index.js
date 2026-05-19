@@ -2131,6 +2131,112 @@ console.log('ODDS_API_KEY set:', !!_k, '| fingerprint:', _k ? _k.slice(0,4)+'...
 
 // ════════════════════════════════════════════════════════════════════════════
 // SERVER GRADING ENGINE (Phase C)
+// ════════════════════════════════════════════════════════════════════════════
+// RESULT SNAPSHOT ENGINE (Phase M)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Upsert result snapshots from Odds API scores response
+async function _upsertResultSnapshots(scoresData, sport) {
+  const sb = getSupabase();
+  if (!sb || !Array.isArray(scoresData)) return;
+  const now = new Date().toISOString();
+  const rows = scoresData.map(function(game) {
+    const sport_key = game.sport_key||sport||'unknown';
+    const sp = sport_key.split('_')[0].toUpperCase()==='BASEBALL'?'MLB'
+      :sport_key.split('_')[0].toUpperCase()==='BASKETBALL'?'NBA'
+      :sport_key.toUpperCase().split('_')[0];
+    const away = (game.away_team||'').toLowerCase().replace(/\s+/g,'-');
+    const home = (game.home_team||'').toLowerCase().replace(/\s+/g,'-');
+    const date = (game.commence_time||'').slice(0,10);
+    const cKey = sp+'|'+away+'|'+home+'|'+date;
+    // Derive winner from scores
+    const scores = game.scores||[];
+    let homeScore=null, awayScore=null, winner=null;
+    if (scores.length===2) {
+      const h=scores.find(function(s){ return s.name===game.home_team; });
+      const a=scores.find(function(s){ return s.name===game.away_team; });
+      if(h&&a) {
+        homeScore=parseInt(h.score,10)||0; awayScore=parseInt(a.score,10)||0;
+        if (game.completed) {
+          winner = homeScore>awayScore?'home':awayScore>homeScore?'away':'tie';
+        }
+      }
+    }
+    const status = game.completed?'final':game.scores?'live':'scheduled';
+    return {
+      result_snapshot_id: 'RS_'+sport+'_'+game.id,
+      sport: sp, event_id:game.id, canonical_game_key:cKey,
+      home_team:game.home_team, away_team:game.away_team,
+      commence_time:game.commence_time, status,
+      home_score:homeScore, away_score:awayScore, winner,
+      final_at:game.completed?now:null,
+      source:'odds-api', fetched_at:now
+    };
+  });
+  if (!rows.length) return;
+  try {
+    await sb.from('result_snapshots').upsert(rows, { onConflict:'canonical_game_key' });
+    console.log('[results] upserted '+rows.length+' result snapshots for '+sport);
+  } catch(e) { console.warn('[results] upsert error:', e.message); }
+}
+
+// Derive leg outcome from result snapshot
+function _deriveLegOutcome(leg, result) {
+  if (!result) return { outcome:'error', reason:'result_missing' };
+  if (result.status !== 'final') return { outcome:'pending', reason:'result_not_final', status:result.status };
+  const market   = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
+  const pick     = (leg.pick||'').toLowerCase();
+  const homeTeam = (result.home_team||'').toLowerCase();
+  const awayTeam = (result.away_team||'').toLowerCase();
+  const homeScore= parseInt(result.home_score,10)||0;
+  const awayScore= parseInt(result.away_score,10)||0;
+
+  if (market==='moneyline'||market==='h2h') {
+    if (homeScore===awayScore) return { outcome:'push', reason:'tie' };
+    const pickedHome = pick.includes(homeTeam);
+    const pickedAway = pick.includes(awayTeam);
+    if (result.winner==='home'&&pickedHome) return { outcome:'won' };
+    if (result.winner==='away'&&pickedAway) return { outcome:'won' };
+    return { outcome:'lost' };
+  }
+  if (market==='spread'||market==='run line') {
+    const line = parseFloat(leg.accepted_point_line||leg.line||0);
+    const pickedHome = pick.includes(homeTeam);
+    const margin = homeScore-awayScore;
+    const adjusted = pickedHome ? margin+line : awayScore-homeScore+line;
+    if (Math.abs(adjusted)<0.001) return { outcome:'push' };
+    return adjusted>0 ? { outcome:'won' } : { outcome:'lost' };
+  }
+  if (market==='total'||market==='totals') {
+    const total = homeScore+awayScore;
+    const line  = parseFloat(leg.accepted_point_line||leg.line||0);
+    const pickOver = pick.includes('over');
+    if (Math.abs(total-line)<0.001) return { outcome:'push' };
+    return (pickOver?total>line:total<line) ? { outcome:'won' } : { outcome:'lost' };
+  }
+  return { outcome:'error', reason:'unsupported_market:'+market };
+}
+
+// Derive combined ticket outcome from all legs
+function _deriveTicketOutcome(ticket, legs, resultsByKey) {
+  const type = (ticket.type||'single').toLowerCase();
+  if (!legs.length) return { outcome:'error', reason:'no_legs' };
+  const legOutcomes = legs.map(function(leg) {
+    const result = resultsByKey[leg.canonical_game_key||'']||null;
+    return Object.assign({ leg:leg.pick }, _deriveLegOutcome(leg, result));
+  });
+  const pending = legOutcomes.find(function(l){ return l.outcome==='pending'||l.outcome==='error'; });
+  if (pending) return { outcome:pending.outcome, reason:pending.reason, leg:pending.leg };
+  if (type==='single'||type==='straight') return legOutcomes[0];
+  // Parlay
+  const anyLost = legOutcomes.find(function(l){ return l.outcome==='lost'; });
+  if (anyLost) return { outcome:'lost' };
+  const anyPush = legOutcomes.find(function(l){ return l.outcome==='push'; });
+  if (anyPush) return { outcome:'push' };
+  return legOutcomes.every(function(l){ return l.outcome==='won'; }) ? { outcome:'won' } : { outcome:'lost' };
+}
+// ───────────────────────────────────────────────────────────────────────────
+
 // POST /api/grade/run — authoritative server-side grading
 // Reads tickets from Supabase, fetches scores, grades, writes ledger + audit.
 // ════════════════════════════════════════════════════════════════════════════
@@ -2254,6 +2360,50 @@ async function _sgFetchCompletedGames(daysBack) {
   });
 }
 
+// POST /api/grade/manual — admin manual grade override
+app.post('/api/grade/manual', requirePermissionScoped('run_server_grade'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { ticketId, result, reason, overrideCode, clubId } = req.body||{};
+  if (!ticketId||!result||!reason||!overrideCode)
+    return res.status(400).json({ ok:false, error:'missing_required_field' });
+  if (!['won','lost','push'].includes(result))
+    return res.status(400).json({ ok:false, error:'invalid_result:'+result });
+  try {
+    const { data:tData } = await sb.from('tickets')
+      .select('id,status,player_id,club_id,risk_amount,potential_profit').eq('id',ticketId).limit(1);
+    const ticket = tData&&tData[0];
+    if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    if (['won','lost','push','canceled','voided'].includes(ticket.status))
+      return res.status(409).json({ ok:false, error:'already_graded', status:ticket.status });
+    const profit = parseFloat(ticket.potential_profit)||0;
+    const iKey   = 'MANUAL_'+result+'_'+ticketId;
+    const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
+      p_ticket_id:ticket.id, p_club_id:ticket.club_id||clubId||'',
+      p_player_id:ticket.player_id, p_grade_result:result, p_profit:profit,
+      p_idempotency_key:iKey, p_created_by:actor.actorId||'admin'
+    });
+    if (!gradeResult.ok && !gradeResult.idempotent)
+      return res.status(400).json({ ok:false, error:gradeResult.error||'grade_failed' });
+    await sb.from('grade_overrides').insert({
+      ticket_id:ticketId, player_id:ticket.player_id, club_id:ticket.club_id||clubId,
+      result, override_code:overrideCode, reason,
+      created_by:actor.actorId||'admin', actor_role:actor.role
+    });
+    await sb.from('audit_events').insert({
+      event_type:'manual_grade_override', ticket_id:ticketId,
+      player_id:ticket.player_id, club_id:ticket.club_id||clubId,
+      payload:{ result, reason, overrideCode, createdBy:actor.actorId, actorRole:actor.role }
+    });
+    console.log('[grade/manual] ticketId='+ticketId+' result='+result+' by='+(actor.actorId||'?')+' code='+overrideCode);
+    res.json({ ok:true, ticketId, result, overrideCode, balanceAfter:gradeResult.balance_after });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdempotency({required:false}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
@@ -2280,10 +2430,51 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
       .in('ticket_id', ticketIds);
     if (lErr) throw lErr;
 
-    // 2. Fetch completed scores
-    const completedGames = await _sgFetchCompletedGames(daysBack);
-    console.log('[server grade] checked='+tickets.length+' completedGames='+completedGames.length);
+    // 2. Phase M: fetch result snapshots from DB (server-trusted results only)
+    const uniqueKeys = [...new Set((allLegs||[]).map(function(l){ return l.canonical_game_key||''; }).filter(Boolean))];
+    let resultsByKey = {};
+    if (uniqueKeys.length) {
+      try {
+        const { data: snapRows } = await sb.from('result_snapshots').select('*')
+          .in('canonical_game_key', uniqueKeys);
+        (snapRows||[]).forEach(function(r){ resultsByKey[r.canonical_game_key]=r; });
+        // Also try to refresh from Odds API scores
+        const sports = [...new Set((allLegs||[]).map(function(l){ return (l.sport||'baseball_mlb').toLowerCase(); }))];
+        for (const sport of sports) {
+          try {
+            const url = `https://api.the-odds-api.com/v4/sports/${sport}/scores/?apiKey=${ODDS_KEY}&daysFrom=${daysBack}`;
+            const scoresData = await new Promise(function(resolve) {
+              const https = require('https');
+              const req = https.get(url, function(res) {
+                let d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(_e){resolve([]);}});
+              }); req.on('error',function(){ resolve([]); }); req.setTimeout(8000,function(){ req.destroy(); resolve([]); });
+            });
+            if (Array.isArray(scoresData)) {
+              await _upsertResultSnapshots(scoresData, sport);
+              // Re-load updated snapshots
+              scoresData.forEach(function(g){
+                if (!g.completed) return;
+                const sp=g.sport_key.includes('baseball')?'MLB':g.sport_key.split('_')[0].toUpperCase();
+                const away=(g.away_team||'').toLowerCase().replace(/\s+/g,'-');
+                const home=(g.home_team||'').toLowerCase().replace(/\s+/g,'-');
+                const date=(g.commence_time||'').slice(0,10);
+                const cKey=sp+'|'+away+'|'+home+'|'+date;
+                const scores=g.scores||[];
+                const h=scores.find(function(s){return s.name===g.home_team;});
+                const a=scores.find(function(s){return s.name===g.away_team;});
+                if(h&&a){
+                  resultsByKey[cKey]={ status:'final', home_team:g.home_team, away_team:g.away_team,
+                    home_score:parseInt(h.score,10)||0, away_score:parseInt(a.score,10)||0,
+                    winner:parseInt(h.score,10)>parseInt(a.score,10)?'home':parseInt(a.score,10)>parseInt(h.score,10)?'away':'tie' };
+                }
+              });
+            }
+          } catch(_e) { console.warn('[grade/run] score fetch for '+sport+':', _e.message); }
+        }
+      } catch(_e) { console.warn('[grade/run] result load error:', _e.message); }
+    }
 
+    console.log('[server grade] tickets='+tickets.length+' resultKeys='+Object.keys(resultsByKey).length);
     const results = [];
     let graded = 0, skipped = 0;
     const errors = [];
@@ -2291,98 +2482,62 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
     for (const ticket of tickets) {
       const ticketLegs = (allLegs||[]).filter(function(l){ return l.ticket_id===ticket.id; })
         .sort(function(a,b){ return (a.leg_index||0)-(b.leg_index||0); });
-
       const row = { ticketId:ticket.id, statusBefore:ticket.status, statusAfter:null,
-        result:null, matchMethod:null, payoutDelta:0, ledgerEntryId:null, auditEventId:null, reason:null };
+        result:null, source:'result_snapshot', payoutDelta:0, ledgerEntryId:null,
+        auditEventId:null, reason:null };
 
       try {
-        // Skip already settled (idempotency)
         if (ticket.graded_at) { row.reason='already_graded'; skipped++; results.push(row); continue; }
 
-        // Future gate + grade
-        for (const leg of ticketLegs) {
-          const ctMs = leg.scheduled_start ? new Date(leg.scheduled_start).getTime() : 0;
-          if (ctMs>0 && ctMs>nowMs) { row.reason='future_game_not_gradeable'; break; }
-        }
-        if (row.reason) { skipped++; results.push(row); continue; }
+        // Phase M: derive outcome from server result snapshots only
+        const outcome = _deriveTicketOutcome(ticket, ticketLegs, resultsByKey);
+        if (outcome.outcome==='error') { row.reason=outcome.reason||'result_conflict'; skipped++; results.push(row); continue; }
+        if (outcome.outcome==='pending') { row.reason=outcome.reason||'result_not_final'; skipped++; results.push(row); continue; }
+        const combined = outcome.outcome; // 'won'|'lost'|'push'
 
-        // Match and grade each leg
-        const legResults = [];
-        let skipReason = null;
-        for (const leg of ticketLegs) {
-          const match = _sgFindGame(leg, completedGames);
-          row.matchMethod = match.method;
-          if (!match.game) { skipReason = match.reason||'no_match'; break; }
-          if (!_sgIsGameFinal(match.game.status)) { skipReason = 'game_not_final'; break; }
-          const lr = _sgGradeLeg(leg, match.game);
-          if (!lr) { skipReason = 'leg_unable_to_grade'; break; }
-          legResults.push(lr);
-        }
+        const risk   = parseFloat(ticket.risk_amount)||0;
+        const profit = parseFloat(ticket.potential_profit)||0;
+        const payout = combined==='won'?Math.round((risk+profit)*100)/100:combined==='push'?risk:0;
+        const delta  = combined==='won'?profit:combined==='push'?0:-risk;
 
-        if (skipReason) { row.reason=skipReason; skipped++; results.push(row); continue; }
-        if (!legResults.length) { row.reason='no_legs'; skipped++; results.push(row); continue; }
-
-        const combined = legResults.some(function(r){return r==='lost';})?'lost':
-                         legResults.every(function(r){return r==='push';})?'push':
-                         legResults.some(function(r){return r==='push';})?'push':'won';
-
-        const risk    = parseFloat(ticket.risk_amount)||0;
-        const profit  = parseFloat(ticket.potential_profit)||0;
-        const payout  = combined==='won' ? Math.round((risk+profit)*100)/100
-                      : combined==='push' ? risk : 0;
-        const delta   = combined==='won' ? profit : combined==='push' ? 0 : -risk;
-
-        // Phase I: call grade_ticket_tx RPC (atomic status + canonical ledger)
+        // Phase I+M: call grade_ticket_tx RPC
         const iKey = 'SG_'+combined+'_'+ticket.id;
         const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
-          p_ticket_id:       ticket.id,
-          p_club_id:         ticket.club_id||'',
-          p_player_id:       ticket.player_id,
-          p_grade_result:    combined,
-          p_profit:          profit,
-          p_idempotency_key: iKey,
-          p_created_by:      'server-grade-api'
+          p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
+          p_grade_result:combined, p_profit:profit,
+          p_idempotency_key:iKey, p_created_by:'server-grade-api'
         });
-
-        if (!gradeResult.ok && !gradeResult.idempotent) {
+        if (!gradeResult.ok && !gradeResult.idempotent)
           throw new Error('grade_rpc_rejected:'+gradeResult.error);
-        }
 
-        // Legacy ledger_entries mirror (fire-and-forget)
+        // Legacy mirror
         const legacyId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
-        sb.from('ledger_entries').upsert({
-          id: legacyId, ticket_id: ticket.id,
-          player_id: ticket.player_id, club_id: ticket.club_id,
-          type: combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
-          amount: combined==='won'?profit:0,
-          reason:'server_grade_'+combined, created_at:gradedAt, created_by:'server-grade-api'
+        sb.from('ledger_entries').upsert({ id:legacyId, ticket_id:ticket.id,
+          player_id:ticket.player_id, club_id:ticket.club_id,
+          type:combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
+          amount:combined==='won'?profit:0, reason:'server_grade_'+combined,
+          created_at:gradedAt, created_by:'server-grade-api'
         }, { onConflict:'id' }).catch(()=>{});
 
-        // Write audit event
         const { data: auditData } = await sb.from('audit_events').insert({
-          event_type: 'ticket_graded_server',
-          ticket_id: ticket.id, player_id: ticket.player_id, club_id: ticket.club_id,
-          payload: { result:combined, matchMethod:row.matchMethod, legResults, payout, delta,
-                     legCount: ticketLegs.length, rpcOk:gradeResult.ok,
-                     balanceAfter:gradeResult.balance_after }
+          event_type:'ticket_graded_server',
+          ticket_id:ticket.id, player_id:ticket.player_id, club_id:ticket.club_id,
+          payload:{ result:combined, source:'result_snapshot', legCount:ticketLegs.length,
+                    payout, delta, rpcOk:gradeResult.ok, balanceAfter:gradeResult.balance_after }
         }).select('id');
 
-        row.statusAfter    = combined;
-        row.result         = combined;
-        row.payoutDelta    = delta;
-        row.ledgerEntryId  = legacyId;
-        row.canonicalLedgerId = 'LE_GR_'+ticket.id+'_'+combined;
-        row.auditEventId   = auditData&&auditData[0] ? auditData[0].id : null;
-        row.balanceAfter   = gradeResult.balance_after;
+        row.statusAfter=combined; row.result=combined; row.payoutDelta=delta;
+        row.ledgerEntryId=legacyId; row.canonicalLedgerId='LE_GR_'+ticket.id+'_'+combined;
+        row.auditEventId=auditData&&auditData[0]?auditData[0].id:null;
+        row.balanceAfter=gradeResult.balance_after;
         graded++;
-        console.log('[server grade] graded ticketId='+ticket.id+' result='+combined+' method='+row.matchMethod);
+        console.log('[server grade] graded ticketId='+ticket.id+' result='+combined+' source=result_snapshot');
 
       } catch(ticketErr) {
-        row.reason = 'error:'+ticketErr.message;
+        row.reason='error:'+ticketErr.message;
         errors.push({ ticketId:ticket.id, error:ticketErr.message });
         console.error('[server grade] error on ticket', ticket.id, ticketErr.message);
       }
-
       results.push(row);
     }
 
