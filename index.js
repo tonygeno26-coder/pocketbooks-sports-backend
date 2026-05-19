@@ -1519,6 +1519,133 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
+// POST /api/bets/place
+app.post('/api/bets/place', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { clubId, playerId, betType, stake, legs, payout, potentialProfit,
+          idempotencyKey, playerUsername } = req.body || {};
+  const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+  const now = new Date().toISOString();
+
+  // Validate required fields
+  const VALID_TYPES = new Set(['Single','Parlay','RoundRobin','Teaser']);
+  const errors = [];
+  if (!playerId)          errors.push('missing_playerId');
+  if (!idempotencyKey)    errors.push('missing_idempotencyKey');
+  if (!VALID_TYPES.has(betType)) errors.push('invalid_betType:'+betType);
+  const stakeAmt = parseFloat(stake);
+  if (isNaN(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
+  const legsArr = Array.isArray(legs) ? legs : [];
+  if (!legsArr.length) errors.push('no_legs');
+  legsArr.forEach(function(leg,i) {
+    if (!leg.pick) errors.push('leg'+i+'_missing_pick');
+    if (!leg.market) errors.push('leg'+i+'_missing_market');
+    if (!leg.canonicalGameKey) errors.push('leg'+i+'_missing_canonicalGameKey');
+    if (typeof leg.odds !== 'number') errors.push('leg'+i+'_invalid_odds');
+    if (!leg.scheduledStart) errors.push('leg'+i+'_missing_scheduledStart');
+  });
+  if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  try {
+    // 1. Idempotency: check if this exact bet was already placed
+    const { data: existLedger } = await sb.from('ledger_entries')
+      .select('id,ticket_id').eq('id', idempotencyKey).limit(1);
+    if (existLedger && existLedger[0]) {
+      // Already placed — return the existing ticket
+      const { data: existTicket } = await sb.from('tickets').select('*').eq('id', existLedger[0].ticket_id).limit(1);
+      return res.json({ ok:true, idempotent:true, ticket: existTicket&&existTicket[0], ledgerEntryId:idempotencyKey });
+    }
+
+    // 2. Derive DB balance for player
+    const { data: playerTix } = await sb.from('tickets')
+      .select('status,risk_amount,potential_profit').eq('player_id', playerId);
+    var startBal = 1000;
+    try {
+      const { data:mem } = await sb.from('club_members').select('balance_start')
+        .eq('player_id',playerId).limit(1);
+      if (mem&&mem[0]) startBal = parseFloat(mem[0].balance_start)||1000;
+    } catch(_e) {}
+    var openRisk=0, settledGains=0, settledLosses=0;
+    (playerTix||[]).forEach(function(t){
+      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
+      if (s==='active'||s==='open') openRisk+=r;
+      else if (s==='won')  settledGains+=p;
+      else if (s==='lost') settledLosses+=r;
+    });
+    var available = rnd(startBal - openRisk - settledLosses + settledGains);
+    if (stakeAmt > available + 0.005)
+      return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
+
+    // 3. Conflict check: active legs on same game+market
+    const { data: activeTix } = await sb.from('tickets').select('id')
+      .eq('player_id', playerId).in('status',['active','open']);
+    if (activeTix && activeTix.length) {
+      const activeTicketIds = activeTix.map(function(t){ return t.id; });
+      const { data: activeLegs } = await sb.from('ticket_legs')
+        .select('canonical_game_key,market').in('ticket_id', activeTicketIds);
+      const activeLegsArr = activeLegs || [];
+      for (var i=0; i<legsArr.length; i++) {
+        var newToken = legsArr[i].canonicalGameKey + '|' + (legsArr[i].market||'').toLowerCase();
+        for (var j=0; j<activeLegsArr.length; j++) {
+          var exToken = activeLegsArr[j].canonical_game_key + '|' + (activeLegsArr[j].market||'').toLowerCase();
+          if (newToken === exToken) return res.status(409).json({ ok:false, error:'conflict_active_bet:'+legsArr[i].canonicalGameKey });
+        }
+      }
+    }
+
+    // 4. Generate ticket ID
+    const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+
+    // 5. Write ticket
+    const ticketRow = {
+      id: ticketId, club_id: clubId||null, player_id: playerId,
+      player_username: playerUsername||null, type: betType, status: 'active',
+      risk_amount: rnd(stakeAmt), potential_profit: rnd(parseFloat(potentialProfit)||0),
+      estimated_payout: rnd(parseFloat(payout)||0),
+      placed_at: now, mirrored_at: now
+    };
+    const { error: tErr } = await sb.from('tickets').insert(ticketRow);
+    if (tErr) throw tErr;
+
+    // 6. Write ticket_legs
+    const legRows = legsArr.map(function(leg,i) { return {
+      id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
+      provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
+      canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
+      home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
+      scheduled_start: leg.scheduledStart, market: leg.market, pick: leg.pick,
+      odds: leg.odds, line: leg.line!=null?parseFloat(leg.line):null, side: leg.side||null
+    }; });
+    const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
+    if (lErr) throw lErr;
+
+    // 7. Write ledger entry (idempotencyKey as id)
+    const { error: leErr } = await sb.from('ledger_entries').upsert({
+      id: idempotencyKey, club_id: clubId||null, player_id: playerId,
+      ticket_id: ticketId, type: 'bet_placed',
+      amount: rnd(-stakeAmt),  // negative = player debit
+      reason: 'bet_placed:'+betType, created_at: now, created_by: playerId
+    }, { onConflict:'id' });
+    if (leErr) throw leErr;
+
+    // 8. Audit event
+    await sb.from('audit_events').insert({
+      event_type: 'ticket_placed', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
+      payload: { betType, stake:stakeAmt, legs:legsArr.length, payout: parseFloat(payout)||0 }
+    });
+
+    console.log('[bets/place] ticketId='+ticketId+' playerId='+playerId+' stake='+stakeAmt+' legs='+legsArr.length);
+    res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows, ledgerEntryId:idempotencyKey });
+  } catch(e) {
+    console.error('[bets/place] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+// ───────────────────────────────────────────────────────────────────────═
+
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
 app.get('/api/player/dashboard', async (req, res) => {
   const sb = getSupabase();
