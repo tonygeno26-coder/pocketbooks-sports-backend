@@ -4,6 +4,165 @@ const cors    = require('cors');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE Q: PRODUCTION OPS HARDENING
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─ Rate limiter (in-memory, Redis-ready abstraction) ───────────────────────────────
+const _rlWindows = new Map();
+function _rlCheck(key, maxReqs, windowMs) {
+  const now = Date.now();
+  const win = _rlWindows.get(key) || { count:0, resetAt: now+windowMs };
+  if (now >= win.resetAt) { win.count=0; win.resetAt=now+windowMs; }
+  win.count++;
+  _rlWindows.set(key, win);
+  const allowed = win.count <= maxReqs;
+  return { allowed, count:win.count, max:maxReqs,
+           retryAfterSec: allowed ? 0 : Math.ceil((win.resetAt-now)/1000) };
+}
+
+const RATE_LIMIT_CONFIG = {
+  '/api/auth/token':         { maxReqs:10,  windowMs:60000, keyBy:'ip' },
+  '/api/auth/refresh':       { maxReqs:10,  windowMs:60000, keyBy:'actor' },
+  '/api/bets/place':         { maxReqs:30,  windowMs:60000, keyBy:'actor' },
+  '/api/bets/cancel':        { maxReqs:30,  windowMs:60000, keyBy:'actor' },
+  '/api/grade/run':          { maxReqs:5,   windowMs:60000, keyBy:'club' },
+  '/api/grade/manual':       { maxReqs:5,   windowMs:60000, keyBy:'club' },
+  '/api/markets/refresh':    { maxReqs:5,   windowMs:60000, keyBy:'club' },
+  '/api/host/settlements':   { maxReqs:20,  windowMs:60000, keyBy:'actor' },
+  '/api/club/members':       { maxReqs:20,  windowMs:60000, keyBy:'actor' },
+  '/api/club/risk-settings': { maxReqs:20,  windowMs:60000, keyBy:'actor' }
+};
+
+function _getRlConfig(path) {
+  if (RATE_LIMIT_CONFIG[path]) return RATE_LIMIT_CONFIG[path];
+  for (const prefix of Object.keys(RATE_LIMIT_CONFIG)) {
+    if (path.startsWith(prefix)) return RATE_LIMIT_CONFIG[prefix];
+  }
+  return null;
+}
+
+function _ipHash(req) {
+  const ip = req.ip || (req.headers&&req.headers['x-forwarded-for'])||'unknown';
+  // Simple 8-char hash — not cryptographic, just for key bucketing
+  let h=0; for(let i=0;i<ip.length;i++) h=(Math.imul(31,h)+ip.charCodeAt(i))|0;
+  return Math.abs(h).toString(16).slice(0,8);
+}
+
+function rateLimitMiddleware(req, res, next) {
+  const cfg = _getRlConfig(req.path);
+  if (!cfg) return next();
+  const actor  = req._actor&&req._actor.actorId;
+  const club   = req._actor&&req._actor.clubId;
+  const keyId  = cfg.keyBy==='club' ? (club||actor||_ipHash(req))
+                : cfg.keyBy==='actor' ? (actor||_ipHash(req))
+                : _ipHash(req);
+  const key = keyId+'|'+req.path;
+  const result = _rlCheck(key, cfg.maxReqs, cfg.windowMs);
+  res.setHeader('X-RateLimit-Limit',     cfg.maxReqs);
+  res.setHeader('X-RateLimit-Remaining', Math.max(0,cfg.maxReqs-result.count));
+  if (!result.allowed) {
+    console.log('[rate-limit] 429 key='+key+' count='+result.count+' retryAfter='+result.retryAfterSec+'s');
+    // Audit (fire-and-forget)
+    try {
+      const sb = getSupabase&&getSupabase();
+      if (sb) sb.from('audit_events').insert({ event_type:'rate_limited',
+        payload:{ key, count:result.count, path:req.path } }).then(()=>{}).catch(()=>{});
+    } catch(_e){}
+    res.setHeader('Retry-After', result.retryAfterSec);
+    return res.status(429).json({ ok:false, error:'rate_limited',
+      retryAfterSec:result.retryAfterSec, limitKey:key });
+  }
+  next();
+}
+
+// ─ CORS hardening ───────────────────────────────────────────────────────────────────
+const _IS_PROD_CORS = process.env.NODE_ENV==='production';
+const _ALLOWED_ORIGINS_RAW = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(function(s){ return s.trim(); })
+  : ['https://pocketbooks-sports.vercel.app',
+     'https://pocketbooks-sports-git-main.vercel.app'];
+
+const _DEV_ORIGINS_EXTRA = ['http://localhost:3000','http://localhost:5000',
+                             'http://localhost:8080','http://localhost:3001'];
+const _CORS_ALLOWED = _IS_PROD_CORS
+  ? _ALLOWED_ORIGINS_RAW
+  : [..._ALLOWED_ORIGINS_RAW, ..._DEV_ORIGINS_EXTRA];
+
+const _DEV_LOCALHOST_RE = /^https?:\/\/localhost(:\d+)?$/;
+
+cors({
+  origin: function(origin, cb) {
+    if (!origin) return cb(null, true); // server-to-server
+    if (!_IS_PROD_CORS && _DEV_LOCALHOST_RE.test(origin)) return cb(null, true);
+    if (_CORS_ALLOWED.includes(origin)) return cb(null, true);
+    // Log and audit
+    console.log('[cors] rejected origin:', origin);
+    try {
+      const sb = getSupabase&&getSupabase();
+      if (sb) sb.from('audit_events').insert({ event_type:'cors_rejected',
+        payload:{ origin } }).then(()=>{}).catch(()=>{});
+    } catch(_e){}
+    return cb(new Error('cors_rejected'), false);
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Actor-Id','X-Club-Id',
+                   'X-Actor-Role','Idempotency-Key']
+});
+
+// Rebuild cors middleware with the hardened config
+const _hardenedCors = cors({
+  origin: function(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (!_IS_PROD_CORS && _DEV_LOCALHOST_RE.test(origin)) return cb(null, true);
+    if (_CORS_ALLOWED.includes(origin)) return cb(null, true);
+    console.log('[cors] rejected origin:', origin);
+    return cb(Object.assign(new Error('cors_rejected:'+origin), { statusCode:403 }), false);
+  },
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Actor-Id','X-Club-Id',
+                   'X-Actor-Role','Idempotency-Key']
+});
+
+// ─ Security headers middleware ──────────────────────────────────────────────────────────────
+const _SENSITIVE_PATHS_SEC = ['/api/auth','/api/bets','/api/host/settlements',
+                               '/api/grade','/api/club'];
+function securityHeadersMiddleware(req, res, next) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options',        'DENY');
+  res.setHeader('Referrer-Policy',        'no-referrer');
+  res.setHeader('Permissions-Policy',     'camera=(), microphone=(), geolocation=()');
+  const isSensitive = _SENSITIVE_PATHS_SEC.some(function(p){ return req.path.startsWith(p); });
+  if (isSensitive) res.setHeader('Cache-Control','no-store');
+  next();
+}
+
+// ─ Payload size limiter ────────────────────────────────────────────────────────────────────
+const _SENSITIVE_BET_PATHS = ['/api/bets/','/api/grade/','/api/host/settlements/'];
+const _PAYLOAD_DEFAULT   = 100 * 1024;  // 100 KB
+const _PAYLOAD_SENSITIVE =  50 * 1024;  //  50 KB
+
+function payloadSizeMiddleware(req, res, next) {
+  // Only check POST/PUT with Content-Length
+  const cl = parseInt(req.headers['content-length']||0, 10);
+  if (!cl || req.method==='GET') return next();
+  const isSensitive = _SENSITIVE_BET_PATHS.some(function(p){ return req.path.startsWith(p); });
+  const limit = isSensitive ? _PAYLOAD_SENSITIVE : _PAYLOAD_DEFAULT;
+  if (cl > limit) {
+    console.log('[payload] 413 path='+req.path+' size='+cl+' limit='+limit);
+    try {
+      const sb = getSupabase&&getSupabase();
+      if (sb) sb.from('audit_events').insert({ event_type:'payload_too_large',
+        payload:{ path:req.path, byteLength:cl, limit } }).then(()=>{}).catch(()=>{});
+    } catch(_e){}
+    return res.status(413).json({ ok:false, error:'payload_too_large', byteLength:cl, limit });
+  }
+  next();
+}
+// ════════════════════════════════════════════════════════════════════════════
+
 // ── Supabase mirror client (Phase A — passive write only) ─────────────────────
 // Loaded lazily so missing env never crashes startup.
 let _supabase = null;
@@ -126,8 +285,12 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
 
-app.use(cors());
-app.use(express.json());
+// Phase Q: hardened CORS, security headers, payload size, rate limiter
+app.use(_hardenedCors);
+app.use(express.json({ limit:'100kb' })); // body-parser limit as first guard
+app.use(securityHeadersMiddleware);
+app.use(payloadSizeMiddleware);
+app.use(rateLimitMiddleware);
 
 // ===== HEALTH (first route) =====
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
