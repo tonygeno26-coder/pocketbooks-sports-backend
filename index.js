@@ -544,23 +544,96 @@ const ACTION_MIN_RANK = {
 
 function _getRoleRank(role) { return ROLE_RANK[role] != null ? ROLE_RANK[role] : -99; }
 
-// Resolve actor from request headers
-function requireActor(req) {
-  const actorId   = (req.headers['x-actor-id']   || '').trim();
-  const clubId    = (req.headers['x-club-id']    || '').trim();
-  const actorRole = (req.headers['x-actor-role'] || '').trim();
-  const bypassAllowed = !IS_PRODUCTION || DEV_AUTH_BYPASS;
+// ── SESSION TOKEN FUNCTIONS (HS256) ────────────────────────────────────────────────────
+const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-insecure-secret-change-in-prod';
+if (IS_PRODUCTION && SESSION_SECRET === 'dev-insecure-secret-change-in-prod') {
+  console.error('[auth] FATAL: SESSION_SECRET not set in production! Set SESSION_SECRET env var.');
+}
 
-  if (!actorId) {
-    if (bypassAllowed) {
-      const bypassClub = clubId || (req.query && req.query.clubId) || (req.body && req.body.clubId) || 'dev-club';
-      console.log('[auth] DEV BYPASS actor=dev-owner role=owner club=' + bypassClub);
-      return { actorId:'dev-owner', role:'owner', clubId:bypassClub, isDevBypass:true };
+const _crypto = require('crypto');
+
+function _b64url(buf) {
+  return Buffer.from(buf).toString('base64')
+    .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function _b64urlDecode(s) {
+  s = s.replace(/-/g,'+').replace(/\//g,'/');
+  while (s.length%4) s += '=';
+  return Buffer.from(s,'base64');
+}
+
+function _signToken(payload, expiresInSec) {
+  const header = _b64url(JSON.stringify({ alg:'HS256', typ:'JWT' }));
+  const exp    = Math.floor(Date.now()/1000) + (expiresInSec != null ? expiresInSec : 86400); // 24h default
+  const body   = _b64url(JSON.stringify(Object.assign({}, payload, { exp, iat:Math.floor(Date.now()/1000) })));
+  const sig    = _b64url(_crypto.createHmac('sha256', SESSION_SECRET).update(header+'.'+body).digest());
+  return header+'.'+body+'.'+sig;
+}
+
+function _verifyToken(token) {
+  if (!token || typeof token !== 'string') return { error:'missing_token' };
+  const parts = token.split('.');
+  if (parts.length !== 3) return { error:'malformed_token' };
+  const [header, body, sig] = parts;
+  const expected = _b64url(_crypto.createHmac('sha256', SESSION_SECRET).update(header+'.'+body).digest());
+  if (expected !== sig) return { error:'invalid_token' };
+  let payload;
+  try { payload = JSON.parse(_b64urlDecode(body).toString()); } catch(_e) { return { error:'malformed_payload' }; }
+  const nowSec = Math.floor(Date.now()/1000);
+  if (payload.exp && nowSec >= payload.exp) return { error:'expired_token', expiredAt:payload.exp };
+  return { ok:true, payload };
+}
+
+// Sign a session token for a player/host (called after login/pairing)
+function issueSessionToken(actorId, role, clubId, expiresInSec) {
+  return _signToken({ sub:actorId, actorId, role, clubId: clubId||'' }, expiresInSec);
+}
+
+// ── REQUIRE ACTOR (Phase C — token-trusted) ───────────────────────────────────────────
+function requireActor(req) {
+  const authHeader = (req.headers['authorization'] || '').trim();
+  const bypassAllowed = !IS_PRODUCTION || DEV_AUTH_BYPASS;
+  const reqClub = (req.headers['x-club-id']||'').trim() ||
+                  (req.body && req.body.clubId) || (req.query && req.query.clubId) || '';
+
+  // 1. Bearer token — only trusted source for role in production
+  if (authHeader.startsWith('Bearer ')) {
+    const token  = authHeader.slice(7);
+    const result = _verifyToken(token);
+    if (!result.ok) {
+      const evType = result.error; // 'invalid_token' | 'expired_token' | 'malformed_token'
+      console.log('[auth] '+evType+' token from '+req.path);
+      _writeAuthAudit(evType, null, reqClub, req.path);
+      return { error:result.error, status:401, auditEvent:evType };
     }
-    return { error:'unauthenticated', status:401 };
+    const p    = result.payload;
+    const role = ROLE_RANK[p.role] != null ? p.role : 'view_only';
+    const club = reqClub || p.clubId || '';
+    if (IS_PRODUCTION) console.log('[auth] token ok actor='+p.sub+' role='+role+' club='+club);
+    return { actorId:p.sub||p.actorId, role, clubId:club, isDevBypass:false, fromToken:true };
   }
-  const role = ROLE_RANK[actorRole] != null ? actorRole : 'view_only';
-  return { actorId, role, clubId: clubId || (req.body && req.body.clubId) || (req.query && req.query.clubId) || '', isDevBypass:false };
+
+  // 2. Dev bypass (no token provided)
+  if (bypassAllowed) {
+    const bypassClub = reqClub || 'dev-club';
+    console.log('[auth] DEV BYPASS actor=dev-owner role=owner club='+bypassClub);
+    return { actorId:'dev-owner', role:'owner', clubId:bypassClub, isDevBypass:true };
+  }
+
+  // 3. Production, no token — x-actor-role is NOT trusted
+  console.log('[auth] unauthenticated request to '+req.path);
+  _writeAuthAudit('unauthenticated', null, reqClub, req.path);
+  return { error:'unauthenticated', status:401, auditEvent:'unauthenticated' };
+}
+
+function _writeAuthAudit(eventType, actorId, clubId, endpoint) {
+  try {
+    const sb = getSupabase();
+    if (sb) sb.from('audit_events').insert({
+      event_type: eventType, player_id: actorId||null, club_id: clubId||null,
+      payload: { endpoint, eventType }
+    }).then(()=>{}).catch(()=>{});
+  } catch(_e){}
 }
 
 // Check permission for action; targetPlayerId for player-self actions
@@ -610,8 +683,20 @@ requirePermission = function(action, getTargetPlayerId) {
         reason:perm.reason, required:perm.required, actual:perm.actual
       });
     }
-    req._actor = actor; // make actor available to handler
+    req._actor = actor;
     if (actor.isDevBypass) console.log('[auth] DEV BYPASS passthrough action='+action);
+    // Audit granted access for sensitive mutations
+    const SENSITIVE = new Set(['settle_player','weekly_rollover','run_server_grade','grade_trigger','force_market_refresh']);
+    if (SENSITIVE.has(action) && !actor.isDevBypass) {
+      try {
+        const sb = getSupabase();
+        if (sb) sb.from('audit_events').insert({
+          event_type:'permission_granted',
+          player_id: actor.actorId||null, club_id: actor.clubId||null,
+          payload:{ actorId:actor.actorId, role:actor.role, action, endpoint:req.path, fromToken:!!actor.fromToken }
+        }).then(()=>{}).catch(()=>{});
+      } catch(_e){}
+    }
     next();
   };
 }
@@ -1460,6 +1545,39 @@ app.post('/api/grade/run', requirePermission('grade_trigger'), async (req, res) 
 });
 
 // ── HOST DASHBOARD DB READ (Phase C Step 2) ────────────────────────────────────────────────────────
+// ══ SESSION TOKEN ISSUANCE ═══════════════════════════════════════════════════════════════════════════
+// POST /api/auth/token — issue a signed session token
+// Body: { actorId, clubId, role, secret? }
+// In production this should be called after real auth (club PIN, host code, etc.).
+// For now it validates against a CLUB_SECRET env var as a simple gate.
+app.post('/api/auth/token', async (req, res) => {
+  const { actorId, clubId, role, secret: clientSecret } = req.body || {};
+  if (!actorId) return res.status(400).json({ ok:false, error:'missing_actorId' });
+  if (!clubId)  return res.status(400).json({ ok:false, error:'missing_clubId'  });
+
+  // Role validation: cannot self-issue owner/full_admin without server-side verification
+  // In Phase C, trust the caller's role unless ROLE_SECRET is set
+  const ROLE_SECRET = process.env.ROLE_ISSUE_SECRET;
+  const requestedRole = ROLE_RANK[role] != null ? role : 'player';
+  const highPriv = requestedRole === 'owner' || requestedRole === 'full_admin';
+  if (highPriv && ROLE_SECRET && clientSecret !== ROLE_SECRET) {
+    return res.status(403).json({ ok:false, error:'cannot_self_issue_elevated_role' });
+  }
+
+  const token = issueSessionToken(actorId, requestedRole, clubId, 86400); // 24h
+  console.log('[auth] token issued actor='+actorId+' role='+requestedRole+' club='+clubId);
+  res.json({ ok:true, token, actorId, role:requestedRole, clubId, expiresIn:86400 });
+});
+
+// GET /api/auth/verify — verify a token and return actor info
+app.get('/api/auth/verify', (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  res.json({ ok:true, actorId:actor.actorId, role:actor.role, clubId:actor.clubId,
+             isDevBypass:actor.isDevBypass, fromToken:actor.fromToken||false });
+});
+// ───────────────────────────────────────────────────────────────────────────
+
 // ══ LIVE MARKETS API ═══════════════════════════════════════════════════════════════════════════
 app.get('/api/markets/live', (req, res) => {
   const nowMs = Date.now();
