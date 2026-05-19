@@ -1290,6 +1290,39 @@ app.get('/api/health', async (req, res) => {
     requestId:req.requestId });
 });
 
+// GET /api/admin/env-check — full_admin+; reports missing/warning env vars without exposing values
+app.get('/api/admin/env-check', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const REQUIRED = [
+    'SESSION_SECRET','SUPABASE_URL','SUPABASE_SERVICE_ROLE_KEY',
+    'ALLOWED_ORIGINS','ODDS_API_KEY'
+  ];
+  const RECOMMENDED = [
+    { key:'PLATFORM_ADMIN_ALLOWLIST', reason:'platform_admin escape hatch' },
+    { key:'WALLET_ERC20',             reason:'crypto deposit wallet (ERC20)' },
+    { key:'WALLET_BTC',               reason:'crypto deposit wallet (BTC)' },
+    { key:'ENABLE_WORKER',            reason:'background job worker' },
+  ];
+  const OPTIONAL = [
+    'BLOCKCHAIN_SCANNER_ENABLED','AUTO_CREDIT_CONFIRMED_CRYPTO',
+    'APP_VERSION','COMMIT_SHA','LOG_VERBOSE'
+  ];
+  const missing  = REQUIRED.filter(function(k){ return !process.env[k]; }).map(function(k){ return { key:k, level:'required' }; });
+  const warnings = RECOMMENDED.filter(function(v){ return !process.env[v.key]; }).map(function(v){ return { key:v.key, reason:v.reason }; });
+  const present  = REQUIRED.filter(function(k){ return !!process.env[k]; })
+    .concat(RECOMMENDED.filter(function(v){ return !!process.env[v.key]; }).map(function(v){ return v.key; }))
+    .concat(OPTIONAL.filter(function(k){ return !!process.env[k]; }));
+  // Never expose values
+  res.json({ ok:missing.length===0, missing, warnings,
+    presentCount:present.length,
+    report: missing.map(function(m){ return 'MISSING(required): '+m.key; })
+           .concat(warnings.map(function(w){ return 'WARNING(recommended): '+w.key+' — '+w.reason; })),
+    checkedAt:new Date().toISOString() });
+});
+
 // ── ADMIN JOB ENDPOINTS ───────────────────────────────────────────────────────────────────────
 app.get('/api/admin/jobs', async (req, res) => {
   const actor = requireActor(req);
