@@ -3764,6 +3764,17 @@ app.get('/api/club/exposure', requirePermissionScoped('view_host_dashboard'), as
 
 // ══ SETTLEMENT PERIODS + CLOSEOUT (Phase N) ═══════════════════════════════════════════════════════════════════════
 
+// ── PAYMENT HELPERS ───────────────────────────────────────────────────────────────────────
+async function _calcTotalPaid(sb, periodId, playerId, direction) {
+  const { data } = await sb.from('settlement_payments').select('amount')
+    .eq('period_id',periodId).eq('player_id',playerId)
+    .eq('direction',direction).eq('status','confirmed');
+  return Math.round((data||[]).reduce(function(s,r){ return s+parseFloat(r.amount||0); },0)*100)/100;
+}
+const VALID_PAY_METHODS    = new Set(['cash','zelle','venmo','cashapp','crypto','other']);
+const VALID_PAY_DIRECTIONS = new Set(['player_paid_host','host_paid_player']);
+// ───────────────────────────────────────────────────────────────────────────
+
 // GET /api/host/settlements/periods
 app.get('/api/host/settlements/periods', requirePermissionScoped('view_settlement_history'), async (req, res) => {
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
@@ -3794,6 +3805,174 @@ app.get('/api/host/settlements/:periodId/snapshots', requirePermissionScoped('vi
     }
     const { data } = await q.order('player_id');
     res.json({ ok:true, periodId, snapshots:data||[] });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/host/settlements/payment
+app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { periodId, clubId, playerId, direction, amount, method, note, adminOverride } = req.body||{};
+  if (!periodId||!clubId||!playerId) return res.status(400).json({ ok:false, error:'missing_required_field' });
+  if (!VALID_PAY_DIRECTIONS.has(direction)) return res.status(400).json({ ok:false, error:'invalid_direction' });
+  if (!VALID_PAY_METHODS.has(method||'cash')) return res.status(400).json({ ok:false, error:'invalid_method' });
+  const amt = parseFloat(amount);
+  if (isNaN(amt)||amt<=0) return res.status(400).json({ ok:false, error:'invalid_amount' });
+  try {
+    // Period must be closed or reopened
+    const { data:pData } = await sb.from('settlement_periods').select('status,revision')
+      .eq('period_id',periodId).limit(1);
+    const period = pData&&pData[0];
+    if (!period||period.status==='open')
+      return res.status(409).json({ ok:false, code:'period_not_closed' });
+    // Snapshot for overpayment check
+    const { data:snapData } = await sb.from('settlement_snapshots').select('amount_owed_by_player,amount_owed_to_player')
+      .eq('period_id',periodId).eq('player_id',playerId).order('revision',{ascending:false}).limit(1);
+    const snap = snapData&&snapData[0]||{ amount_owed_by_player:0, amount_owed_to_player:0 };
+    const owedKey = direction==='player_paid_host'?'amount_owed_by_player':'amount_owed_to_player';
+    const amountOwed = parseFloat(snap[owedKey]||0);
+    const alreadyPaid = await _calcTotalPaid(sb, periodId, playerId, direction);
+    const remaining  = Math.round((amountOwed-alreadyPaid)*100)/100;
+    if (amt > remaining+0.005 && !adminOverride) {
+      return res.status(409).json({ ok:false, code:'overpayment_blocked',
+        amountOwed, alreadyPaid, remaining, attempted:amt });
+    }
+    if (amt > remaining+0.005 && adminOverride && (ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+      return res.status(403).json({ ok:false, code:'insufficient_role_for_override', required:'full_admin' });
+    // Create payment row
+    const paymentId = 'PAY_'+clubId+'_'+playerId+'_'+Date.now();
+    const now = new Date().toISOString();
+    const { error:pErr } = await sb.from('settlement_payments').insert({
+      payment_id:paymentId, period_id:periodId, revision:period.revision||0,
+      club_id:clubId, player_id:playerId, direction, amount:amt,
+      method:method||'cash', status:'pending', note:note||null,
+      created_at:now, created_by:actor.actorId||'host'
+    });
+    if (pErr) throw pErr;
+    _writeAuthAudit('payment_recorded', actor.actorId, clubId, '/settlements/payment',
+      { paymentId, direction, amount:amt, method:method||'cash' });
+    console.log('[settlement/payment] '+paymentId+' '+direction+' $'+amt+' pending');
+    res.json({ ok:true, paymentId, status:'pending', direction, amount:amt });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/host/settlements/payment-confirm
+app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { paymentId } = req.body||{};
+  if (!paymentId) return res.status(400).json({ ok:false, error:'missing_paymentId' });
+  try {
+    const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
+    const pay = pData&&pData[0];
+    if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
+    if (pay.status==='confirmed') return res.json({ ok:true, idempotent:true, paymentId });
+    if (pay.status==='voided')    return res.status(409).json({ ok:false, error:'payment_voided' });
+    const iKey = 'CONFIRM_PAY_'+paymentId;
+    // Write canonical ledger
+    const dir = pay.direction==='player_paid_host'?'debit':'credit';
+    await _writeLedgerEntry({
+      clubId:pay.club_id, playerId:pay.player_id, settlementId:paymentId,
+      eventType:'SETTLEMENT_APPLIED', amount:parseFloat(pay.amount),
+      idempotencyKey:iKey, createdBy:actor.actorId||'host',
+      reason:'payment_confirmed:'+pay.direction
+    });
+    const now = new Date().toISOString();
+    await sb.from('settlement_payments').update({
+      status:'confirmed', confirmed_at:now, confirmed_by:actor.actorId||'host', ledger_written:true
+    }).eq('payment_id',paymentId);
+    _writeAuthAudit('payment_confirmed', actor.actorId, pay.club_id, '/settlements/payment-confirm',
+      { paymentId, amount:pay.amount, direction:pay.direction });
+    console.log('[settlement/confirm] '+paymentId+' confirmed $'+pay.amount+' '+dir);
+    res.json({ ok:true, paymentId, ledgerId:'LE_PAY_'+paymentId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/host/settlements/payment-void
+app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { paymentId, voidReason } = req.body||{};
+  if (!paymentId) return res.status(400).json({ ok:false, error:'missing_paymentId' });
+  try {
+    const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
+    const pay = pData&&pData[0];
+    if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
+    if (pay.status==='voided') return res.json({ ok:true, idempotent:true, paymentId });
+    let reversalLedgerId = null;
+    // If already ledger-applied, write reversal
+    if (pay.ledger_written) {
+      const revDir = pay.direction==='player_paid_host'?'credit':'debit';
+      const rKey = 'VOID_PAY_'+paymentId;
+      await _writeLedgerEntry({
+        clubId:pay.club_id, playerId:pay.player_id, settlementId:paymentId,
+        eventType:'BALANCE_ADJUSTMENT', amount:parseFloat(pay.amount),
+        idempotencyKey:rKey, createdBy:actor.actorId||'host',
+        reason:'void_reversal:'+paymentId, metadataJson:{ voidedPaymentId:paymentId }
+      });
+      reversalLedgerId = 'LE_REV_'+paymentId;
+    }
+    const now = new Date().toISOString();
+    await sb.from('settlement_payments').update({
+      status:'voided', voided_at:now, voided_by:actor.actorId||'host',
+      void_reason:voidReason||null
+    }).eq('payment_id',paymentId);
+    _writeAuthAudit('payment_voided', actor.actorId, pay.club_id, '/settlements/payment-void',
+      { paymentId, amount:pay.amount, reversalLedgerId, voidReason });
+    console.log('[settlement/void] '+paymentId+(reversalLedgerId?' reversal='+reversalLedgerId:''));
+    res.json({ ok:true, paymentId, reversalLedgerId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/host/settlements/:periodId/payments
+app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const { periodId } = req.params;
+  const actor = req._actor||{};
+  try {
+    // Load snapshots (latest revision)
+    const { data:revData } = await sb.from('settlement_snapshots').select('revision')
+      .eq('period_id',periodId).order('revision',{ascending:false}).limit(1);
+    const latestRev = revData&&revData[0]?revData[0].revision:0;
+    const { data:snaps } = await sb.from('settlement_snapshots').select('*')
+      .eq('period_id',periodId).eq('revision',latestRev);
+    const { data:payments } = await sb.from('settlement_payments').select('*')
+      .eq('period_id',periodId).order('created_at');
+    // Build per-player balance view
+    const byPlayer = {};
+    (snaps||[]).forEach(function(s) {
+      const paidBy = (payments||[]).filter(function(p){ return p.player_id===s.player_id&&p.status==='confirmed'&&p.direction==='player_paid_host'; })
+                       .reduce(function(acc,p){ return acc+parseFloat(p.amount||0); },0);
+      const paidTo = (payments||[]).filter(function(p){ return p.player_id===s.player_id&&p.status==='confirmed'&&p.direction==='host_paid_player'; })
+                       .reduce(function(acc,p){ return acc+parseFloat(p.amount||0); },0);
+      const owedBy = parseFloat(s.amount_owed_by_player||0);
+      const owedTo = parseFloat(s.amount_owed_to_player||0);
+      const remBy  = Math.round((owedBy-paidBy)*100)/100;
+      const remTo  = Math.round((owedTo-paidTo)*100)/100;
+      const status = owedBy>0?(paidBy<=0?'unpaid':paidBy<owedBy-0.005?'partial':paidBy>owedBy+0.005?'overpaid':'paid')
+                   : owedTo>0?(paidTo<=0?'unpaid':paidTo<owedTo-0.005?'partial':paidTo>owedTo+0.005?'overpaid':'paid')
+                   : 'even';
+      byPlayer[s.player_id] = {
+        playerId:s.player_id, owedByPlayer:owedBy, owedToPlayer:owedTo,
+        paidByPlayer:Math.round(paidBy*100)/100, paidToPlayer:Math.round(paidTo*100)/100,
+        remainingByPlayer:remBy, remainingToPlayer:remTo,
+        status, paymentHistory:(payments||[]).filter(function(p){ return p.player_id===s.player_id; })
+      };
+    });
+    res.json({ ok:true, periodId, playerBalances:Object.values(byPlayer) });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
