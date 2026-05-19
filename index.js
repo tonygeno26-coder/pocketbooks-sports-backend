@@ -269,6 +269,7 @@ async function _failJob(jobId, errorMsg) {
     .update({status:j.status,locked_at:null,locked_by:null,
              last_error:errorMsg,run_after:j.run_after,updated_at:now})
     .eq('job_id',jobId); } catch(_e){}
+  if (isDead) emitEvent('job_failed',{ jobId, type:j.type, lastError:errorMsg, dead:true },{ clubId:j.club_id });
   console.log('[jobs] failed', jobId, isDead?'DEAD':'retry@'+j.run_after);
 }
 
@@ -363,6 +364,7 @@ async function _workerTick() {
     await handler(job);
     await _completeJob(job.job_id);
     console.log('[worker] completed', job.type, job.job_id);
+    emitEvent('job_completed',{ type:job.type, jobId:job.job_id },{ clubId:job.club_id });
   } catch(e) {
     logEvent('error','worker_job_failed',{ type:job.type, jobId:job.job_id, err:e.message });
     await _failJob(job.job_id, e.message);
@@ -376,6 +378,123 @@ if (process.env.ENABLE_WORKER==='true') {
   // Seed recurring jobs
   enqueueJob('odds_refresh',{},{idempotencyKey:'BOOT_odds_refresh'});
   enqueueJob('result_refresh',{},{idempotencyKey:'BOOT_result_refresh'});
+}
+// ───────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE T: REAL-TIME POLLING BUS
+// ════════════════════════════════════════════════════════════════════════════
+
+const VALID_EV_TYPES = new Set([
+  'ticket_placed','ticket_canceled','ticket_graded',
+  'balance_changed','odds_refreshed','result_refreshed',
+  'settlement_closed','payment_confirmed','payment_voided',
+  'job_completed','job_failed','risk_limit_changed'
+]);
+const CLUB_WIDE_EV = new Set(['odds_refreshed','result_refreshed','settlement_closed',
+                               'job_completed','job_failed','risk_limit_changed']);
+
+// In-memory buffer (ring buffer per club, 500 events max)
+const _evMem = {}; // clubId -> [events]
+const EV_MEM_MAX = 500;
+
+function emitEvent(type, payload, scope, requestId) {
+  if (!VALID_EV_TYPES.has(type)) return;
+  const ev = {
+    event_id:   'EV_'+Date.now()+'_'+_crypto.randomBytes(3).toString('hex'),
+    club_id:    scope&&scope.clubId  || null,
+    actor_id:   scope&&scope.actorId || null,
+    player_id:  scope&&scope.playerId|| null,
+    type,
+    payload_json: payload||{},
+    created_at: new Date().toISOString(),
+    request_id: requestId||null
+  };
+  // Ring buffer
+  const cid = ev.club_id||'__global';
+  if (!_evMem[cid]) _evMem[cid]=[];
+  _evMem[cid].push(ev);
+  if (_evMem[cid].length>EV_MEM_MAX) _evMem[cid].shift();
+  // Persist fire-and-forget
+  try {
+    const sb=getSupabase();
+    if(sb) sb.from('event_feed').insert({
+      event_id:ev.event_id, club_id:ev.club_id, actor_id:ev.actor_id,
+      player_id:ev.player_id, type, payload_json:payload||{}
+    }).then(()=>{}).catch(()=>{});
+  } catch(_e){}
+}
+
+// GET /api/events — polling endpoint
+app.get('/api/events', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const clubId  = req._clubId || (req.query.clubId);
+  const since   = (req.query.since||'').trim();
+  const limit   = Math.min(parseInt(req.query.limit)||50, 200);
+  const nowTs   = new Date().toISOString();
+  const rank    = ROLE_RANK[actor.role]||0;
+
+  // Collect from mem buffer
+  const cid = clubId||'__global';
+  let events = (_evMem[cid]||[]).concat(
+    actor.platformRole==='platform_admin'
+      ? Object.values(_evMem).flat().filter(function(e){ return e.club_id!==cid; })
+      : []
+  );
+
+  // Also try Supabase for events not in mem buffer
+  try {
+    const sb = getSupabase();
+    if (sb && since) {
+      let q = sb.from('event_feed').select('*').order('created_at').limit(limit);
+      if (clubId && actor.platformRole!=='platform_admin') q=q.eq('club_id',clubId);
+      if (since.startsWith('EV_')) q=q.gt('event_id',since);
+      else q=q.gt('created_at',since);
+      const { data } = await q;
+      if (data&&data.length) {
+        const existIds = new Set(events.map(function(e){ return e.event_id; }));
+        (data||[]).forEach(function(e){ if(!existIds.has(e.event_id)) events.push(e); });
+      }
+    }
+  } catch(_e){}
+
+  // Filter by cursor
+  if (since) {
+    events = events.filter(function(e){
+      return since.startsWith('EV_') ? e.event_id>since : e.created_at>since;
+    });
+  }
+
+  // Access control
+  events = events.filter(function(ev) {
+    if (actor.platformRole==='platform_admin') return true;
+    if (ev.club_id && ev.club_id!==clubId) return false;
+    if (rank >= ROLE_RANK.risk_viewer) return true;
+    if (CLUB_WIDE_EV.has(ev.type)) return true;
+    return ev.player_id && ev.player_id===actor.actorId;
+  });
+
+  // Sort + limit
+  events.sort(function(a,b){ return a.created_at<b.created_at?-1:1; });
+  events = events.slice(-limit);
+  const latestCursor = events.length ? events[events.length-1].event_id : (since||null);
+  res.json({ ok:true, events, latestCursor, serverTime:nowTs, count:events.length });
+});
+
+// Cleanup helper (run via admin job or cron)
+async function _cleanupEventFeed() {
+  const cutoff = new Date(Date.now()-7*86400000).toISOString();
+  // Mem buffer
+  Object.keys(_evMem).forEach(function(cid){
+    _evMem[cid]=_evMem[cid].filter(function(e){ return e.created_at>=cutoff; });
+    if(_evMem[cid].length>10000) _evMem[cid]=_evMem[cid].slice(-10000);
+  });
+  // Supabase
+  try {
+    const sb=getSupabase();
+    if(sb) await sb.from('event_feed').delete().lt('created_at',cutoff);
+  } catch(_e){}
 }
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -4072,6 +4191,10 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     const ticketRow = { id:ticketId, club_id:clubId, player_id:playerId, type:betType,
       status:'active', risk_amount:rnd(stakeAmt), placed_at:now };
     console.log('[bets/place] RPC ok ticketId='+ticketId+' stake='+stakeAmt+' balanceAfter='+(rpcResult.balance_after||'?'));
+    emitEvent('ticket_placed',{ ticketId, stake:stakeAmt, betType, balanceAfter:rpcResult.balance_after },
+      { clubId, actorId:playerId, playerId }, req.requestId);
+    emitEvent('balance_changed',{ playerId, balanceAfter:rpcResult.balance_after },
+      { clubId, playerId }, req.requestId);
     res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows,
                ledgerEntryId:idempotencyKey, balanceAfter:rpcResult.balance_after });
   } catch(e) {
@@ -4156,6 +4279,10 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
 
     const refundAmt = cancelResult.refund || riskAmt;
     console.log('[bets/cancel] RPC ok ticketId='+ticketId+' refund=$'+refundAmt);
+    emitEvent('ticket_canceled',{ ticketId, refundAmount:refundAmt, balanceAfter:cancelResult.balance_after },
+      { clubId, actorId:playerId, playerId }, req.requestId);
+    emitEvent('balance_changed',{ playerId, balanceAfter:cancelResult.balance_after },
+      { clubId, playerId }, req.requestId);
     res.json({ ok:true, ticketId, status:'canceled', refundAmount:refundAmt,
                ledgerEntryId:idempotencyKey, balanceAfter:cancelResult.balance_after });
   } catch(e) {
@@ -4453,6 +4580,8 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
     _writeAuthAudit('payment_confirmed', actor.actorId, pay.club_id, '/settlements/payment-confirm',
       { paymentId, amount:pay.amount, direction:pay.direction });
     console.log('[settlement/confirm] '+paymentId+' confirmed $'+pay.amount+' '+dir);
+    emitEvent('payment_confirmed',{ paymentId, amount:pay.amount, direction:pay.direction },
+      { clubId:pay.club_id, playerId:pay.player_id, actorId:actor.actorId }, req.requestId);
     res.json({ ok:true, paymentId, ledgerId:'LE_PAY_'+paymentId });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -4493,6 +4622,8 @@ app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_p
     _writeAuthAudit('payment_voided', actor.actorId, pay.club_id, '/settlements/payment-void',
       { paymentId, amount:pay.amount, reversalLedgerId, voidReason });
     console.log('[settlement/void] '+paymentId+(reversalLedgerId?' reversal='+reversalLedgerId:''));
+    emitEvent('payment_voided',{ paymentId, reversalLedgerId, amount:pay.amount },
+      { clubId:pay.club_id, playerId:pay.player_id, actorId:actor.actorId }, req.requestId);
     res.json({ ok:true, paymentId, reversalLedgerId });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -4641,6 +4772,8 @@ app.post('/api/host/settlements/close-week', requirePermissionScoped('settlement
                 playerCount:snapRows.length, revision:nextRevision }
     });
 
+    emitEvent('settlement_closed',{ periodId, weekStart, revision:nextRevision, playerCount:snapRows.length },
+      { clubId }, req.requestId);
     console.log('[close-week] periodId='+periodId+' players='+snapRows.length+' rev='+nextRevision);
     res.json({ ok:true, periodId, weekStart, revision:nextRevision,
                playerCount:snapRows.length, forceClose:!!forceClose });
