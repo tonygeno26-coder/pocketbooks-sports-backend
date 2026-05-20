@@ -436,63 +436,6 @@ try {
 } catch (_e) {}
 }
 
-// GET /api/events — polling endpoint
-app.get('/api/events', async (req, res) => {
-  const actor = requireActor(req);
-  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
-  const clubId  = req._clubId || (req.query.clubId);
-  const since   = (req.query.since||'').trim();
-  const limit   = Math.min(parseInt(req.query.limit)||50, 200);
-  const nowTs   = new Date().toISOString();
-  const rank    = ROLE_RANK[actor.role]||0;
-
-  // Collect from mem buffer
-  const cid = clubId||'__global';
-  let events = (_evMem[cid]||[]).concat(
-    actor.platformRole==='platform_admin'
-      ? Object.values(_evMem).flat().filter(function(e){ return e.club_id!==cid; })
-      : []
-  );
-
-  // Also try Supabase for events not in mem buffer
-  try {
-    const sb = getSupabase();
-    if (sb && since) {
-      let q = sb.from('event_feed').select('*').order('created_at').limit(limit);
-      if (clubId && actor.platformRole!=='platform_admin') q=q.eq('club_id',clubId);
-      if (since.startsWith('EV_')) q=q.gt('event_id',since);
-      else q=q.gt('created_at',since);
-      const { data } = await q;
-      if (data&&data.length) {
-        const existIds = new Set(events.map(function(e){ return e.event_id; }));
-        (data||[]).forEach(function(e){ if(!existIds.has(e.event_id)) events.push(e); });
-      }
-    }
-  } catch(_e){}
-
-  // Filter by cursor
-  if (since) {
-    events = events.filter(function(e){
-      return since.startsWith('EV_') ? e.event_id>since : e.created_at>since;
-    });
-  }
-
-  // Access control
-  events = events.filter(function(ev) {
-    if (actor.platformRole==='platform_admin') return true;
-    if (ev.club_id && ev.club_id!==clubId) return false;
-    if (rank >= ROLE_RANK.risk_viewer) return true;
-    if (CLUB_WIDE_EV.has(ev.type)) return true;
-    return ev.player_id && ev.player_id===actor.actorId;
-  });
-
-  // Sort + limit
-  events.sort(function(a,b){ return a.created_at<b.created_at?-1:1; });
-  events = events.slice(-limit);
-  const latestCursor = events.length ? events[events.length-1].event_id : (since||null);
-  res.json({ ok:true, events, latestCursor, serverTime:nowTs, count:events.length });
-});
-
 // Cleanup helper (run via admin job or cron)
 async function _cleanupEventFeed() {
   const cutoff = new Date(Date.now()-7*86400000).toISOString();
@@ -1671,6 +1614,64 @@ async function mirrorLedgerEntry(entry) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const app = express();
+
+// GET /api/events — polling endpoint
+app.get('/api/events', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const clubId  = req._clubId || (req.query.clubId);
+  const since   = (req.query.since||'').trim();
+  const limit   = Math.min(parseInt(req.query.limit)||50, 200);
+  const nowTs   = new Date().toISOString();
+  const rank    = ROLE_RANK[actor.role]||0;
+
+  // Collect from mem buffer
+  const cid = clubId||'__global';
+  let events = (_evMem[cid]||[]).concat(
+    actor.platformRole==='platform_admin'
+      ? Object.values(_evMem).flat().filter(function(e){ return e.club_id!==cid; })
+      : []
+  );
+
+  // Also try Supabase for events not in mem buffer
+  try {
+    const sb = getSupabase();
+    if (sb && since) {
+      let q = sb.from('event_feed').select('*').order('created_at').limit(limit);
+      if (clubId && actor.platformRole!=='platform_admin') q=q.eq('club_id',clubId);
+      if (since.startsWith('EV_')) q=q.gt('event_id',since);
+      else q=q.gt('created_at',since);
+      const { data } = await q;
+      if (data&&data.length) {
+        const existIds = new Set(events.map(function(e){ return e.event_id; }));
+        (data||[]).forEach(function(e){ if(!existIds.has(e.event_id)) events.push(e); });
+      }
+    }
+  } catch(_e){}
+
+  // Filter by cursor
+  if (since) {
+    events = events.filter(function(e){
+      return since.startsWith('EV_') ? e.event_id>since : e.created_at>since;
+    });
+  }
+
+  // Access control
+  events = events.filter(function(ev) {
+    if (actor.platformRole==='platform_admin') return true;
+    if (ev.club_id && ev.club_id!==clubId) return false;
+    if (rank >= ROLE_RANK.risk_viewer) return true;
+    if (CLUB_WIDE_EV.has(ev.type)) return true;
+    return ev.player_id && ev.player_id===actor.actorId;
+  });
+
+  // Sort + limit
+  events.sort(function(a,b){ return a.created_at<b.created_at?-1:1; });
+  events = events.slice(-limit);
+  const latestCursor = events.length ? events[events.length-1].event_id : (since||null);
+  res.json({ ok:true, events, latestCursor, serverTime:nowTs, count:events.length });
+});
+
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
 
