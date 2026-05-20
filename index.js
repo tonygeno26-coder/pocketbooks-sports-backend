@@ -994,7 +994,19 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
   const { data:balRow } = await sb.from('host_diamond_balances')
     .select('*').eq('club_id',clubId).limit(1);
   const host = balRow && balRow[0];
-  if (!host) return { ok:false, error:'host_balance_not_found' };
+  // FAIL-CLOSED: missing host balance row blocks new bettors in production
+  if (!host) {
+    const isDev = process.env.NODE_ENV !== 'production';
+    const devBypass = process.env.DEV_AUTH_BYPASS === 'true';
+    if (!isDev || !devBypass) {
+      return {
+        ok:false, error:'host_diamond_balance_missing', httpStatus:402,
+        message:'Host diamond balance is not configured. Contact the host to set up their account.'
+      };
+    }
+    console.warn('[WARN] DEV_AUTH_BYPASS: host_diamond_balance_missing for club='+clubId+' — allowing in dev');
+    return { ok:true, charged:false, reason:'dev_bypass_no_balance_row', weekStart };
+  }
 
   if (host.balance_diamonds < HOST_ACTIVE_BETTOR_FEE) {
     return {
@@ -1035,6 +1047,39 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
     ledgerEvent:'HOST_ACTIVE_BETTOR_CHARGE', weekStart, ledgerId
   };
 }
+
+// POST /api/admin/host-diamonds/seed
+app.post('/api/admin/host-diamonds/seed', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const { clubId, hostActorId, startingBalanceDiamonds, force } = req.body||{};
+  if (!clubId||!hostActorId) return res.status(400).json({ ok:false, error:'missing_clubId_or_hostActorId' });
+  const bal = parseFloat(startingBalanceDiamonds);
+  if (isNaN(bal)||bal<0) return res.status(400).json({ ok:false, error:'invalid_startingBalance' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const { data:existing } = await sb.from('host_diamond_balances').select('*').eq('club_id',clubId).limit(1);
+    if (existing&&existing[0]&&!force) {
+      return res.status(409).json({ ok:false, error:'balance_row_already_exists',
+        current:parseFloat(existing[0].balance_diamonds) });
+    }
+    const now = new Date().toISOString();
+    await sb.from('host_diamond_balances').upsert({
+      club_id:clubId, host_actor_id:hostActorId,
+      balance_diamonds:bal, updated_at:now
+    }, { onConflict:'club_id' });
+    _writeAuthAudit('host_balance_seeded', actor.actorId, clubId,
+      '/admin/host-diamonds/seed', { hostActorId, bal, force:!!force });
+    console.log('[host/seed] clubId='+clubId+' hostActorId='+hostActorId+' bal='+bal+' force='+!!force);
+    res.json({ ok:true, clubId, hostActorId, balanceDiamonds:bal,
+      created:!(existing&&existing[0]), overwritten:!!(existing&&existing[0]) });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/diamond-usage
 app.get('/api/host/diamond-usage', async (req, res) => {
@@ -4822,11 +4867,14 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     // 2c. Phase AA: active-bettor charge check
     const _habResult = await _processActiveBettorCharge(sb, clubId, playerId, null, Date.now());
     if (!_habResult.ok) {
-      if (_habResult.error === 'host_diamond_balance_insufficient') {
-        return res.status(402).json({ ok:false, error:'host_diamond_balance_insufficient',
+      if (_habResult.httpStatus === 402) {
+        return res.status(402).json({ ok:false, error:_habResult.error,
           message:_habResult.message, balance:_habResult.balance, required:_habResult.required });
       }
-      console.warn('[bets/place] active-bettor charge error:', _habResult.error, '— allowing bet (fail-open)');
+      // Other unexpected errors: fail-closed (log + block)
+      console.error('[bets/place] active-bettor charge unexpected error:', _habResult.error);
+      return res.status(503).json({ ok:false, error:'active_bettor_charge_failed',
+        detail:_habResult.error });
     }
 
     // 3. Phase K: snapshot-based odds verification + server payout recalculation
