@@ -2862,6 +2862,7 @@ const pollLiveOddsLoopWithSnapshots = async function() {
   _upsertOddsSnapshots().catch(()=>{});
 };
 // Re-register poller with snapshot write
+const CACHE_POLL_INTERVAL = 30 * 1000;        // 30s poll
 if (ODDS_KEY) setInterval(pollLiveOddsLoopWithSnapshots, CACHE_POLL_INTERVAL);
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -3272,7 +3273,6 @@ requirePermission = function(action, getTargetPlayerId) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const ODDS_TOLERANCE_PTS  = 3;
-const CACHE_POLL_INTERVAL = 30 * 1000;        // 30s poll
 const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
 const CACHE_SPORTS = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
 
