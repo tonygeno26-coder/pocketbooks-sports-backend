@@ -963,6 +963,114 @@ app.post('/api/admin/crypto/deposits/reject', requirePermissionScoped('settle_pl
 // ───────────────────────────────────────────────────────────────────────────
 
 // ════════════════════════════════════════════════════════════════════════════
+// PHASE AA: HOST ACTIVE-BETTOR DIAMOND CHARGING
+// ════════════════════════════════════════════════════════════════════════════
+
+const HOST_ACTIVE_BETTOR_FEE = 15; // diamonds
+
+function _getWeekStart(nowMs) {
+  var d   = new Date(nowMs || Date.now());
+  var day = d.getUTCDay();
+  var diff= day === 0 ? -6 : 1 - day;
+  var mon = new Date(d);
+  mon.setUTCDate(d.getUTCDate() + diff);
+  mon.setUTCHours(0,0,0,0);
+  return mon.toISOString().slice(0,10);
+}
+
+async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs) {
+  if (!sb) return { ok:true, charged:false, reason:'supabase_not_configured_dev_bypass' };
+  const weekStart = _getWeekStart(nowMs);
+
+  // Already active this week?
+  const { data:existing } = await sb.from('weekly_active_bettors')
+    .select('player_id').eq('club_id',clubId).eq('player_id',playerId)
+    .eq('week_start',weekStart).limit(1);
+  if (existing && existing[0]) {
+    return { ok:true, charged:false, reason:'already_active_this_week', weekStart };
+  }
+
+  // Load host balance
+  const { data:balRow } = await sb.from('host_diamond_balances')
+    .select('*').eq('club_id',clubId).limit(1);
+  const host = balRow && balRow[0];
+  if (!host) return { ok:false, error:'host_balance_not_found' };
+
+  if (host.balance_diamonds < HOST_ACTIVE_BETTOR_FEE) {
+    return {
+      ok:false, error:'host_diamond_balance_insufficient', httpStatus:402,
+      message:'Host diamond balance is too low to activate another bettor this week. Ask host to refill diamonds.',
+      balance:host.balance_diamonds, required:HOST_ACTIVE_BETTOR_FEE
+    };
+  }
+
+  // Deduct, activate, write ledger
+  const ledgerId = 'HAB_'+clubId+'_'+playerId+'_'+weekStart;
+  const now = new Date(nowMs||Date.now()).toISOString();
+
+  await sb.from('host_diamond_balances')
+    .update({ balance_diamonds: host.balance_diamonds - HOST_ACTIVE_BETTOR_FEE, updated_at:now })
+    .eq('club_id', clubId);
+
+  await sb.from('weekly_active_bettors').insert({
+    club_id:clubId, player_id:playerId, week_start:weekStart,
+    first_ticket_id:ticketId, activated_at:now,
+    charged_diamonds:HOST_ACTIVE_BETTOR_FEE, charge_ledger_id:ledgerId
+  });
+
+  // Write host ledger entry
+  await _writeLedgerEntry({
+    clubId, playerId:host.host_actor_id,
+    eventType:'HOST_ACTIVE_BETTOR_CHARGE', amount:HOST_ACTIVE_BETTOR_FEE,
+    idempotencyKey:ledgerId, createdBy:'system',
+    reason:'active_bettor_fee:'+playerId+':'+weekStart,
+    metadataJson:{ playerId, weekStart, ticketId }
+  }).catch(function(e){ console.warn('[hab] ledger write error:', e.message); });
+
+  console.log('[host/active-bettor] CHARGED clubId='+clubId+' playerId='+playerId+
+    ' -'+HOST_ACTIVE_BETTOR_FEE+'d week='+weekStart+' balance='+(host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE));
+
+  return {
+    ok:true, charged:true, chargedDiamonds:HOST_ACTIVE_BETTOR_FEE,
+    ledgerEvent:'HOST_ACTIVE_BETTOR_CHARGE', weekStart, ledgerId
+  };
+}
+
+// GET /api/host/diamond-usage
+app.get('/api/host/diamond-usage', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const clubId = req._clubId || req.query.clubId;
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:true, balanceDiamonds:0, activeBettorCount:0,
+    feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE, capacityTotal:0, capacityUsed:0,
+    capacityRemaining:0, activeBettors:[], _note:'supabase_not_configured' });
+  try {
+    const weekStart = _getWeekStart();
+    const { data:balRow } = await sb.from('host_diamond_balances')
+      .select('*').eq('club_id',clubId).limit(1);
+    const balance = balRow&&balRow[0] ? parseFloat(balRow[0].balance_diamonds) : 0;
+    const { data:wab } = await sb.from('weekly_active_bettors')
+      .select('*').eq('club_id',clubId).eq('week_start',weekStart);
+    const activeBettorCount = (wab||[]).length;
+    const capacityRemaining = Math.floor(balance / HOST_ACTIVE_BETTOR_FEE);
+    res.json({ ok:true, balanceDiamonds:balance, activeBettorCount,
+      feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE,
+      capacityTotal: capacityRemaining + activeBettorCount,
+      capacityUsed:  activeBettorCount,
+      capacityRemaining,
+      activeBettors: (wab||[]).map(function(r){
+        return { playerId:r.player_id, weekStart:r.week_start,
+                 activatedAt:r.activated_at, chargedDiamonds:r.charged_diamonds };
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
+// ════════════════════════════════════════════════════════════════════════════
 // PHASE V: FRAUD/ABUSE SIGNALS
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -4709,6 +4817,16 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       }
     } catch(riskErr) {
       console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
+    }
+
+    // 2c. Phase AA: active-bettor charge check
+    const _habResult = await _processActiveBettorCharge(sb, clubId, playerId, null, Date.now());
+    if (!_habResult.ok) {
+      if (_habResult.error === 'host_diamond_balance_insufficient') {
+        return res.status(402).json({ ok:false, error:'host_diamond_balance_insufficient',
+          message:_habResult.message, balance:_habResult.balance, required:_habResult.required });
+      }
+      console.warn('[bets/place] active-bettor charge error:', _habResult.error, '— allowing bet (fail-open)');
     }
 
     // 3. Phase K: snapshot-based odds verification + server payout recalculation
