@@ -419,13 +419,21 @@ function emitEvent(type, payload, scope, requestId) {
   _evMem[cid].push(ev);
   if (_evMem[cid].length>EV_MEM_MAX) _evMem[cid].shift();
   // Persist fire-and-forget
-  try {
-    const sb=getSupabase();
-    if(sb) sb.from('event_feed').insert({
-      event_id:ev.event_id, club_id:ev.club_id, actor_id:ev.actor_id,
-      player_id:ev.player_id, type, payload_json:payload||{}
-    }).then(()=>{}).catch(()=>{});
-  } catch(_e){}
+try {
+  const sb = getSupabase();
+
+  if (sb) {
+    sb.from('event_feed').insert({
+      event_id: ev.event_id,
+      club_id: ev.club_id,
+      actor_id: ev.actor_id,
+      player_id: ev.player_id,
+      type,
+      payload_json: payload || {}
+    }).then(() => {}).catch(() => {});
+  }
+
+} catch (_e) {}
 }
 
 // GET /api/events — polling endpoint
