@@ -472,6 +472,9 @@ function _resolveWallet(symbol, network) {
 }
 
 // POST /api/crypto/deposits/create-intent
+
+const app = express();
+
 app.post('/api/crypto/deposits/create-intent', async (req, res) => {
   const actor = requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
@@ -1612,8 +1615,6 @@ async function mirrorLedgerEntry(entry) {
   }
 }
 // ─────────────────────────────────────────────────────────────────────────────
-
-const app = express();
 
 // GET /api/events — polling endpoint
 app.get('/api/events', async (req, res) => {
