@@ -2212,6 +2212,10 @@ const https = require('https');
 const ODDS_PROVIDER      = process.env.ODDS_PROVIDER || 'the_odds_api';
 const OWLS_KEY           = process.env.OWLS_INSIGHT_API_KEY || '';
 const OWLS_BASE_URL      = (process.env.OWLS_INSIGHT_BASE_URL || 'https://api.owlsinsight.com').replace(/\/$/, '');
+console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
+  ' resolved='+ODDS_PROVIDER+
+  ' hasOwlsKey='+(!!OWLS_KEY)+
+  ' hasOwlsBase='+(!!process.env.OWLS_INSIGHT_BASE_URL));
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
 const OWLS_ALTERNATES    = process.env.OWLS_INSIGHT_ALTERNATES === 'true';
 
@@ -3604,6 +3608,7 @@ function _getSuspendedMarkets(cache, nowMs) {
 // Poll live odds and atomically replace cache
 async function pollLiveOddsLoop() {
   // Provider switch: Owls Insight vs The Odds API
+  console.log('[odds-provider] selected='+ODDS_PROVIDER+' hasOwlsKey='+(!!OWLS_KEY)+' hasOddsKey='+(!!ODDS_KEY));
   if (ODDS_PROVIDER === 'owls_insight') {
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
     const start = Date.now(); const allGames = [];
