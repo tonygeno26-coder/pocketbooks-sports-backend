@@ -1202,6 +1202,67 @@ app.post('/api/admin/host-diamonds/seed', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// GET /api/host/diamond-weekly-report
+app.get('/api/host/diamond-weekly-report', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const clubId    = req._clubId || req.query.clubId;
+  const weekStart = req.query.weekStart || _getWeekStart();
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:true, weekStart, totalActiveBettors:0, totalCharges:0,
+    totalTopups:0, totalAdjustments:0, activeBettors:[], ledgerRows:[], _note:'supabase_not_configured' });
+  try {
+    // Week window
+    var weekEndD = new Date(weekStart+'T00:00:00Z');
+    weekEndD.setUTCDate(weekEndD.getUTCDate()+7);
+    var weekEnd = weekEndD.toISOString().slice(0,10);
+
+    // Active bettors for this week
+    const { data:bettors } = await sb.from('weekly_active_bettors')
+      .select('*').eq('club_id',clubId).eq('week_start',weekStart)
+      .order('activated_at',{ ascending:true });
+
+    // Ledger rows for this week
+    const { data:ledger } = await sb.from('host_diamond_ledger')
+      .select('*').eq('club_id',clubId)
+      .gte('created_at',weekStart+'T00:00:00Z')
+      .lt('created_at',weekEnd+'T00:00:00Z')
+      .order('created_at',{ ascending:true });
+
+    // Current balance
+    const { data:balRow } = await sb.from('host_diamond_balances')
+      .select('balance_diamonds').eq('club_id',clubId).limit(1);
+    const endBal = balRow&&balRow[0] ? parseFloat(balRow[0].balance_diamonds) : null;
+
+    const ll = ledger||[];
+    const totalCharges     = ll.filter(function(r){ return r.event_type.includes('CHARGE'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+    const totalTopups      = ll.filter(function(r){ return r.event_type.includes('TOPUP'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+    const totalAdjustments = ll.filter(function(r){ return r.event_type.includes('ADJUSTMENT'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+
+    res.json({ ok:true, weekStart, weekEnd, feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE,
+      endingHostBalance:endBal,
+      totalActiveBettors:(bettors||[]).length, totalCharges, totalTopups, totalAdjustments,
+      activeBettors:(bettors||[]).map(function(r){
+        return { playerId:r.player_id, firstTicketId:r.first_ticket_id,
+                 activatedAt:r.activated_at, chargedDiamonds:parseFloat(r.charged_diamonds),
+                 chargeLedgerId:r.charge_ledger_id };
+      }),
+      ledgerRows:ll.map(function(r){
+        return { eventType:r.event_type, direction:r.direction,
+                 amountDiamonds:parseFloat(r.amount_diamonds),
+                 balanceBefore:parseFloat(r.balance_before), balanceAfter:parseFloat(r.balance_after),
+                 createdAt:r.created_at, reason:r.reason||null };
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
 // GET /api/host/diamond-usage
 app.get('/api/host/diamond-usage', async (req, res) => {
   const actor = requireActor(req);
