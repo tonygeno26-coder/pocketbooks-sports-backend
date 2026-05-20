@@ -1202,6 +1202,58 @@ app.post('/api/admin/host-diamonds/seed', async (req, res) => {
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+// GET /api/host/diamond-invoice
+app.get('/api/host/diamond-invoice', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const clubId    = req._clubId || req.query.clubId;
+  const weekStart = req.query.weekStart || _getWeekStart();
+  const sb = getSupabase();
+  if (!sb) return res.json({ ok:true, invoiceId:'HDI_'+clubId+'_'+weekStart, clubId, weekStart,
+    activeBettorCount:0, totalActiveBettorCharges:0, totalTopups:0, totalAdjustments:0,
+    lineItems:[], activeBettors:[], _note:'supabase_not_configured' });
+  try {
+    var weekEndD = new Date(weekStart+'T00:00:00Z');
+    weekEndD.setUTCDate(weekEndD.getUTCDate()+7);
+    var weekEnd = weekEndD.toISOString().slice(0,10);
+    const { data:bettors } = await sb.from('weekly_active_bettors')
+      .select('*').eq('club_id',clubId).eq('week_start',weekStart).order('activated_at',{ ascending:true });
+    const { data:ledger }  = await sb.from('host_diamond_ledger')
+      .select('*').eq('club_id',clubId)
+      .gte('created_at',weekStart+'T00:00:00Z').lt('created_at',weekEnd+'T00:00:00Z')
+      .order('created_at',{ ascending:true });
+    const { data:balRow }  = await sb.from('host_diamond_balances')
+      .select('balance_diamonds').eq('club_id',clubId).limit(1);
+    const endBal = balRow&&balRow[0] ? parseFloat(balRow[0].balance_diamonds) : null;
+    const ll = ledger||[];
+    const bs = bettors||[];
+    const totalCharges = ll.filter(function(r){ return r.event_type.includes('CHARGE'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+    const totalTopups  = ll.filter(function(r){ return r.event_type.includes('TOPUP'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+    const totalAdj     = ll.filter(function(r){ return r.event_type.includes('ADJUSTMENT'); })
+      .reduce(function(s,r){ return s+parseFloat(r.amount_diamonds); },0);
+    var lineItems = [];
+    if (bs.length) lineItems.push({ description:'Active bettor fee', quantity:bs.length,
+      unitPriceDiamonds:HOST_ACTIVE_BETTOR_FEE, totalDiamonds:bs.length*HOST_ACTIVE_BETTOR_FEE });
+    if (totalTopups) lineItems.push({ description:'Diamond top-ups', quantity:1,
+      unitPriceDiamonds:totalTopups, totalDiamonds:totalTopups });
+    if (totalAdj)   lineItems.push({ description:'Adjustments', quantity:1,
+      unitPriceDiamonds:totalAdj, totalDiamonds:totalAdj });
+    res.json({ ok:true, invoiceId:'HDI_'+clubId+'_'+weekStart, clubId, weekStart, weekEnd,
+      feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE, activeBettorCount:bs.length,
+      totalActiveBettorCharges:totalCharges, totalTopups, totalAdjustments:totalAdj,
+      startingBalance:null, endingBalance:endBal,
+      lineItems,
+      activeBettors:bs.map(function(r){ return { playerId:r.player_id, firstTicketId:r.first_ticket_id,
+        activatedAt:r.activated_at, chargedDiamonds:parseFloat(r.charged_diamonds) }; }),
+      generatedAt:new Date().toISOString() });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
+
 // GET /api/host/diamond-weekly-report
 app.get('/api/host/diamond-weekly-report', async (req, res) => {
   const actor = requireActor(req);
