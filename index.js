@@ -2226,40 +2226,144 @@ const OWLS_SPORT_MAP = {
 
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 
+function _owlsMarketType(key) {
+  var k = (key||'').toLowerCase();
+  if (k==='h2h'||k==='moneyline') return 'moneyline';
+  if (k==='spreads'||k==='spread') return 'spread';
+  if (k==='totals'||k==='total')   return 'total';
+  return null;
+}
+
+// Convert decimal odds to American (if needed)
+function _toAmericanOdds(price) {
+  if (typeof price !== 'number') return price;
+  // American odds: integers typically > 100 or < -100
+  // Decimal odds: typically 1.xx to 20.xx
+  // If the absolute value is < 30 and it's not a whole number near +-100, treat as decimal
+  if (Math.abs(price) <= 30 && price > 0) {
+    // Likely decimal: convert
+    if (price >= 2) return Math.round((price - 1) * 100);
+    else            return Math.round(-100 / (price - 1));
+  }
+  return price; // already American
+}
+
 function _normalizeOwlsResponse(owlsData, sportKey) {
-  if (!owlsData || !owlsData.success || !owlsData.data) return null;
+  if (!owlsData) return null;
+  // Accept success:true OR no success field (some responses omit it)
+  if (owlsData.success === false) return null;
+
+  var rawData = owlsData.data;
+  if (!rawData) return null;
+
+  // Build flat event list — handle both shapes:
+  //   Shape A: { pinnacle:[...], fanduel:[...] }  (per-book object, docs say this)
+  //   Shape B: [...] flat array of events
+  //   Shape C: { events:[...] }
   var allEvents = []; var seen = {};
-  Object.values(owlsData.data).forEach(function(bookEvs){
-    (bookEvs||[]).forEach(function(ev){ if(!seen[ev.id]){seen[ev.id]=true;allEvents.push(ev);} });
-  });
+  function _addEv(ev) { if (ev && ev.id && !seen[ev.id]) { seen[ev.id]=true; allEvents.push(ev); } }
+
+  if (Array.isArray(rawData)) {
+    rawData.forEach(_addEv);
+  } else if (rawData.events && Array.isArray(rawData.events)) {
+    rawData.events.forEach(_addEv);
+  } else if (typeof rawData === 'object') {
+    // Per-book or any object — iterate values
+    Object.values(rawData).forEach(function(v){
+      if (Array.isArray(v)) v.forEach(_addEv);
+      else if (v && v.id) _addEv(v); // single event value
+    });
+  }
+
+  // Also handle top-level events array
+  if (!allEvents.length && Array.isArray(owlsData.events)) {
+    owlsData.events.forEach(_addEv);
+  }
+
   var games = []; var mkByCK = {}; var mkByPGI = {}; var warnings = [];
+
   allEvents.forEach(function(ev){
-    var date = ev.commence_time ? ev.commence_time.slice(0,10) : '';
-    var ck   = (ev.sport_key||sportKey||'?')+'|'+(ev.away_team||'')+'|'+(ev.home_team||'')+'|'+date;
-    var gEntry = { id:ev.id, sport_key:ev.sport_key||sportKey,
-      commence_time:ev.commence_time, home_team:ev.home_team, away_team:ev.away_team,
-      canonicalKey:ck, markets:[] };
-    (ev.bookmakers||[]).forEach(function(bm){
-      (bm.markets||[]).forEach(function(mkt){
-        var mt = mkt.key==='h2h'?'moneyline':mkt.key==='spreads'?'spread':mkt.key==='totals'?'total':null;
-        if (!mt) return;
-        if (mkt.suspended){ warnings.push('suspended:'+ev.id+':'+mkt.key); return; }
-        (mkt.outcomes||[]).forEach(function(oc){
-          var e={marketType:mt,sportsbook:bm.key,sportsbookName:bm.title,
-            teamOrSide:oc.name,odds:oc.price,lastUpdate:bm.last_update,
-            providerGameId:ev.id,canonicalKey:ck};
-          if(oc.point!=null) e.line=oc.point;
-          if(mt==='total') e.overUnder=oc.name;
-          gEntry.markets.push(e);
+    var evId   = ev.id || ev.event_id || ev.game_id;
+    var sport  = ev.sport_key || ev.sport || sportKey || '?';
+    var home   = ev.home_team  || ev.home  || ev.homeTeam  || '';
+    var away   = ev.away_team  || ev.away  || ev.awayTeam  || '';
+    var ct     = ev.commence_time || ev.start_time || ev.game_time || ev.startTime || '';
+    var date   = ct ? ct.slice(0,10) : '';
+    var ck     = sport+'|'+away+'|'+home+'|'+date;
+
+    var gEntry = { id:evId, sport_key:sport, commence_time:ct,
+      home_team:home, away_team:away, canonicalKey:ck, markets:[] };
+
+    // Bookmakers may be at ev.bookmakers, ev.books, or markets may be directly on ev
+    var bookmakerList = ev.bookmakers || ev.books || [];
+
+    // Handle markets directly on event (no bookmaker wrapper)
+    if (!bookmakerList.length && (ev.markets||ev.odds)) {
+      bookmakerList = [{ key:'owls', title:'Owls', last_update: ct, markets: ev.markets||ev.odds||[] }];
+    }
+
+    (bookmakerList).forEach(function(bm){
+      var bmKey    = bm.key || bm.id || 'owls';
+      var bmTitle  = bm.title || bm.name || bmKey;
+      var bmUpdate = bm.last_update || bm.lastUpdate || bm.updated_at || '';
+
+      // Markets may be at bm.markets, bm.odds, or bm itself may have h2h/spreads/totals keys
+      var mktList = bm.markets || bm.odds || [];
+      if (!mktList.length) {
+        // Try extracting h2h/spreads/totals from bm directly
+        ['h2h','moneyline','spreads','spread','totals','total'].forEach(function(k){
+          if (bm[k]) mktList.push({ key:k, outcomes:bm[k] });
+        });
+      }
+
+      (mktList).forEach(function(mkt){
+        var mktKey = mkt.key || mkt.type || mkt.market_key || mkt.name || '';
+        var mt = _owlsMarketType(mktKey);
+        if (!mt) {
+          console.log('[owls][normdbg] unknown market key='+JSON.stringify(mktKey)+' skipping');
+          return;
+        }
+        if (mkt.suspended || mkt.is_suspended) {
+          warnings.push('suspended:'+evId+':'+mktKey); return;
+        }
+
+        var outcomes = mkt.outcomes || mkt.selections || [];
+        if (!Array.isArray(outcomes)) {
+          // Some APIs return {home:{price,point}, away:{price,point}}
+          outcomes = Object.entries(outcomes).map(function(kv){
+            return Object.assign({ name:kv[0] }, kv[1]);
+          });
+        }
+
+        outcomes.forEach(function(oc){
+          var ocName  = oc.name  || oc.team   || oc.label || oc.selection || '';
+          var ocPrice = oc.price || oc.odds   || oc.american || oc.line    || 0;
+          var ocPoint = oc.point != null ? oc.point
+                      : oc.handicap != null ? oc.handicap
+                      : oc.spread   != null ? oc.spread   : undefined;
+
+          var americanOdds = _toAmericanOdds(parseFloat(ocPrice)||0);
+
+          var entry = { marketType:mt, sportsbook:bmKey, sportsbookName:bmTitle,
+            teamOrSide:ocName, odds:americanOdds, lastUpdate:bmUpdate,
+            providerGameId:evId, canonicalKey:ck };
+          if (ocPoint != null) entry.line = ocPoint;
+          if (mt==='total') entry.overUnder = ocName;
+          gEntry.markets.push(entry);
         });
       });
     });
+
     games.push(gEntry);
-    if(!mkByCK[ck]) mkByCK[ck]=[];
+    if (!mkByCK[ck])    mkByCK[ck]=[];
     gEntry.markets.forEach(function(m){ mkByCK[ck].push(m); });
-    if(!mkByPGI[ev.id]) mkByPGI[ev.id]=[];
-    gEntry.markets.forEach(function(m){ mkByPGI[ev.id].push(m); });
+    if (!mkByPGI[evId]) mkByPGI[evId]=[];
+    gEntry.markets.forEach(function(m){ mkByPGI[evId].push(m); });
   });
+
+  var mktCount = Object.values(mkByCK).reduce(function(s,a){ return s+a.length; },0);
+  console.log('[owls][norm] sport='+sportKey+' events='+allEvents.length+' games='+games.length+' markets='+mktCount+' warnings='+warnings.length);
+
   return { ok:true, games, marketsByCanonicalKey:mkByCK,
     marketsByProviderGameId:mkByPGI,
     sourceStatus:games.length?'live':'empty', warnings, meta:owlsData.meta||{} };
@@ -2295,8 +2399,34 @@ async function fetchOddsFromOwlsInsight(sportKey) {
           return resolve({ok:false,error:'owls_insight_http_error',status:res.statusCode});
         try {
           var data = JSON.parse(body);
+          // ─ Safe debug: log first event shape (no API key logged) ─
+          try {
+            var _debugBooks = Object.keys(data.data||{});
+            var _debugFirstBook = _debugBooks[0];
+            var _debugEvArr = _debugFirstBook ? (data.data[_debugFirstBook]||[]) : [];
+            var _debugEv  = _debugEvArr[0];
+            if (_debugEv) {
+              var _debugBm  = (_debugEv.bookmakers||[])[0];
+              var _debugMkt = (_debugBm&&_debugBm.markets||[])[0];
+              var _debugOc  = (_debugMkt&&_debugMkt.outcomes||[])[0];
+              console.log('[owls][debug] sport='+sportKey+
+                ' topKeys='+JSON.stringify(Object.keys(data.data||{})).slice(0,60)+
+                ' books='+JSON.stringify(_debugBooks).slice(0,60)+
+                ' evCount='+_debugEvArr.length+
+                ' eventKeys='+JSON.stringify(Object.keys(_debugEv)).slice(0,80)+
+                ' bmCount='+((_debugEv.bookmakers||[]).length)+
+                ' bmKeys='+JSON.stringify(Object.keys(_debugBm||{})).slice(0,60)+
+                ' mktCount='+((_debugBm&&_debugBm.markets||[]).length)+
+                ' mkt0='+JSON.stringify({key:_debugMkt&&_debugMkt.key,
+                  suspended:_debugMkt&&_debugMkt.suspended,
+                  outcomeCount:_debugMkt&&(_debugMkt.outcomes||[]).length}).slice(0,80)+
+                ' oc0='+JSON.stringify(Object.keys(_debugOc||{})).slice(0,60));
+            } else {
+              console.log('[owls][debug] sport='+sportKey+' NO EVENTS in response. topKeys='+JSON.stringify(Object.keys(data||{})));
+            }
+          } catch(_de) { console.warn('[owls][debug] log error:',_de.message); }
           resolve(_normalizeOwlsResponse(data, sportKey) || {ok:false,error:'normalize_failed'});
-        } catch(_e) { resolve({ok:false,error:'json_parse_error'}); }
+        } catch(_e) { resolve({ok:false,error:'json_parse_error',detail:_e.message}); }
       });
     });
     req.setTimeout(10000,function(){req.destroy();resolve({ok:false,error:'timeout'});});
