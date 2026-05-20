@@ -1039,6 +1039,14 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
     metadataJson:{ playerId, weekStart, ticketId }
   }).catch(function(e){ console.warn('[hab] ledger write error:', e.message); });
 
+  // Write host diamond ledger entry for the charge
+  await _writeHostDiamondLedger(sb, {
+    ledgerId, clubId, hostActorId:host.host_actor_id,
+    eventType:'HOST_ACTIVE_BETTOR_CHARGE', amount:HOST_ACTIVE_BETTOR_FEE, direction:'debit',
+    balanceBefore:host.balance_diamonds, balanceAfter:host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE,
+    createdBy:'system', reason:'active_bettor_fee:'+playerId+':'+weekStart,
+    idempotencyKey:ledgerId, metadata:{ playerId, weekStart, ticketId }
+  });
   console.log('[host/active-bettor] CHARGED clubId='+clubId+' playerId='+playerId+
     ' -'+HOST_ACTIVE_BETTOR_FEE+'d week='+weekStart+' balance='+(host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE));
 
@@ -1047,6 +1055,119 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
     ledgerEvent:'HOST_ACTIVE_BETTOR_CHARGE', weekStart, ledgerId
   };
 }
+
+// ── Host diamond ledger writer ──────────────────────────────────────────────────────────────────────────
+const VALID_HD_EVENT_TYPES = new Set([
+  'HOST_DIAMOND_TOPUP','HOST_ACTIVE_BETTOR_CHARGE',
+  'HOST_DIAMOND_ADJUSTMENT','HOST_DIAMOND_REFUND'
+]);
+
+async function _writeHostDiamondLedger(sb, params) {
+  if (!sb) return;
+  const { ledgerId, clubId, hostActorId, eventType, amount, direction,
+          balanceBefore, balanceAfter, createdBy, reason, idempotencyKey, metadata } = params;
+  try {
+    await sb.from('host_diamond_ledger').insert({
+      ledger_id:ledgerId, club_id:clubId, host_actor_id:hostActorId,
+      event_type:eventType, amount_diamonds:amount, direction,
+      balance_before:balanceBefore, balance_after:balanceAfter,
+      created_at:new Date().toISOString(), created_by:createdBy||'system',
+      reason:reason||null, idempotency_key:idempotencyKey||null,
+      metadata_json:metadata||{}
+    });
+  } catch(e) { console.warn('[hdl] ledger write error:', e.message); }
+}
+
+// POST /api/admin/host-diamonds/topup
+app.post('/api/admin/host-diamonds/topup', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { clubId, hostActorId, amountDiamonds, method, reason, idempotencyKey } = req.body||{};
+  const VALID_METHODS = new Set(['admin_credit','crypto','manual','promo','other']);
+  if (!clubId||!idempotencyKey)       return res.status(400).json({ ok:false, error:'missing_clubId_or_idempotencyKey' });
+  const amt = parseFloat(amountDiamonds);
+  if (isNaN(amt)||amt<=0)             return res.status(400).json({ ok:false, error:'invalid_amount' });
+  if (!VALID_METHODS.has(method))     return res.status(400).json({ ok:false, error:'invalid_method:'+method });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    // Idempotency check
+    const { data:idemRow } = await sb.from('host_diamond_ledger')
+      .select('ledger_id').eq('idempotency_key',idempotencyKey).limit(1);
+    if (idemRow&&idemRow[0]) return res.json({ ok:true, idempotent:true });
+
+    // Load current balance
+    const { data:balRow } = await sb.from('host_diamond_balances')
+      .select('*').eq('club_id',clubId).limit(1);
+    const host = balRow&&balRow[0];
+    const balBefore = host ? parseFloat(host.balance_diamonds) : 0;
+    const balAfter  = balBefore + amt;
+    const now = new Date().toISOString();
+    const ledgerId = idempotencyKey;
+
+    // Upsert balance
+    await sb.from('host_diamond_balances').upsert({
+      club_id:clubId, host_actor_id:hostActorId||host&&host.host_actor_id||'unknown',
+      balance_diamonds:balAfter, updated_at:now
+    },{ onConflict:'club_id' });
+
+    // Write ledger entry
+    await _writeHostDiamondLedger(sb, {
+      ledgerId, clubId, hostActorId:hostActorId||host&&host.host_actor_id||'unknown',
+      eventType:'HOST_DIAMOND_TOPUP', amount:amt, direction:'credit',
+      balanceBefore:balBefore, balanceAfter:balAfter,
+      createdBy:actor.actorId||'admin', reason:reason||null,
+      idempotencyKey, metadata:{ method }
+    });
+    _writeAuthAudit('host_diamond_topup', actor.actorId, clubId,
+      '/admin/host-diamonds/topup', { amt, method });
+    console.log('[host/topup] clubId='+clubId+' +'+amt+'d bal='+balBefore+'->'+balAfter);
+    res.json({ ok:true, clubId, balanceBefore:balBefore, balanceAfter:balAfter,
+               amountDiamonds:amt, ledgerId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/admin/host-diamonds/adjust
+app.post('/api/admin/host-diamonds/adjust', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor||{};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole!=='platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { clubId, amountDiamonds, direction, reason } = req.body||{};
+  if (!clubId||!reason||!reason.trim()) return res.status(400).json({ ok:false, error:'missing_clubId_or_reason' });
+  if (!['credit','debit'].includes(direction)) return res.status(400).json({ ok:false, error:'invalid_direction' });
+  const amt = parseFloat(amountDiamonds);
+  if (isNaN(amt)||amt<=0) return res.status(400).json({ ok:false, error:'invalid_amount' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const { data:balRow } = await sb.from('host_diamond_balances')
+      .select('*').eq('club_id',clubId).limit(1);
+    const host = balRow&&balRow[0];
+    if (!host) return res.status(404).json({ ok:false, error:'host_balance_not_found' });
+    const balBefore = parseFloat(host.balance_diamonds);
+    const balAfter  = direction==='credit' ? balBefore+amt : balBefore-amt;
+    if (balAfter < 0 && actor.platformRole!=='platform_admin')
+      return res.status(400).json({ ok:false, error:'would_go_negative', balanceBefore:balBefore, wouldBe:balAfter });
+    const now = new Date().toISOString();
+    const ledgerId = 'ADJ_'+clubId+'_'+Date.now();
+    await sb.from('host_diamond_balances')
+      .update({ balance_diamonds:balAfter, updated_at:now }).eq('club_id',clubId);
+    await _writeHostDiamondLedger(sb, {
+      ledgerId, clubId, hostActorId:host.host_actor_id,
+      eventType:'HOST_DIAMOND_ADJUSTMENT', amount:amt, direction,
+      balanceBefore:balBefore, balanceAfter:balAfter,
+      createdBy:actor.actorId||'admin', reason:reason.trim(),
+      idempotencyKey:null, metadata:{}
+    });
+    _writeAuthAudit('host_diamond_adjust', actor.actorId, clubId,
+      '/admin/host-diamonds/adjust', { amt, direction, balBefore, balAfter });
+    res.json({ ok:true, balanceBefore:balBefore, balanceAfter:balAfter, direction, ledgerId });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+// ────────────────────────────────────────────────────────────────────────────
 
 // POST /api/admin/host-diamonds/seed
 app.post('/api/admin/host-diamonds/seed', async (req, res) => {
@@ -1101,11 +1222,25 @@ app.get('/api/host/diamond-usage', async (req, res) => {
       .select('*').eq('club_id',clubId).eq('week_start',weekStart);
     const activeBettorCount = (wab||[]).length;
     const capacityRemaining = Math.floor(balance / HOST_ACTIVE_BETTOR_FEE);
+    // Recent ledger
+    const { data:recentLedger } = await sb.from('host_diamond_ledger')
+      .select('*').eq('club_id',clubId).order('created_at',{ ascending:false }).limit(10);
+    const weekIso = weekStart+'T00:00:00.000Z';
+    const ledgerAll = recentLedger||[];
+    const totalTopupsThisWeek = ledgerAll
+      .filter(function(e){ return e.event_type==='HOST_DIAMOND_TOPUP' && e.created_at>=weekIso; })
+      .reduce(function(s,e){ return s+parseFloat(e.amount_diamonds); },0);
+    const totalChargesThisWeek = ledgerAll
+      .filter(function(e){ return e.event_type==='HOST_ACTIVE_BETTOR_CHARGE' && e.created_at>=weekIso; })
+      .reduce(function(s,e){ return s+parseFloat(e.amount_diamonds); },0);
     res.json({ ok:true, balanceDiamonds:balance, activeBettorCount,
       feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE,
       capacityTotal: capacityRemaining + activeBettorCount,
       capacityUsed:  activeBettorCount,
       capacityRemaining,
+      projectedRemainingActiveBettors: capacityRemaining,
+      totalTopupsThisWeek, totalChargesThisWeek,
+      recentLedger: ledgerAll,
       activeBettors: (wab||[]).map(function(r){
         return { playerId:r.player_id, weekStart:r.week_start,
                  activatedAt:r.activated_at, chargedDiamonds:r.charged_diamonds };
