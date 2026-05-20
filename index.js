@@ -353,7 +353,8 @@ async function _runGradeCore(fakeReq, sb) {
 }
 
 // ── WORKER LOOP ───────────────────────────────────────────────────────────────────────────
-const WORKER_ID = 'worker_'+_crypto.randomBytes(4).toString('hex');
+const crypto = require('crypto');
+const WORKER_ID = 'worker_'+crypto.randomBytes(4).toString('hex');
 const WORKER_POLL_MS = parseInt(process.env.WORKER_POLL_MS)||20000; // 20s default
 
 async function _workerTick() {
