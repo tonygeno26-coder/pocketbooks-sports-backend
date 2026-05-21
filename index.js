@@ -4318,14 +4318,28 @@ function requirePermissionScoped(action, getTargetPlayerId) {
     const actor = requireActor(req);
     // Club scope: derive from token; check against body/query value (must match)
     const requestedClubId = (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
+    console.log('BACKEND_CLUB_SCOPE_CHECK'
+      + ' request.clubId='  + (requestedClubId   || '(none)')
+      + ' actor.clubId='    + (actor && actor.clubId    || '(none)')
+      + ' actor.actorId='   + (actor && actor.actorId   || '?')
+      + ' path='            + req.path);
     const scope = _checkClubScope(actor, requestedClubId);
     if (!scope.ok) {
       console.log('[auth] CLUB_SCOPE_MISMATCH actor='+(actor.actorId||'?')+
         ' actorClub='+(actor.clubId||'?')+' requestedClub='+(requestedClubId||'?')+' action='+action);
+      console.log('BACKEND_CLUB_SCOPE'
+        + ' request.clubId='   + (requestedClubId   || '(none)')
+        + ' actor.clubId='     + (actor.clubId       || '(none)')
+        + ' actor.actorId='    + (actor.actorId      || '?')
+        + ' actor.role='       + (actor.role         || '?')
+        + ' resolvedClubId='   + (actor.clubId       || '(from token)')
+        + ' path='             + req.path
+        + ' mismatch=YES');
       _writeAuthAudit('club_scope_mismatch', actor.actorId, actor.clubId, req.path,
         { requestedClubId, action, role:actor.role });
       return res.status(403).json({ ok:false, error:'club_scope_mismatch',
-        actorClubId:actor.clubId, requestedClubId, action });
+        actorClubId:actor.clubId, requestedClubId, action,
+        hint:'token_club_must_match_payload_clubId' });
     }
     // Permission check (role)
     const targetId = typeof getTargetPlayerId === 'function'
