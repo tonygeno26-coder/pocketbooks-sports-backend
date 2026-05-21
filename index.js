@@ -2219,14 +2219,42 @@ console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
 const OWLS_ALTERNATES    = process.env.OWLS_INSIGHT_ALTERNATES === 'true';
 
+// Owls Insight v1 unified-odds supported sport keys (from public docs at
+// https://owlsinsight.com/docs as of 2026-05). The unified /api/v1/{sport}/odds
+// endpoint covers: nba, ncaab, nfl, nhl, ncaaf, mlb, mma, soccer, tennis,
+// cs2, valorant, lol. Soccer/tennis carry extra market keys beyond h2h/
+// spreads/totals (handled by _owlsMarketType where safe); for the MVP we
+// only surface markets we can safely map to the existing moneyline/spread/
+// total schema. Esports + soccer/tennis can be hidden behind a feature
+// flag if you want a smaller initial slate.
 const OWLS_SPORT_MAP = {
-  basketball_nba:'nba', nba:'nba',
-  americanfootball_nfl:'nfl', nfl:'nfl',
-  icehockey_nhl:'nhl', nhl:'nhl',
-  baseball_mlb:'mlb', mlb:'mlb',
-  basketball_ncaab:'ncaab', ncaab:'ncaab',
-  americanfootball_ncaaf:'ncaaf', ncaaf:'ncaaf'
+  // Traditional US sports (already proven in production)
+  basketball_nba:'nba',                 nba:'nba',
+  americanfootball_nfl:'nfl',           nfl:'nfl',
+  icehockey_nhl:'nhl',                  nhl:'nhl',
+  baseball_mlb:'mlb',                   mlb:'mlb',
+  basketball_ncaab:'ncaab',             ncaab:'ncaab',
+  americanfootball_ncaaf:'ncaaf',       ncaaf:'ncaaf',
+  // Combat sports
+  mma_mixed_martial_arts:'mma',         mma:'mma',
+  // International — share unified h2h/spreads/totals shape
+  soccer:'soccer',
+  tennis:'tennis',
+  // Esports — same unified shape per docs
+  cs2:'cs2',                            counterstrike:'cs2',
+  valorant:'valorant',
+  lol:'lol',                            leagueoflegends:'lol'
 };
+
+// Feature flag: which Owls sports are SAFE to surface to the frontend right
+// now. Keeps the on-disk map permissive (so callers can map alias keys) but
+// the live cache poll + /api/sports listing default to the proven 6 sports.
+// Override with OWLS_SAFE_SPORTS="mlb,nba,nhl,nfl,ncaab,ncaaf,soccer,tennis"
+// to widen coverage without code changes.
+const OWLS_SAFE_SPORTS_DEFAULT = ['mlb','nba','nhl','nfl','ncaab','ncaaf'];
+const OWLS_SAFE_SPORTS = (process.env.OWLS_SAFE_SPORTS
+  ? process.env.OWLS_SAFE_SPORTS.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean)
+  : OWLS_SAFE_SPORTS_DEFAULT);
 
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 
@@ -3540,7 +3568,20 @@ requirePermission = function(action, getTargetPlayerId) {
 
 const ODDS_TOLERANCE_PTS  = 3;
 const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
-const CACHE_SPORTS = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
+// Sports the live-odds poller actually fetches. Owls polls use these keys;
+// the Odds API legacy path also accepts them. When ODDS_PROVIDER=owls_insight,
+// we expand to every sport listed in OWLS_SAFE_SPORTS (mapped to the canonical
+// Odds-API-style key for downstream consistency).
+const _CACHE_SPORTS_BASE = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
+const _CACHE_SPORT_KEY_BY_SHORT = {
+  mlb:'baseball_mlb', nba:'basketball_nba', nfl:'americanfootball_nfl',
+  nhl:'icehockey_nhl', ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf',
+  mma:'mma_mixed_martial_arts', soccer:'soccer', tennis:'tennis',
+  cs2:'cs2', valorant:'valorant', lol:'lol'
+};
+const CACHE_SPORTS = (ODDS_PROVIDER === 'owls_insight')
+  ? OWLS_SAFE_SPORTS.map(function(s){ return _CACHE_SPORT_KEY_BY_SHORT[s] || s; })
+  : _CACHE_SPORTS_BASE;
 
 function _sportPrefix(sportKey) {
   const k = (sportKey||'').toLowerCase();
@@ -4036,9 +4077,118 @@ app.get('/api/scores/:sport', async (req, res) => {
   req2.setTimeout(8000, () => { req2.destroy(); res.status(504).json({ error: 'Timeout' }); });
 });
 
+// ── Helpers: project the in-memory cache into the flat player-friendly shape ──
+// When ODDS_PROVIDER=owls_insight, the live poller stores Owls games in
+// LIVE_MARKET_CACHE.games. Each game carries a flat `markets[]` array of
+// { marketType, sportsbook, teamOrSide, odds, line } entries — NOT the
+// bookmakers->markets nesting the legacy Odds API path produces. This helper
+// folds the flat market array back into the moneyline/spreads/totals triplet
+// the frontend already consumes, preferring Pinnacle when present and falling
+// back to the first sportsbook seen for any side we haven't filled yet.
+function _isMatchingSport(gameSportKey, requestedShort, requestedFull) {
+  if (!gameSportKey) return false;
+  var g = String(gameSportKey).toLowerCase();
+  if (requestedFull && g === String(requestedFull).toLowerCase()) return true;
+  if (requestedShort && g === String(requestedShort).toLowerCase()) return true;
+  // Tolerate "baseball_mlb" vs "mlb" mismatch and sport-title casing.
+  if (requestedShort && g.indexOf('_'+String(requestedShort).toLowerCase()) >= 0) return true;
+  if (requestedShort && g.indexOf(String(requestedShort).toLowerCase()) === 0) return true;
+  return false;
+}
+
+function _projectOwlsGameToFlat(g, sportLabel) {
+  if (!g || typeof g !== 'object') return null;
+  var moneyline = [];
+  var spreads   = [];
+  var totals    = [];
+  // De-dupe per (marketType, side) preferring Pinnacle; "side" is teamOrSide.
+  var seen = {}; // key -> sportsbook chosen
+  function _pick(key, sportsbook) {
+    var cur = seen[key];
+    if (!cur) { seen[key] = sportsbook || 'unknown'; return true; }
+    // Upgrade if we get Pinnacle later (best-line proxy for our MVP)
+    if (sportsbook === 'pinnacle' && cur !== 'pinnacle') { seen[key] = 'pinnacle'; return true; }
+    return false;
+  }
+  var mkts = Array.isArray(g.markets) ? g.markets : [];
+  for (var i = 0; i < mkts.length; i++) {
+    var m = mkts[i]; if (!m) continue;
+    var mt = m.marketType; var side = m.teamOrSide; var price = m.odds;
+    if (typeof price !== 'number' || !side) continue;
+    var key = mt + '|' + side;
+    if (mt === 'moneyline') {
+      if (_pick(key, m.sportsbook)) {
+        var existing = moneyline.findIndex(function(x){ return x.team === side; });
+        var row = { team: side, odds: price };
+        if (existing >= 0) moneyline[existing] = row; else moneyline.push(row);
+      }
+    } else if (mt === 'spread') {
+      if (typeof m.line !== 'number') continue;
+      if (_pick(key, m.sportsbook)) {
+        var ex = spreads.findIndex(function(x){ return x.team === side; });
+        var rr = { team: side, line: m.line, odds: price };
+        if (ex >= 0) spreads[ex] = rr; else spreads.push(rr);
+      }
+    } else if (mt === 'total') {
+      if (typeof m.line !== 'number') continue;
+      // Owls Over/Under outcomes share a line; key by name only.
+      if (_pick(key, m.sportsbook)) {
+        var et = totals.findIndex(function(x){ return x.name === side; });
+        var rt = { name: side, line: m.line, odds: price };
+        if (et >= 0) totals[et] = rt; else totals.push(rt);
+      }
+    }
+    // team_total / first_half_* intentionally not surfaced in the MVP
+    // moneyline/spread/total triplet — they're still in LIVE_MARKET_CACHE
+    // for downstream consumers when we're ready.
+  }
+  return {
+    id:    g.id || g.providerGameId || ((g.away_team||'')+'@'+(g.home_team||'')+'@'+(g.commence_time||'')),
+    sport: sportLabel || g.sport_key || '',
+    home:  g.home_team || '',
+    away:  g.away_team || '',
+    time:  g.commence_time || null,
+    moneyline: moneyline,
+    spreads:   spreads,
+    totals:    totals
+  };
+}
+
+// Project ALL Owls cache games matching a sport key into the flat shape.
+function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
+  var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+  if (!cache || !Array.isArray(cache.games) || !cache.games.length) return [];
+  var short = String(requestedSport||'').toLowerCase();
+  var full  = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+  var out = [];
+  for (var i = 0; i < cache.games.length; i++) {
+    var g = cache.games[i];
+    if (!_isMatchingSport(g.sport_key, short, full)) continue;
+    var flat = _projectOwlsGameToFlat(g, sportLabel || short.toUpperCase());
+    if (flat && flat.home && flat.away) out.push(flat);
+  }
+  return out;
+}
+
 app.get('/api/odds/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
-  const sport = sportMap[req.params.sport] || req.params.sport;
+  const sportShort = String(req.params.sport||'').toLowerCase();
+  const sport = sportMap[sportShort] || sportShort;
+  // ── Owls Insight path: serve from the in-memory cache the poller fills.
+  if (ODDS_PROVIDER === 'owls_insight') {
+    const flat = _owlsCacheFlatGamesForSport(sportShort, sportShort.toUpperCase());
+    const cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+    res.setHeader('X-Provider',      'owls_insight');
+    res.setHeader('X-Source-Status', (cache && cache.sourceStatus) || 'unknown');
+    res.setHeader('X-Games-Count',   String(flat.length));
+    if (cache && cache.updatedAt) {
+      res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
+    }
+    console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
+    // Empty is a valid, non-error response — the frontend renders "No games available right now."
+    return res.json(flat.slice(0, 50));
+  }
+  // ── Legacy Odds API path (untouched) ────────────────────────────────────
   console.log('[odds] source=backend-proxy sport='+req.params.sport+' key_fingerprint='+(ODDS_KEY?ODDS_KEY.slice(0,4)+'...'+ODDS_KEY.slice(-4):'MISSING'));
   try {
     const games = await fetchOdds(sport);
@@ -4053,6 +4203,86 @@ app.get('/api/odds/:sport', async (req, res) => {
     }));
     res.json(formatted);
   } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
+});
+
+// ── GET /api/sports ─────────────────────────────────────────────────────────
+// Returns the list of sports the backend can currently serve, with per-sport
+// game/market counts pulled from the live cache. Used by the frontend to
+// render sport tabs dynamically and decide between "No games available" and
+// hiding the tab entirely. Provider-agnostic shape:
+//   { provider, updatedAt, sourceStatus, sports: [ { key, label, group, games,
+//     markets, sourceStatus, safe } ] }
+app.get('/api/sports', (req, res) => {
+  const cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+  const provider = ODDS_PROVIDER || 'unknown';
+  // Sport metadata table — label + group for the UI. Keys match the short
+  // names used everywhere else (mlb, nba, soccer, etc.).
+  const SPORT_META = {
+    mlb:     { label:'MLB',     group:'us-major' },
+    nba:     { label:'NBA',     group:'us-major' },
+    nfl:     { label:'NFL',     group:'us-major' },
+    nhl:     { label:'NHL',     group:'us-major' },
+    ncaab:   { label:'NCAAB',   group:'us-college' },
+    ncaaf:   { label:'NCAAF',   group:'us-college' },
+    mma:     { label:'MMA',     group:'combat' },
+    soccer:  { label:'Soccer',  group:'international' },
+    tennis:  { label:'Tennis',  group:'international' },
+    cs2:     { label:'CS2',     group:'esports' },
+    valorant:{ label:'Valorant',group:'esports' },
+    lol:     { label:'LoL',     group:'esports' }
+  };
+  // Per-sport counts: how many games + markets are in the cache right now?
+  const counts = {};
+  if (cache && Array.isArray(cache.games)) {
+    for (let i = 0; i < cache.games.length; i++) {
+      const g = cache.games[i];
+      // Map game.sport_key (e.g. "baseball_mlb") to the short key ("mlb").
+      let short = null;
+      const sk = String(g.sport_key||'').toLowerCase();
+      for (const k in _CACHE_SPORT_KEY_BY_SHORT) {
+        if (_CACHE_SPORT_KEY_BY_SHORT[k] === sk || k === sk) { short = k; break; }
+      }
+      if (!short) continue;
+      const c = counts[short] || (counts[short] = { games:0, markets:0 });
+      c.games++;
+      // Each Owls-normalized game stores its outcomes in g.markets[]; legacy
+      // Odds-API-shaped games store them under bookmakers[].markets[].outcomes
+      if (Array.isArray(g.markets) && g.markets.length) {
+        c.markets += g.markets.length;
+      } else if (Array.isArray(g.bookmakers)) {
+        for (const bm of g.bookmakers) {
+          for (const m of (bm.markets||[])) c.markets += (m.outcomes||[]).length;
+        }
+      }
+    }
+  }
+  // The set of sports we list = union of safe sports + sports actually present
+  // in the cache (so a manually-enabled tab with games still shows up).
+  const safeSet = {};
+  for (const s of OWLS_SAFE_SPORTS) safeSet[s] = true;
+  const allKeys = {};
+  for (const k in safeSet) allKeys[k] = true;
+  for (const k in counts) allKeys[k] = true;
+  const sports = Object.keys(allKeys).sort().map(function(key){
+    const meta = SPORT_META[key] || { label:key.toUpperCase(), group:'other' };
+    const c    = counts[key] || { games:0, markets:0 };
+    return {
+      key:          key,
+      label:        meta.label,
+      group:        meta.group,
+      games:        c.games,
+      markets:      c.markets,
+      sourceStatus: c.games > 0 ? (cache && cache.sourceStatus) || 'unknown' : (safeSet[key] ? 'empty' : 'inactive'),
+      safe:         !!safeSet[key]
+    };
+  });
+  res.setHeader('Cache-Control', 'public, max-age=30');
+  res.json({
+    provider:     provider,
+    updatedAt:    cache && cache.updatedAt || null,
+    sourceStatus: cache && cache.sourceStatus || 'unknown',
+    sports:       sports
+  });
 });
 
 app.get('/api/odds', async (req, res) => {
