@@ -4375,9 +4375,13 @@ function _checkPermission(actor, action, targetPlayerId) {
   if (minRank == null) return { allowed:false, reason:'unknown_action:'+action };
   const rank = _getRoleRank(actor.role);
   if (minRank === -1) {
-    const isSelf       = targetPlayerId && actor.actorId === targetPlayerId;
+    const isSelf       = targetPlayerId && String(actor.actorId) === String(targetPlayerId);
+    // owner/host can place bets as themselves (same club) — playerCapable = rank >= owner
     const isPrivileged = rank >= ROLE_RANK.full_admin;
-    if (!isSelf && !isPrivileged) return { allowed:false, reason:'not_own_account', status:403 };
+    const isPlayerCapable = rank >= ROLE_RANK.owner; // owner can place test bets
+    if (!isSelf && !isPrivileged && !isPlayerCapable) {
+      return { allowed:false, reason:'not_own_account', status:403 };
+    }
     return { allowed:true };
   }
   if (rank < minRank) {
@@ -6923,8 +6927,16 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
-  const { clubId, playerId, betType, stake, legs, payout, potentialProfit,
-          idempotencyKey, playerUsername } = req.body || {};
+  const _bodyRaw = req.body || {};
+  // If no playerId in body, use the token's actorId (owner/host placing own test bet)
+  const _actor = requireActor(req);
+  const _resolvedPlayerId = _bodyRaw.playerId || (_actor && _actor.actorId) || null;
+  const { clubId, betType, stake, legs, payout, potentialProfit,
+          idempotencyKey, playerUsername } = _bodyRaw;
+  const playerId = _resolvedPlayerId;
+  if (_actor && !_bodyRaw.playerId && _actor.actorId) {
+    console.log('TOKEN_SCOPE role='+(_actor.role||'?')+' clubId='+(_actor.clubId||'?')+' playerCapable=true playerId='+_actor.actorId+' (resolved from token)');
+  }
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   const now = new Date().toISOString();
 
