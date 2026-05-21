@@ -2232,9 +2232,21 @@ function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 
 function _owlsMarketType(key) {
   var k = (key||'').toLowerCase();
+  // Core full-game markets
   if (k==='h2h'||k==='moneyline') return 'moneyline';
   if (k==='spreads'||k==='spread') return 'spread';
   if (k==='totals'||k==='total')   return 'total';
+  // Baseball run line is a spread variant
+  if (k==='run_line'||k==='runline') return 'spread';
+  // Alternate lines map to their base canonical type (downstream can use the `line` field)
+  if (k==='alternate_spreads'||k==='alt_spreads'||k==='alternate_spread') return 'spread';
+  if (k==='alternate_totals'||k==='alt_totals'||k==='alternate_total')    return 'total';
+  // Team totals — distinct canonical so downstream can split per-team
+  if (k==='team_totals'||k==='team_total') return 'team_total';
+  // First-half markets — keep distinct so they don't pollute full-game lines
+  if (k==='first_half_spreads'||k==='first_half_spread'||k==='spreads_h1'||k==='spread_h1') return 'first_half_spread';
+  if (k==='first_half_totals' ||k==='first_half_total' ||k==='totals_h1' ||k==='total_h1')  return 'first_half_total';
+  if (k==='first_half_moneyline'||k==='first_half_h2h'||k==='h2h_h1'||k==='moneyline_h1')   return 'first_half_moneyline';
   return null;
 }
 
@@ -2285,6 +2297,9 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
   }
 
   var games = []; var mkByCK = {}; var mkByPGI = {}; var warnings = [];
+  // [owls][summary] diagnostics — temporary instrumentation for market-key coverage audit
+  var acceptedKeyCounts = {}; var skippedKeyCounts = {}; var skippedSamples = [];
+  var acceptedTotal = 0; var skippedTotal = 0;
 
   allEvents.forEach(function(ev){
     var evId   = ev.id || ev.event_id || ev.game_id;
@@ -2322,11 +2337,16 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
 
       (mktList).forEach(function(mkt){
         var mktKey = mkt.key || mkt.type || mkt.market_key || mkt.name || '';
+        var mktKeyLc = (mktKey||'').toLowerCase() || '(empty)';
         var mt = _owlsMarketType(mktKey);
         if (!mt) {
-          console.log('[owls][normdbg] unknown market key='+JSON.stringify(mktKey)+' skipping');
+          skippedTotal++;
+          skippedKeyCounts[mktKeyLc] = (skippedKeyCounts[mktKeyLc]||0)+1;
+          if (skippedSamples.length < 8 && skippedSamples.indexOf(mktKeyLc) === -1) skippedSamples.push(mktKeyLc);
           return;
         }
+        acceptedTotal++;
+        acceptedKeyCounts[mktKeyLc] = (acceptedKeyCounts[mktKeyLc]||0)+1;
         if (mkt.suspended || mkt.is_suspended) {
           warnings.push('suspended:'+evId+':'+mktKey); return;
         }
@@ -2367,6 +2387,16 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
 
   var mktCount = Object.values(mkByCK).reduce(function(s,a){ return s+a.length; },0);
   console.log('[owls][norm] sport='+sportKey+' events='+allEvents.length+' games='+games.length+' markets='+mktCount+' warnings='+warnings.length);
+  // Temporary diagnostics — audit which Owls market keys are mapped vs skipped
+  var uniqueAccepted = Object.keys(acceptedKeyCounts).sort();
+  var uniqueSkipped  = Object.keys(skippedKeyCounts).sort();
+  console.log('[owls][summary] sport='+sportKey
+    +' accepted='+acceptedTotal+' skipped='+skippedTotal
+    +' uniqueAccepted='+JSON.stringify(uniqueAccepted)
+    +' acceptedCounts='+JSON.stringify(acceptedKeyCounts)
+    +' uniqueSkipped='+JSON.stringify(uniqueSkipped)
+    +' skippedCounts='+JSON.stringify(skippedKeyCounts)
+    +' skippedSamples='+JSON.stringify(skippedSamples));
 
   return { ok:true, games, marketsByCanonicalKey:mkByCK,
     marketsByProviderGameId:mkByPGI,
