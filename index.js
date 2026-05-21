@@ -7982,6 +7982,14 @@ app.get('/api/grade/status', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
+  const _startSHA = '749a7e0'; // bump on each deploy for Railway log proof
+  console.log('\n╔══════════════════════════════════════════════════╗');
+  console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
+  console.log('╠══════════════════════════════════════════════════╣');
+  console.log('║  PORT='+PORT+'  NODE_ENV='+process.env.NODE_ENV+'  DEV_AUTH_BYPASS='+process.env.DEV_AUTH_BYPASS);
+  console.log('║  SUPABASE_URL='+(process.env.SUPABASE_URL?'set':'MISSING'));
+  console.log('║  SESSION_SECRET='+(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'dev-insecure-secret-change-in-prod' ? 'set':'MISSING/default'));
+  console.log('╚══════════════════════════════════════════════════╝\n');
   console.log(`✅ Server running on port ${PORT}`);
   // Init DB after server is bound
   initDB()
