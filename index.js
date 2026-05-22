@@ -3930,6 +3930,11 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
         if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
           // eslint-disable-next-line no-console
           console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=canonical`);
+        } else {
+          // Non-prop canonical match — same shape as the prop log so Railway
+          // grep + downstream tooling can index a single SNAPSHOT_MATCH stem.
+          // eslint-disable-next-line no-console
+          console.log(`SNAPSHOT_MATCH via=canonical marketType=${ident.marketType||'?'} canonicalMarketKey=${cmk} canonicalSelectionKey=${csk}`);
         }
       }
     } catch(dbErr) {
@@ -3952,9 +3957,16 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
         .limit(1);
       if (error) throw error;
       snap = data&&data[0]||null;
-      if (snap && ident.marketType === MARKET_TYPES.PLAYER_PROP) {
-        // eslint-disable-next-line no-console
-        console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+      if (snap) {
+        if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+          // eslint-disable-next-line no-console
+          console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+        } else {
+          // Non-prop legacy match — echoes the legacy column trio the
+          // verifier used (canonical_game_key + market_key + selection_key).
+          // eslint-disable-next-line no-console
+          console.log(`SNAPSHOT_MATCH via=legacy marketType=${ident.marketType||'?'} marketKey=${market} selectionKey=${pick}`);
+        }
       }
     } catch(dbErr) {
       console.warn('[snapshot] DB error:', dbErr.message, 'leg='+leg.pick);
