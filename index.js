@@ -7128,7 +7128,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       if (csData&&csData[0]) oddsChangePolicy = csData[0].odds_change_policy||'reject';
     } catch(_e){}
 
-    if (!body.oddsAccepted) {
+    if (!_bodyRaw.oddsAccepted) {
       // Verify all legs against odds_snapshots table
       const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
       if (payoutResult && !payoutResult.ok) {
