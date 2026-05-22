@@ -1974,6 +1974,96 @@ async function initDB() {
   console.log('[db] migrations complete');
 }
 
+// CANONICAL MARKET IDENTITY MIGRATION (priority #13)
+//
+// Adds structured columns to odds_snapshots so the priority-#11 canonical
+// lookup + priority-#12 Owls snapshot upsert can persist + retrieve player
+// props (and any future structured market type) without overloading the
+// legacy `selection_key` string.
+//
+// SQL also lives in migrations/2026-05-22_canonical_market_identity.sql
+// and is duplicated here so the backend self-migrates on Railway boot —
+// same pattern as initDB above. Statements are idempotent (ADD COLUMN IF
+// NOT EXISTS, CREATE INDEX IF NOT EXISTS) so running it on every boot is
+// safe.
+//
+// After the ALTER, we introspect information_schema.columns to confirm
+// the required columns are present and emit:
+//   ODDS_SNAPSHOTS_SCHEMA_READY columns=N
+//   ODDS_SNAPSHOTS_SCHEMA_MISSING missing=col1,col2,...
+//
+// Fail-soft: no DATABASE_URL -> log + return; the snapshot upsert's catch
+// block already handles the legacy column set.
+const CANONICAL_MARKET_IDENTITY_COLUMNS = [
+  'canonical_market_key',
+  'canonical_selection_key',
+  'market_type',
+  'provider_game_id',
+  'player_name',
+  'player_name_normalized',
+  'prop_type',
+  'prop_type_normalized',
+  'prop_side',
+  'player_team',
+];
+
+async function _migrateOddsSnapshotsSchema() {
+  if (!process.env.DATABASE_URL) {
+    console.log('ODDS_SNAPSHOTS_SCHEMA_MISSING missing=all reason=no_database_url');
+    return { ok:false, reason:'no_database_url' };
+  }
+  // ----- DDL: idempotent ALTER + CREATE INDEX -----
+  const ddl = [
+    `ALTER TABLE odds_snapshots
+       ADD COLUMN IF NOT EXISTS canonical_market_key     TEXT,
+       ADD COLUMN IF NOT EXISTS canonical_selection_key  TEXT,
+       ADD COLUMN IF NOT EXISTS market_type              TEXT,
+       ADD COLUMN IF NOT EXISTS provider_game_id         TEXT,
+       ADD COLUMN IF NOT EXISTS player_name              TEXT,
+       ADD COLUMN IF NOT EXISTS player_name_normalized   TEXT,
+       ADD COLUMN IF NOT EXISTS prop_type                TEXT,
+       ADD COLUMN IF NOT EXISTS prop_type_normalized     TEXT,
+       ADD COLUMN IF NOT EXISTS prop_side                TEXT,
+       ADD COLUMN IF NOT EXISTS player_team              TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_odds_snapshots_canonical
+       ON odds_snapshots (canonical_market_key, canonical_selection_key)`,
+  ];
+  for (const sql of ddl) {
+    try {
+      await query(sql);
+    } catch (e) {
+      // 42P01 = table doesn't exist. Some early dev envs don't have
+      // odds_snapshots yet — log and bail out gracefully.
+      const msg = (e && e.message) || '';
+      if (/relation .*odds_snapshots.* does not exist/i.test(msg) || /42P01/.test(String(e.code||''))) {
+        console.log('ODDS_SNAPSHOTS_SCHEMA_MISSING missing=all reason=table_not_found');
+        return { ok:false, reason:'table_not_found' };
+      }
+      console.error('[odds_snapshots migration] failed:', msg);
+      return { ok:false, reason:'ddl_error', error:msg };
+    }
+  }
+  // ----- Verify: information_schema.columns -----
+  const present = new Set();
+  try {
+    const r = await query(
+      `SELECT column_name FROM information_schema.columns
+         WHERE table_name = 'odds_snapshots'`
+    );
+    for (const row of (r.rows || [])) present.add(row.column_name);
+  } catch (e) {
+    console.error('[odds_snapshots migration] schema introspection failed:', e.message);
+    return { ok:false, reason:'introspect_error', error:e.message };
+  }
+  const missing = CANONICAL_MARKET_IDENTITY_COLUMNS.filter(function(c){ return !present.has(c); });
+  if (missing.length > 0) {
+    console.log('ODDS_SNAPSHOTS_SCHEMA_MISSING missing=' + missing.join(','));
+    return { ok:false, reason:'columns_missing', missing };
+  }
+  console.log('ODDS_SNAPSHOTS_SCHEMA_READY columns=' + CANONICAL_MARKET_IDENTITY_COLUMNS.length);
+  return { ok:true };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // PERMISSION ENGINE
 // Roles: owner(5) > full_admin(4) > settlement_manager(3) > risk_viewer(2) > view_only(1)
@@ -2219,42 +2309,102 @@ console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
 const OWLS_ALTERNATES    = process.env.OWLS_INSIGHT_ALTERNATES === 'true';
 
-// Owls Insight v1 unified-odds supported sport keys (from public docs at
-// https://owlsinsight.com/docs as of 2026-05). The unified /api/v1/{sport}/odds
-// endpoint covers: nba, ncaab, nfl, nhl, ncaaf, mlb, mma, soccer, tennis,
-// cs2, valorant, lol. Soccer/tennis carry extra market keys beyond h2h/
-// spreads/totals (handled by _owlsMarketType where safe); for the MVP we
-// only surface markets we can safely map to the existing moneyline/spread/
-// total schema. Esports + soccer/tennis can be hidden behind a feature
-// flag if you want a smaller initial slate.
+// Owls Insight v1 unified-odds supported sport keys. The unified
+// /api/v1/{sport}/odds endpoint covers a broader catalog than we previously
+// surfaced. Keys here map every alias we accept (Odds-API full keys + our
+// short keys) to the canonical Owls path segment. If Owls doesn't actually
+// have a feed for a key we list, the poller logs and skips it gracefully —
+// the catalog stays exposed via /api/sports so the UI can still render the
+// tab dimmed (per spec).
 const OWLS_SPORT_MAP = {
-  // Traditional US sports (already proven in production)
+  // ── US major leagues ──
   basketball_nba:'nba',                 nba:'nba',
+  basketball_wnba:'wnba',               wnba:'wnba',
   americanfootball_nfl:'nfl',           nfl:'nfl',
   icehockey_nhl:'nhl',                  nhl:'nhl',
   baseball_mlb:'mlb',                   mlb:'mlb',
+  // ── US college ──
   basketball_ncaab:'ncaab',             ncaab:'ncaab',
   americanfootball_ncaaf:'ncaaf',       ncaaf:'ncaaf',
-  // Combat sports
+  baseball_ncaa:'ncaabaseball',         ncaabaseball:'ncaabaseball',  college_baseball:'ncaabaseball',
+  // ── Combat sports ──
   mma_mixed_martial_arts:'mma',         mma:'mma',
-  // International — share unified h2h/spreads/totals shape
+  boxing_boxing:'boxing',               boxing:'boxing',
+  // ── Motorsports ──
+  nascar:'nascar',                      nascar_cup:'nascar',
+  formula1:'f1',                        f1:'f1',
+  // ── Soccer (multi-competition; all roll up to 'soccer' for unified-odds path) ──
   soccer:'soccer',
-  tennis:'tennis',
-  // Esports — same unified shape per docs
-  cs2:'cs2',                            counterstrike:'cs2',
+  soccer_epl:'soccer_epl',              epl:'soccer_epl',           premier_league:'soccer_epl',
+  soccer_uefa_champs_league:'soccer_ucl', ucl:'soccer_ucl',         champions_league:'soccer_ucl',
+  soccer_usa_mls:'soccer_mls',          mls:'soccer_mls',
+  soccer_fifa_world_cup:'soccer_worldcup', worldcup:'soccer_worldcup', world_cup:'soccer_worldcup',
+  soccer_uefa_european_championship:'soccer_euros', euros:'soccer_euros',
+  soccer_spain_la_liga:'soccer_laliga', laliga:'soccer_laliga',
+  soccer_italy_serie_a:'soccer_seriea', serie_a:'soccer_seriea',
+  soccer_germany_bundesliga:'soccer_bundesliga', bundesliga:'soccer_bundesliga',
+  soccer_france_ligue_one:'soccer_ligue1', ligue1:'soccer_ligue1',
+  // ── Other international team sports ──
+  cricket:'cricket',
+  cricket_ipl:'cricket_ipl',            ipl:'cricket_ipl',
+  cricket_international_t20:'cricket_t20', t20:'cricket_t20',
+  rugbyunion_six_nations:'rugby',       rugby_union:'rugby',     rugby:'rugby',
+  rugbyleague:'rugby_league',           rugby_league:'rugby_league', nrl:'rugby_league',
+  aussierules_afl:'afl',                afl:'afl',
+  // ── Individual sports ──
+  tennis:'tennis',                      atp:'tennis_atp',          wta:'tennis_wta',
+  tennis_atp:'tennis_atp',              tennis_wta:'tennis_wta',
+  golf_pga_championship:'golf_pga',     pga:'golf_pga',            pga_tour:'golf_pga',
+  golf_masters_tournament:'golf_pga',
+  golf_us_open:'golf_pga',              golf_the_open_championship:'golf_pga',
+  golf:'golf_pga',
+  golf_liv:'golf_liv',                  liv:'golf_liv',
+  golf_european_tour:'golf_european',
+  table_tennis:'table_tennis',          tabletennis:'table_tennis',
+  // ── Esports ──
+  cs2:'cs2',                            counterstrike:'cs2',     csgo:'cs2',
   valorant:'valorant',
-  lol:'lol',                            leagueoflegends:'lol'
+  lol:'lol',                            leagueoflegends:'lol',
+  dota2:'dota2',                        dota:'dota2',
+  rocketleague:'rocketleague',          rl:'rocketleague'
 };
 
-// Feature flag: which Owls sports are SAFE to surface to the frontend right
-// now. Keeps the on-disk map permissive (so callers can map alias keys) but
-// the live cache poll + /api/sports listing default to the proven 6 sports.
-// Override with OWLS_SAFE_SPORTS="mlb,nba,nhl,nfl,ncaab,ncaaf,soccer,tennis"
-// to widen coverage without code changes.
+// The exhaustive list of short keys this backend is willing to surface when
+// OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped).
+const OWLS_ALL_SPORTS = (function(){
+  var seen = {}, out = [];
+  Object.values(OWLS_SPORT_MAP).forEach(function(v){ if (v && !seen[v]) { seen[v]=true; out.push(v); } });
+  return out;
+})();
+
+// ── Sport enablement ──
+// OWLS_ENABLED_SPORTS controls which sports the backend polls + advertises
+// in /api/sports. Spec:
+//   - "all"                  → every sport in OWLS_ALL_SPORTS
+//   - "mlb,nba,tennis,..."  → only those sports
+//   - unset                  → legacy OWLS_SAFE_SPORTS (back-compat) or default
 const OWLS_SAFE_SPORTS_DEFAULT = ['mlb','nba','nhl','nfl','ncaab','ncaaf'];
-const OWLS_SAFE_SPORTS = (process.env.OWLS_SAFE_SPORTS
-  ? process.env.OWLS_SAFE_SPORTS.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean)
-  : OWLS_SAFE_SPORTS_DEFAULT);
+function _parseEnabledSportsEnv() {
+  var raw = (process.env.OWLS_ENABLED_SPORTS||'').trim().toLowerCase();
+  if (raw === 'all') return OWLS_ALL_SPORTS.slice();
+  if (raw)           return raw.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean);
+  // Legacy fallback — keep existing deployments working
+  if (process.env.OWLS_SAFE_SPORTS)
+    return process.env.OWLS_SAFE_SPORTS.split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean);
+  return OWLS_SAFE_SPORTS_DEFAULT.slice();
+}
+const OWLS_ENABLED_SPORTS = _parseEnabledSportsEnv();
+// Legacy alias — still referenced in a few places downstream
+const OWLS_SAFE_SPORTS = OWLS_ENABLED_SPORTS;
+// Boot-time catalog log (live/upcoming counts unknown until the live cache
+// has its first successful poll — use '?' placeholders so structured log
+// parsers don't choke on the missing numerics).
+console.log('OWLS_SPORT_CATALOG'
+  +' total='+OWLS_ALL_SPORTS.length
+  +' enabled='+OWLS_ENABLED_SPORTS.length
+  +' live=? upcoming=?'
+  +' provider=owls'
+  +' enabledList='+JSON.stringify(OWLS_ENABLED_SPORTS));
 
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 
@@ -2275,6 +2425,85 @@ function _owlsMarketType(key) {
   if (k==='first_half_spreads'||k==='first_half_spread'||k==='spreads_h1'||k==='spread_h1') return 'first_half_spread';
   if (k==='first_half_totals' ||k==='first_half_total' ||k==='totals_h1' ||k==='total_h1')  return 'first_half_total';
   if (k==='first_half_moneyline'||k==='first_half_h2h'||k==='h2h_h1'||k==='moneyline_h1')   return 'first_half_moneyline';
+  // Player props — if the key starts with player_/batter_/pitcher_/anytime
+  // we treat it as a prop and let _owlsPropType() classify the subtype.
+  if (_owlsPropType(k)) return 'player_prop';
+  return null;
+}
+
+// Map a raw Owls market key to a normalized prop subtype label that's
+// safe to surface in the UI ("Points", "Receiving Yards", etc.). Returns
+// null when the key isn't recognized as a player prop.
+//
+// We accept a generous alias set because Owls/upstream books are
+// inconsistent on the exact key string (player_pass_yds vs pass_yards vs
+// passYards). If you see a missing key in production, add it here.
+function _owlsPropType(key) {
+  var k = String(key||'').toLowerCase().replace(/[\s-]+/g,'_');
+  // ----- NBA / WNBA / NCAAB -----
+  if (k==='player_points' || k==='points' || k==='player_pts')       return 'Points';
+  if (k==='player_rebounds' || k==='rebounds' || k==='player_reb')   return 'Rebounds';
+  if (k==='player_assists'  || k==='assists'  || k==='player_ast')   return 'Assists';
+  if (k==='player_threes' || k==='threes' || k==='player_3pt'
+      || k==='player_three_pointers_made')                           return '3-Pointers Made';
+  if (k==='player_steals'  || k==='steals')                          return 'Steals';
+  if (k==='player_blocks'  || k==='blocks')                          return 'Blocks';
+  if (k==='player_turnovers' || k==='turnovers')                     return 'Turnovers';
+  if (k==='player_pra' || k==='player_points_rebounds_assists')      return 'Pts + Reb + Ast';
+  if (k==='player_pr'  || k==='player_points_rebounds')              return 'Pts + Reb';
+  if (k==='player_pa'  || k==='player_points_assists')               return 'Pts + Ast';
+  if (k==='player_ra'  || k==='player_rebounds_assists')             return 'Reb + Ast';
+  // ----- NFL / NCAAF -----
+  if (k==='player_pass_yds' || k==='player_passing_yards'
+      || k==='pass_yards' || k==='passing_yards')                    return 'Passing Yards';
+  if (k==='player_pass_tds' || k==='player_passing_tds')             return 'Passing TDs';
+  if (k==='player_pass_completions')                                 return 'Pass Completions';
+  if (k==='player_pass_attempts')                                    return 'Pass Attempts';
+  if (k==='player_pass_interceptions')                               return 'Interceptions Thrown';
+  if (k==='player_rush_yds' || k==='player_rushing_yards'
+      || k==='rush_yards' || k==='rushing_yards')                    return 'Rushing Yards';
+  if (k==='player_rush_attempts')                                    return 'Rushing Attempts';
+  if (k==='player_rush_tds')                                         return 'Rushing TDs';
+  if (k==='player_receptions' || k==='receptions')                   return 'Receptions';
+  if (k==='player_reception_yds' || k==='player_receiving_yards'
+      || k==='reception_yards' || k==='receiving_yards')             return 'Receiving Yards';
+  if (k==='player_reception_tds')                                    return 'Receiving TDs';
+  if (k==='player_anytime_td')                                       return 'Anytime TD';
+  if (k==='player_first_td')                                         return 'First TD';
+  if (k==='player_last_td')                                          return 'Last TD';
+  if (k==='player_kicking_points')                                   return 'Kicking Points';
+  if (k==='player_sacks')                                            return 'Sacks';
+  if (k==='player_tackles_assists' || k==='player_tackles')          return 'Tackles + Asts';
+  // ----- MLB -----
+  if (k==='pitcher_strikeouts' || k==='player_strikeouts')           return 'Strikeouts';
+  if (k==='pitcher_outs')                                            return 'Pitching Outs';
+  if (k==='pitcher_earned_runs')                                     return 'Earned Runs';
+  if (k==='pitcher_walks')                                           return 'Walks Allowed';
+  if (k==='pitcher_hits_allowed')                                    return 'Hits Allowed';
+  if (k==='batter_hits' || k==='player_hits')                        return 'Hits';
+  if (k==='batter_total_bases')                                      return 'Total Bases';
+  if (k==='batter_home_runs' || k==='player_home_runs')              return 'Home Runs';
+  if (k==='batter_rbis' || k==='player_rbis')                        return 'RBIs';
+  if (k==='batter_runs_scored' || k==='player_runs_scored')          return 'Runs Scored';
+  if (k==='batter_walks' || k==='player_walks')                      return 'Walks';
+  if (k==='batter_stolen_bases')                                     return 'Stolen Bases';
+  // ----- NHL -----
+  if (k==='player_goals'  || k==='goals')                            return 'Goals';
+  if (k==='player_shots'  || k==='shots' || k==='shots_on_goal')     return 'Shots on Goal';
+  if (k==='player_points_nhl')                                       return 'Points';
+  if (k==='goalie_saves'  || k==='player_saves')                     return 'Goalie Saves';
+  // ----- Soccer -----
+  if (k==='player_shots_on_target')                                  return 'Shots on Target';
+  if (k==='player_to_score')                                         return 'Anytime Goalscorer';
+  // Catch-all heuristics: anything that starts with player_/batter_/pitcher_/goalie_
+  // is treated as a prop even if the specific subtype is unknown. Better
+  // to surface than to silently drop.
+  if (/^(player|batter|pitcher|goalie)_/.test(k)) {
+    // Humanize: "player_some_thing" -> "Some Thing"
+    return k.replace(/^(player|batter|pitcher|goalie)_/, '')
+            .replace(/_/g, ' ')
+            .replace(/\b\w/g, function(c){ return c.toUpperCase(); });
+  }
   return null;
 }
 
@@ -2338,8 +2567,54 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
     var date   = ct ? ct.slice(0,10) : '';
     var ck     = sport+'|'+away+'|'+home+'|'+date;
 
+    // ── Normalize Owls event status into our 3-state model: upcoming | live | final ──
+    // Owls can express liveness as ev.status / ev.state / ev.in_play / ev.is_live / ev.completed
+    var rawEvStatus = String(ev.status || ev.state || ev.event_status || '').toLowerCase();
+    var evCompleted = ev.completed === true || ev.is_complete === true || ev.is_final === true ||
+                      /^(final|complete|completed|ended|closed|settled)$/.test(rawEvStatus);
+    var evCanceled  = ev.canceled === true || ev.cancelled === true ||
+                      /^(canceled|cancelled|abandoned|postponed)$/.test(rawEvStatus);
+    var evLive      = ev.in_play === true || ev.is_live === true || ev.live === true ||
+                      /^(live|in_play|inprogress|in_progress|started|playing)$/.test(rawEvStatus);
+    // Time-based fallback for liveness when provider didn't say
+    if (!evCompleted && !evCanceled && !evLive && ct) {
+      var ctMsNorm = new Date(ct).getTime();
+      if (!isNaN(ctMsNorm) && Date.now() >= ctMsNorm) evLive = true;
+    }
+    var gameStatus = evCompleted ? 'final' : evCanceled ? 'canceled' : evLive ? 'live' : 'upcoming';
+
+    // ── Capture scoreboard fields when the feed surfaces them. Owls' /odds
+    //    payload sometimes embeds game state under ev.score / ev.live / ev.game_state /
+    //    ev.period_info. We accept many shapes and fall through to undefined when absent.
+    var scoreObj = ev.score || ev.scores || ev.live || ev.game_state || ev.gameState || {};
+    var homeScore = ev.home_score!=null ? ev.home_score :
+                    ev.homeScore!=null  ? ev.homeScore  :
+                    scoreObj.home!=null ? scoreObj.home :
+                    scoreObj.home_score!=null ? scoreObj.home_score : null;
+    var awayScore = ev.away_score!=null ? ev.away_score :
+                    ev.awayScore!=null  ? ev.awayScore  :
+                    scoreObj.away!=null ? scoreObj.away :
+                    scoreObj.away_score!=null ? scoreObj.away_score : null;
+    var period    = ev.period || ev.quarter || scoreObj.period || scoreObj.quarter || null;
+    var clock     = ev.clock  || ev.time_remaining || scoreObj.clock || scoreObj.time_remaining || null;
+    var inning    = ev.inning || scoreObj.inning || null;
+    var inningHalf= ev.inning_half || ev.inningHalf || scoreObj.inning_half || scoreObj.half || null;
+    var outs      = ev.outs != null ? ev.outs : (scoreObj.outs!=null ? scoreObj.outs : null);
+    var basesOcc  = ev.bases || ev.bases_occupied || scoreObj.bases || scoreObj.bases_occupied || null;
+    var possession= ev.possession || scoreObj.possession || null;
+    var down      = ev.down || scoreObj.down || null;
+    var distance  = ev.distance || ev.yards_to_go || scoreObj.distance || null;
+
     var gEntry = { id:evId, sport_key:sport, commence_time:ct,
-      home_team:home, away_team:away, canonicalKey:ck, markets:[] };
+      home_team:home, away_team:away, canonicalKey:ck,
+      status:gameStatus, completed:!!evCompleted, canceled:!!evCanceled,
+      isLive:!!evLive,
+      // Scoreboard (null when the feed doesn't supply it — frontend hides empty fields)
+      homeScore: homeScore!=null ? Number(homeScore) : null,
+      awayScore: awayScore!=null ? Number(awayScore) : null,
+      period, clock, inning, inningHalf, outs, basesOccupied: basesOcc,
+      possession, down, distance,
+      markets:[] };
 
     // Bookmakers may be at ev.bookmakers, ev.books, or markets may be directly on ev
     var bookmakerList = ev.bookmakers || ev.books || [];
@@ -2375,8 +2650,15 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
         }
         acceptedTotal++;
         acceptedKeyCounts[mktKeyLc] = (acceptedKeyCounts[mktKeyLc]||0)+1;
-        if (mkt.suspended || mkt.is_suspended) {
-          warnings.push('suspended:'+evId+':'+mktKey); return;
+        // Capture market-level status from Owls (suspended/closed/active/live)
+        var rawMktStatus = String(mkt.status || mkt.state || '').toLowerCase();
+        var mktSuspended = mkt.suspended === true || mkt.is_suspended === true ||
+                           /^(suspended|paused|inactive)$/.test(rawMktStatus);
+        var mktClosed    = mkt.closed === true || mkt.is_closed === true ||
+                           /^(closed|settled|final)$/.test(rawMktStatus);
+        if (mktSuspended || mktClosed) {
+          warnings.push((mktClosed?'closed:':'suspended:')+evId+':'+mktKey);
+          return;
         }
 
         var outcomes = mkt.outcomes || mkt.selections || [];
@@ -2386,6 +2668,16 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
             return Object.assign({ name:kv[0] }, kv[1]);
           });
         }
+
+        // ----- Prop-only metadata pulled from the market level -----
+        // Player name may live at the market level ("player":"LeBron James"),
+        // on individual outcomes, or embedded in the outcome name. We collect
+        // anything we find at the market scope here so per-outcome code can
+        // fall back to it.
+        var propSubtype = (mt === 'player_prop') ? _owlsPropType(mktKey) : null;
+        var mktPlayer = mkt.player || mkt.player_name || mkt.description ||
+                        mkt.participant || mkt.athlete || null;
+        var mktTeam   = mkt.team || mkt.team_name || null;
 
         outcomes.forEach(function(oc){
           var ocName  = oc.name  || oc.team   || oc.label || oc.selection || '';
@@ -2398,9 +2690,52 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
 
           var entry = { marketType:mt, sportsbook:bmKey, sportsbookName:bmTitle,
             teamOrSide:ocName, odds:americanOdds, lastUpdate:bmUpdate,
-            providerGameId:evId, canonicalKey:ck };
+            providerGameId:evId, canonicalKey:ck,
+            // Propagate event-level status so downstream gates can decide allow/block
+            marketStatus: rawMktStatus || (evLive ? 'active' : 'active'),
+            eventStatus:  gameStatus,
+            eventCompleted: !!evCompleted,
+            eventCanceled:  !!evCanceled,
+            eventLive:      !!evLive };
           if (ocPoint != null) entry.line = ocPoint;
           if (mt==='total') entry.overUnder = ocName;
+
+          // ----- Prop-only fields -----
+          if (mt === 'player_prop') {
+            entry.marketKey = String(mktKey||'').toLowerCase();
+            entry.propType  = propSubtype || 'Other';
+            // Player name: prefer market-scope, then outcome-scope, then
+            // strip the trailing "Over/Under" so a name embedded in the
+            // outcome label ("LeBron James Over") still works.
+            var ocPlayer = oc.player || oc.player_name || oc.description ||
+                           oc.participant || oc.athlete || null;
+            var player   = mktPlayer || ocPlayer || ocName
+                             .replace(/\s*(over|under)\s*$/i, '')
+                             .trim();
+            entry.playerName = player || null;
+            entry.playerTeam = oc.team || mktTeam || null;
+            // Side: "over" / "under" / fallback to outcome name lowercased.
+            entry.overUnder = String(ocName||'').toLowerCase().indexOf('under') >= 0
+              ? 'under' : 'over';
+          }
+
+          // ----- Canonical identity stamp (priority #11 cleanup) -----
+          // Every cache outcome carries canonicalMarketKey + canonicalSelectionKey
+          // so the snapshot upsert + verifier never have to re-derive identity.
+          entry.canonicalMarketKey = _buildCanonicalMarketKey({
+            canonicalGameKey: ck,
+            marketType:       entry.marketType,
+            propType:         entry.propType,
+            team:             entry.teamOrSide,
+          });
+          entry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+            marketType: entry.marketType,
+            team:       entry.teamOrSide,
+            player:     entry.playerName,
+            side:       entry.overUnder || entry.teamOrSide,
+            line:       entry.line,
+          });
+
           gEntry.markets.push(entry);
         });
       });
@@ -2993,41 +3328,493 @@ function _snapKey(cKey, market, selection) {
   return cKey+'|'+(market||'').toLowerCase()+'|'+(selection||'').toLowerCase();
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// MARKET IDENTITY PRIMITIVES (canonical cleanup pass — see priority #11)
+// ═════════════════════════════════════════════════════════════════════════
+//
+// Goal: replace string-overloaded market/selection identity with explicit
+// structured keys. Frontend payloads keep working (compat shim below) but
+// internally we use canonicalMarketKey + canonicalSelectionKey for snapshot
+// lookup, grading, and SGP conflict detection.
+//
+// Vocabulary (every cache entry + every persisted snapshot stamps one):
+//
+//   moneyline             — full-game H2H
+//   spread                — full-game point spread
+//   total                 — full-game over/under
+//   player_prop           — single-player line (points, yards, etc.)
+//   team_total            — per-team over/under
+//   period_moneyline      — half/quarter/inning H2H
+//   period_spread         — half/quarter/inning spread
+//   period_total          — half/quarter/inning total
+//
+// Existing string keys ("first_half_spread", etc.) map onto this list via
+// _coerceMarketType() so old callers and old DB rows keep working.
+const MARKET_TYPES = Object.freeze({
+  MONEYLINE:        'moneyline',
+  SPREAD:           'spread',
+  TOTAL:            'total',
+  PLAYER_PROP:      'player_prop',
+  TEAM_TOTAL:       'team_total',
+  PERIOD_MONEYLINE: 'period_moneyline',
+  PERIOD_SPREAD:    'period_spread',
+  PERIOD_TOTAL:     'period_total',
+});
+
+// Map any legacy / alternate market label onto a MARKET_TYPES value. Returns
+// null for unknown inputs so callers can decide whether to skip or fall
+// through to the raw string (back-compat).
+function _coerceMarketType(raw) {
+  if (!raw) return null;
+  const k = String(raw).toLowerCase().trim();
+  if (k === 'moneyline' || k === 'h2h')           return MARKET_TYPES.MONEYLINE;
+  if (k === 'spread'    || k === 'spreads'
+   || k === 'run_line'  || k === 'runline'
+   || k === 'alt_spread' || k === 'alternate_spread' || k === 'alternate_spreads') return MARKET_TYPES.SPREAD;
+  if (k === 'total'     || k === 'totals'
+   || k === 'alt_total' || k === 'alternate_total' || k === 'alternate_totals') return MARKET_TYPES.TOTAL;
+  if (k === 'player_prop' || k === 'prop')         return MARKET_TYPES.PLAYER_PROP;
+  if (k === 'team_total'  || k === 'team_totals')  return MARKET_TYPES.TEAM_TOTAL;
+  if (k === 'first_half_moneyline' || k === 'h2h_h1' || k === 'moneyline_h1') return MARKET_TYPES.PERIOD_MONEYLINE;
+  if (k === 'first_half_spread'    || k === 'spreads_h1' || k === 'spread_h1') return MARKET_TYPES.PERIOD_SPREAD;
+  if (k === 'first_half_total'     || k === 'totals_h1'  || k === 'total_h1')  return MARKET_TYPES.PERIOD_TOTAL;
+  // Heuristic: anything starting with 'period_' or 'quarter_' or 'inning_'
+  // collapses to the period_* variant.
+  if (/^(period|quarter|inning|half|h1|h2|q1|q2|q3|q4)_total$/.test(k))     return MARKET_TYPES.PERIOD_TOTAL;
+  if (/^(period|quarter|inning|half|h1|h2|q1|q2|q3|q4)_spread$/.test(k))    return MARKET_TYPES.PERIOD_SPREAD;
+  if (/^(period|quarter|inning|half|h1|h2|q1|q2|q3|q4)_moneyline$/.test(k)) return MARKET_TYPES.PERIOD_MONEYLINE;
+  return null;
+}
+
+// Normalize a human player name to a stable identifier.
+//   "Jalen Brunson"        -> "jalen_brunson"
+//   "Shai Gilgeous-Alex."  -> "shai_gilgeous_alex"
+//   "O'Connor, Jamal"      -> "o_connor_jamal"
+function _normalizePlayerName(name) {
+  if (!name) return '';
+  return String(name)
+    .toLowerCase()
+    .replace(/['’\.]/g, '')           // drop apostrophes, periods
+    .replace(/[^a-z0-9]+/g, '_')      // any other run -> single underscore
+    .replace(/^_+|_+$/g, '');         // trim leading/trailing underscores
+}
+
+// Normalize a propType display label into a stable identifier.
+//   "Receiving Yards"  -> "receiving_yards"
+//   "3-Pointers Made"  -> "3_pointers_made"
+//   "Pts + Reb + Ast"  -> "pts_reb_ast"
+function _normalizePropType(label) {
+  if (!label) return '';
+  return String(label)
+    .toLowerCase()
+    .replace(/\+/g, '')
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+// Build a canonical market identity tuple for any in-cache / on-snapshot
+// market entry. Returns { canonicalMarketKey, canonicalSelectionKey }.
+//
+// canonicalMarketKey shape:
+//   game-level    : `${gameKey}|${marketType}`
+//   player_prop   : `${gameKey}|player_prop|${propType}`
+//   team_total    : `${gameKey}|team_total|${teamSlug}`
+//   period_*      : `${gameKey}|${marketType}|${periodLabel}`
+//
+// canonicalSelectionKey shape:
+//   moneyline     : team slug
+//   spread        : `${teamSlug}:${line}`
+//   total         : `${over|under}:${line}`
+//   player_prop   : `${playerNorm}:${over|under}:${line}`
+//   team_total    : `${over|under}:${line}`
+//   period_*      : same as their full-game cousins
+//
+// All inputs are tolerated as either canonical or display values — helpers
+// re-normalize so callers don't have to think about case.
+function _buildCanonicalMarketKey(input) {
+  if (!input) return null;
+  const gameKey = input.canonicalGameKey || input.gameKey || input.cKey;
+  if (!gameKey) return null;
+  const mt = _coerceMarketType(input.marketType || input.market);
+  if (!mt) return null;
+  if (mt === MARKET_TYPES.PLAYER_PROP) {
+    const propType = _normalizePropType(input.propType || '');
+    return `${gameKey}|${mt}|${propType || 'unknown'}`;
+  }
+  if (mt === MARKET_TYPES.TEAM_TOTAL) {
+    const team = _normalizePlayerName(input.team || input.teamOrSide || '');
+    return `${gameKey}|${mt}|${team || 'unknown'}`;
+  }
+  if (mt === MARKET_TYPES.PERIOD_MONEYLINE ||
+      mt === MARKET_TYPES.PERIOD_SPREAD ||
+      mt === MARKET_TYPES.PERIOD_TOTAL) {
+    const period = _normalizePropType(input.period || input.periodLabel || 'h1');
+    return `${gameKey}|${mt}|${period}`;
+  }
+  return `${gameKey}|${mt}`;
+}
+
+function _buildCanonicalSelectionKey(input) {
+  if (!input) return null;
+  const mt = _coerceMarketType(input.marketType || input.market);
+  if (!mt) return null;
+  const side = String(input.side || input.overUnder || input.teamOrSide || '').toLowerCase();
+  const line = (input.line != null && Number.isFinite(parseFloat(input.line)))
+                  ? parseFloat(input.line) : null;
+  if (mt === MARKET_TYPES.MONEYLINE || mt === MARKET_TYPES.PERIOD_MONEYLINE) {
+    return _normalizePlayerName(input.team || input.teamOrSide || input.selection || '');
+  }
+  if (mt === MARKET_TYPES.SPREAD || mt === MARKET_TYPES.PERIOD_SPREAD) {
+    const team = _normalizePlayerName(input.team || input.teamOrSide || '');
+    if (line == null || !team) return null;
+    return `${team}:${line}`;
+  }
+  if (mt === MARKET_TYPES.TOTAL || mt === MARKET_TYPES.PERIOD_TOTAL ||
+      mt === MARKET_TYPES.TEAM_TOTAL) {
+    const ou = side.indexOf('under') >= 0 ? 'under' : 'over';
+    if (line == null) return null;
+    return `${ou}:${line}`;
+  }
+  if (mt === MARKET_TYPES.PLAYER_PROP) {
+    const player = _normalizePlayerName(input.player || input.playerName || '');
+    if (!player || line == null) return null;
+    const ou = side.indexOf('under') >= 0 ? 'under' : 'over';
+    return `${player}:${ou}:${line}`;
+  }
+  return null;
+}
+
+// Normalize a legacy frontend leg payload into canonical identity. We do
+// NOT mutate the caller's object — we return a fresh structured identity
+// they can attach. Logs PROP_IDENTITY_NORMALIZED when we successfully coerce
+// a legacy prop shape (market='total' + isPlayerProp=true) into player_prop.
+//
+// Returns:
+//   {
+//     marketType,                  // MARKET_TYPES.*
+//     canonicalMarketKey,
+//     canonicalSelectionKey,
+//     legacy: { market, pick, line, isPlayerProp },
+//     warnings: […]
+//   }
+function _normalizeLegIdentity(leg) {
+  if (!leg || typeof leg !== 'object') return null;
+  const warnings = [];
+  const gameKey = leg.canonicalGameKey || leg.gameKey || leg.cKey || '';
+  if (!gameKey) return null;
+
+  let marketType = _coerceMarketType(leg.market);
+  let playerName = leg.player || leg.playerName || leg.player_name || null;
+  let propType   = leg.propType || leg.prop_type || null;
+  let side       = leg.side || leg.overUnder || null;
+  const lineRaw  = leg.line != null ? leg.line : leg.point;
+  const line     = (lineRaw != null && Number.isFinite(parseFloat(lineRaw))) ? parseFloat(lineRaw) : null;
+
+  // ----- Legacy prop shape: market='total' + isPlayerProp=true -----
+  // Frontend (priority #10) sends prop legs as market='total' with the
+  // flag below + a free-text pick like "Jalen Brunson Over 25.5 Points".
+  // Sniff it, parse out the structured identity, and upgrade.
+  if (leg.isPlayerProp || marketType === MARKET_TYPES.PLAYER_PROP) {
+    marketType = MARKET_TYPES.PLAYER_PROP;
+    const pick = String(leg.selectionLabel || leg.pick || '');
+    if (!playerName || !propType || !side) {
+      const parsed = _parseLegacyPropPick(pick);
+      playerName = playerName || parsed.playerName;
+      propType   = propType   || parsed.propType;
+      side       = side       || parsed.side;
+      // Line is rarely missing from the leg, but fall back to the parsed value.
+      if (line == null && parsed.line != null) {
+        // eslint-disable-next-line no-console
+        console.log(`PROP_IDENTITY_NORMALIZED gameKey=${gameKey} reason=parsed_line_from_label`);
+      }
+    }
+    // eslint-disable-next-line no-console
+    console.log(`PROP_IDENTITY_NORMALIZED gameKey=${gameKey} player=${_normalizePlayerName(playerName||'')} propType=${_normalizePropType(propType||'')} side=${(side||'').toLowerCase()} line=${line!=null?line:'?'} source=${leg.isPlayerProp ? 'legacy_total_flag' : 'native'}`);
+    if (!playerName) warnings.push('player_name_missing');
+    if (!propType)   warnings.push('prop_type_missing');
+    if (!side)       warnings.push('side_missing');
+    if (line == null) warnings.push('line_missing');
+  }
+
+  const canonicalMarketKey = _buildCanonicalMarketKey({
+    canonicalGameKey: gameKey,
+    marketType,
+    propType,
+    // For team_total, the team identifier may live in pick.
+    team: leg.team || leg.teamOrSide || (marketType === MARKET_TYPES.TEAM_TOTAL ? leg.pick : null),
+    period: leg.period || leg.periodLabel,
+  });
+  // Selection identity sources:
+  //   moneyline  : pick is the team
+  //   spread     : pick is the team, leg.line carries the line
+  //   total      : pick is the side ("Over"/"Under")
+  //   team_total : pick is the side
+  //   player_prop: player + side resolved above
+  const isTeamMarket =
+    marketType === MARKET_TYPES.MONEYLINE ||
+    marketType === MARKET_TYPES.SPREAD    ||
+    marketType === MARKET_TYPES.PERIOD_MONEYLINE ||
+    marketType === MARKET_TYPES.PERIOD_SPREAD;
+  const isSideMarket =
+    marketType === MARKET_TYPES.TOTAL      ||
+    marketType === MARKET_TYPES.TEAM_TOTAL ||
+    marketType === MARKET_TYPES.PERIOD_TOTAL;
+  const canonicalSelectionKey = _buildCanonicalSelectionKey({
+    marketType,
+    team:   leg.team || leg.teamOrSide || (isTeamMarket ? leg.pick : null),
+    player: playerName,
+    side:   side || (isSideMarket ? leg.pick : null),
+    line,
+  });
+
+  return {
+    marketType,
+    canonicalMarketKey,
+    canonicalSelectionKey,
+    playerName, propType, side, line, gameKey,
+    legacy: {
+      market: leg.market || null,
+      pick:   leg.pick || leg.selectionLabel || null,
+      line:   leg.line != null ? leg.line : null,
+      isPlayerProp: !!leg.isPlayerProp,
+    },
+    warnings,
+  };
+}
+
+// Parse a legacy prop pick string back into structured fields. Best-effort;
+// the frontend's PropsTab builds the label as
+//   `${playerName} ${Over|Under} ${line} ${propType}`
+// so we anchor on the Over/Under token.
+function _parseLegacyPropPick(label) {
+  const out = { playerName:null, propType:null, side:null, line:null };
+  if (!label) return out;
+  const m = String(label).match(/^(.+?)\s+(over|under)\s+([0-9.]+)\s*(.*)$/i);
+  if (!m) {
+    // Fallback: just split off trailing Over/Under and digits.
+    const m2 = String(label).match(/^(.+?)\s+(over|under)\s*$/i);
+    if (m2) {
+      out.playerName = m2[1].trim();
+      out.side       = m2[2].toLowerCase();
+    } else {
+      out.playerName = label.trim();
+    }
+    return out;
+  }
+  out.playerName = m[1].trim();
+  out.side       = m[2].toLowerCase();
+  out.line       = parseFloat(m[3]);
+  out.propType   = (m[4] || '').trim() || null;
+  return out;
+}
+
+
 // Build snapshot rows from LIVE_MARKET_CACHE and upsert into Supabase
+// Build one snapshot row from a single (entry, outcome) pair.
+//
+// Supports two cache shapes:
+//   1. Odds-API: entry = { cKey, gameId, sport, market, bookmaker,
+//        outcomes:[{name, price, point}, ...], commenceTime, ...status }
+//      — the legacy shape produced by _buildCacheFromGames.
+//   2. Owls:    entry = { canonicalKey, providerGameId, marketType,
+//        teamOrSide, odds, line?, overUnder?, propType?, playerName?,
+//        canonicalMarketKey, canonicalSelectionKey, eventStatus, ... }
+//      — flat per-outcome shape produced by _normalizeOwlsResponse.
+//
+// `outcome` is the Odds-API outcome object on path #1; `null` on path #2
+// (the entry itself IS the outcome).
+function _buildSnapshotRow(entry, outcome, opts) {
+  const now = opts.now;
+  const exp = opts.exp;
+  const provider = opts.provider;
+
+  // ----- Resolve the canonical identity tuple -----
+  // Owls entries already carry canonicalMarketKey/canonicalSelectionKey;
+  // Odds-API entries don't, so we compute them per outcome on the fly.
+  const isOwlsShape = !outcome;
+  const marketTypeRaw = isOwlsShape ? entry.marketType : entry.market;
+  const marketTypeCoerced = _coerceMarketType(marketTypeRaw) || marketTypeRaw;
+
+  const cKey = entry.cKey || entry.canonicalKey || null;
+  if (!cKey) return null;
+
+  let canonicalMarketKey, canonicalSelectionKey;
+  if (isOwlsShape) {
+    canonicalMarketKey    = entry.canonicalMarketKey || _buildCanonicalMarketKey({
+      canonicalGameKey: cKey,
+      marketType:       entry.marketType,
+      propType:         entry.propType,
+      team:             entry.teamOrSide,
+    });
+    canonicalSelectionKey = entry.canonicalSelectionKey || _buildCanonicalSelectionKey({
+      marketType: entry.marketType,
+      team:       entry.teamOrSide,
+      player:     entry.playerName,
+      side:       entry.overUnder || entry.teamOrSide,
+      line:       entry.line,
+    });
+  } else {
+    canonicalMarketKey    = _buildCanonicalMarketKey({
+      canonicalGameKey: cKey,
+      marketType:       entry.market,
+      team:             outcome.name,
+    });
+    canonicalSelectionKey = _buildCanonicalSelectionKey({
+      marketType: entry.market,
+      team:       outcome.name,
+      side:       outcome.name,
+      line:       outcome.point,
+    });
+  }
+
+  // ----- Selection key for the LEGACY column (kept for grading/back-compat) -----
+  let legacySelectionKey, legacyMarketKey, oddsAmerican, line;
+  if (isOwlsShape) {
+    // For Owls props, the legacy selection_key carries the player+side+line
+    // so old grading paths that haven't been migrated yet can still locate
+    // the row by string match.
+    if (entry.marketType === 'player_prop' && entry.playerName) {
+      const side = (entry.overUnder || '').toLowerCase();
+      const ln   = entry.line != null ? entry.line : '';
+      legacySelectionKey = `${entry.playerName} ${side} ${ln}`.trim().toLowerCase();
+    } else {
+      legacySelectionKey = String(entry.teamOrSide || '').toLowerCase();
+    }
+    legacyMarketKey = String(entry.marketType || '').toLowerCase();
+    oddsAmerican    = Math.round(entry.odds || 0);
+    line            = entry.line != null ? entry.line : null;
+  } else {
+    legacySelectionKey = String(outcome.name || '').toLowerCase();
+    legacyMarketKey    = String(entry.market || '').toLowerCase();
+    oddsAmerican       = Math.round(outcome.price || 0);
+    line               = outcome.point != null ? outcome.point : null;
+  }
+
+  const oddsDecimal = oddsAmerican > 0
+    ? Math.round((oddsAmerican / 100 + 1) * 10000) / 10000
+    : Math.round((100 / Math.abs(oddsAmerican || 1) + 1) * 10000) / 10000;
+
+  const row = {
+    snapshot_id:              cKey + '|' + legacyMarketKey + '|' + legacySelectionKey + '|' + Date.now(),
+    sport:                    entry.sport || 'unknown',
+    event_id:                 entry.gameId || entry.providerGameId || null,
+    canonical_game_key:       cKey,
+    market_key:               legacyMarketKey,
+    selection_key:            legacySelectionKey,
+    // Canonical identity columns (priority #11). Stripped by the catch
+    // below if the DB hasn't been migrated yet.
+    canonical_market_key:     canonicalMarketKey,
+    canonical_selection_key:  canonicalSelectionKey,
+    market_type:              marketTypeCoerced,
+    odds_american:            oddsAmerican,
+    odds_decimal:             oddsDecimal,
+    point_line:               line,
+    // Provider tag for analytics + the per-leg verifier preference order.
+    source:                   provider || entry.sportsbook || entry.bookmaker || 'odds-api',
+    provider_game_id:         entry.providerGameId || entry.gameId || null,
+    fetched_at:               now,
+    expires_at:               exp,
+    commence_time:            entry.commenceTime || null,
+    suspended:                entry.suspended || false,
+    event_status:             entry.gameStatus  || entry.eventStatus  || null,
+    market_status:            entry.marketStatus || null,
+    event_completed:          !!(entry.eventCompleted),
+    event_canceled:           !!(entry.eventCanceled),
+    event_live:               !!(entry.eventLive),
+  };
+
+  // ----- Player-prop identity fields when applicable -----
+  if (marketTypeCoerced === 'player_prop' && isOwlsShape) {
+    row.player_name           = entry.playerName || null;
+    row.player_name_normalized= entry.playerName ? _normalizePlayerName(entry.playerName) : null;
+    row.prop_type             = entry.propType || null;
+    row.prop_type_normalized  = entry.propType ? _normalizePropType(entry.propType) : null;
+    row.prop_side             = (entry.overUnder || '').toLowerCase() || null;
+    row.player_team           = entry.playerTeam || null;
+  }
+  return row;
+}
+
 async function _upsertOddsSnapshots() {
   const sb  = getSupabase();
   const now = new Date().toISOString();
   const exp = new Date(Date.now()+SNAPSHOT_TTL_MS).toISOString();
   const cache = LIVE_MARKET_CACHE;
-  if (!sb || !cache.gameCount) return;
+  if (!sb) {
+    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_supabase');
+    return;
+  }
+  if (!cache.gameCount) {
+    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_games_in_cache');
+    return;
+  }
+
+  const provider = ODDS_PROVIDER === 'owls_insight' ? 'owls_insight' : 'odds-api';
   const rows = [];
   Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
-    (entry.outcomes||[]).forEach(function(outcome) {
-      const sel = (outcome.name||'').toLowerCase();
-      rows.push({
-        snapshot_id:       entry.cKey+'|'+entry.market+'|'+sel+'|'+Date.now(),
-        sport:             entry.sport||'unknown',
-        event_id:          entry.gameId||null,
-        canonical_game_key:entry.cKey,
-        market_key:        entry.market,
-        selection_key:     sel,
-        odds_american:     Math.round(outcome.price||0),
-        odds_decimal:      Math.round(((outcome.price||0)>0?(outcome.price/100+1):(100/Math.abs(outcome.price||1)+1))*10000)/10000,
-        point_line:        outcome.point||null,
-        source:            entry.bookmaker||'odds-api',
-        fetched_at:        now,
-        expires_at:        exp,
-        commence_time:     entry.commenceTime||null,
-        suspended:         entry.suspended||false
+    if (!entry) return;
+    // Shape detection: Odds-API entries have an `outcomes[]` array;
+    // Owls entries don't (each entry IS a single outcome).
+    if (Array.isArray(entry.outcomes) && entry.outcomes.length > 0) {
+      // Odds-API path.
+      entry.outcomes.forEach(function(outcome) {
+        const row = _buildSnapshotRow(entry, outcome, { now, exp, provider });
+        if (row) rows.push(row);
       });
-    });
+    } else if (entry.marketType) {
+      // Owls path — entry is itself a per-outcome row from the normalizer.
+      const row = _buildSnapshotRow(entry, null, { now, exp, provider });
+      if (row) rows.push(row);
+    }
   });
-  if (!rows.length) return;
+
+  if (!rows.length) {
+    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+provider+' reason=no_rows_after_iteration cacheMarketCount='+cache.marketCount);
+    return;
+  }
+
+  console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length);
   try {
     await sb.from('odds_snapshots').upsert(rows,
       { onConflict:'canonical_game_key,market_key,selection_key' });
     console.log('[snapshot] upserted '+rows.length+' odds snapshots');
-  } catch(e) { console.warn('[snapshot] upsert error:', e.message); }
+  } catch(e) {
+    // If the DB hasn't been migrated with the new canonical columns the
+    // upsert above fails with `column "canonical_market_key" does not exist`
+    // (PG code 42703). Retry once with the legacy projection so the system
+    // keeps working until the migration runs.
+    const msg = (e && e.message) || '';
+    // Drop any column the migration hasn't applied yet. We strip the
+    // priority-#11 canonical columns AND the priority-#12 player-prop +
+    // provider columns in one pass so a single retry covers either state.
+    if (/canonical_market_key|canonical_selection_key|market_type|player_name|prop_type|prop_side|player_team|provider_game_id/.test(msg)) {
+      console.warn('[snapshot] upsert: optional columns missing on DB, falling back to legacy projection (run the migration to enable structured identity)');
+      const legacyRows = rows.map(function(r) {
+        const copy = Object.assign({}, r);
+        delete copy.canonical_market_key;
+        delete copy.canonical_selection_key;
+        delete copy.market_type;
+        delete copy.player_name;
+        delete copy.player_name_normalized;
+        delete copy.prop_type;
+        delete copy.prop_type_normalized;
+        delete copy.prop_side;
+        delete copy.player_team;
+        delete copy.provider_game_id;
+        return copy;
+      });
+      try {
+        await sb.from('odds_snapshots').upsert(legacyRows,
+          { onConflict:'canonical_game_key,market_key,selection_key' });
+        console.log('[snapshot] upserted '+legacyRows.length+' odds snapshots (legacy projection)');
+        return;
+      } catch(e2) {
+        console.warn('[snapshot] legacy upsert error:', e2.message);
+        return;
+      }
+    }
+    console.warn('[snapshot] upsert error:', msg);
+  }
 }
 
 // Phase L: fail-closed odds verification
@@ -3041,25 +3828,72 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const bypassOk = !IS_PRODUCTION || DEV_AUTH_BYPASS;
   let snap = null;
 
-  try {
-    const { data, error } = await sb.from('odds_snapshots').select('*')
-      .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pick)
-      .limit(1);
-    if (error) throw error;
-    snap = data&&data[0]||null;
-  } catch(dbErr) {
-    console.warn('[snapshot] DB error:', dbErr.message, 'leg='+leg.pick);
-    if (bypassOk) {
-      console.warn('[snapshot] DEV FALLBACK — using client odds (production would reject)');
-      return { ok:true, devFallback:true, warn:'snapshot_db_error',
-               acceptedOddsAmerican:parseInt(leg.odds,10)||0,
-               acceptedOddsDecimal:null };
+  // ----- Canonical identity (priority #11) -----
+  // Normalize the incoming leg into structured identity. For props this
+  // sniffs the legacy {market:'total', isPlayerProp:true} shape and upgrades
+  // it to {marketType:'player_prop', canonicalMarketKey, canonicalSelectionKey}.
+  const ident = _normalizeLegIdentity(leg) || {};
+  const cmk = ident.canonicalMarketKey || null;
+  const csk = ident.canonicalSelectionKey || null;
+
+  // Tier 1: canonical lookup. Skipped when we can't build a structured key
+  // (e.g. legacy leg with too little data) — we'll fall back to legacy below.
+  if (cmk && csk) {
+    try {
+      const { data, error } = await sb.from('odds_snapshots').select('*')
+        .eq('canonical_market_key',cmk)
+        .eq('canonical_selection_key',csk)
+        .limit(1);
+      if (error) throw error;
+      if (data && data[0]) {
+        snap = data[0];
+        if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+          // eslint-disable-next-line no-console
+          console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=canonical`);
+        }
+      }
+    } catch(dbErr) {
+      // 42703 = column not found. Old DB, no canonical columns. Silent
+      // fallback to legacy lookup below.
+      const msg = (dbErr && dbErr.message) || '';
+      if (!/canonical_market_key|canonical_selection_key/.test(msg)) {
+        console.warn('[snapshot] canonical lookup error:', msg);
+      }
     }
-    return { ok:false, code:'odds_service_unavailable', reason:'db_error', leg:leg.pick };
   }
 
-  // Snapshot not found
+  // Tier 2: legacy lookup by (canonical_game_key, market_key, selection_key).
+  // This is the original code path — keeps existing snapshots discoverable
+  // until the canonical columns are populated everywhere.
   if (!snap) {
+    try {
+      const { data, error } = await sb.from('odds_snapshots').select('*')
+        .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pick)
+        .limit(1);
+      if (error) throw error;
+      snap = data&&data[0]||null;
+      if (snap && ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+        // eslint-disable-next-line no-console
+        console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+      }
+    } catch(dbErr) {
+      console.warn('[snapshot] DB error:', dbErr.message, 'leg='+leg.pick);
+      if (bypassOk) {
+        console.warn('[snapshot] DEV FALLBACK — using client odds (production would reject)');
+        return { ok:true, devFallback:true, warn:'snapshot_db_error',
+                 acceptedOddsAmerican:parseInt(leg.odds,10)||0,
+                 acceptedOddsDecimal:null };
+      }
+      return { ok:false, code:'odds_service_unavailable', reason:'db_error', leg:leg.pick };
+    }
+  }
+
+  // Snapshot not found via either tier
+  if (!snap) {
+    if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+      // eslint-disable-next-line no-console
+      console.log(`PROP_SNAPSHOT_MISS gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} cmk=${cmk||'-'} csk=${csk||'-'}`);
+    }
     if (bypassOk) {
       console.warn('[snapshot] MISSING — DEV FALLBACK for', leg.pick);
       return { ok:true, devFallback:true, warn:'odds_snapshot_missing',
@@ -3079,9 +3913,14 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     const ageMs = nowMs - new Date(snap.fetched_at).getTime();
     return { ok:false, code:'odds_stale', leg:leg.pick, ageMs };
   }
-  if (state === 'suspended') return { ok:false, code:'market_closed', leg:leg.pick, reason:'suspended' };
-  if (state === 'event_started')
-    return { ok:false, code:'event_started', leg:leg.pick, commenceTime:snap.commence_time };
+  // Hard blocks — game is over or market is unavailable. Live is allowed.
+  if (state === 'final')
+    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_final' };
+  if (state === 'canceled')
+    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
+  if (state === 'suspended')
+    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
+  // 'active' and 'live' both allow placement — fall through to odds drift check below.
 
   // Odds drift check
   const submittedOdds = parseInt(leg.odds,10);
@@ -3108,15 +3947,34 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   };
 }
 
-// Classify a snapshot into a market state
+// Classify a snapshot into a market state.
+//   active        → placement allowed (covers pregame AND live)
+//   live          → placement allowed (informational subtype of active)
+//   suspended     → BLOCK (provider paused the market)
+//   final         → BLOCK (game completed/settled)
+//   canceled      → BLOCK (game canceled/postponed/abandoned)
+//   stale         → BLOCK (snapshot too old to trust)
 function _classifyMarket(snap, nowMs) {
   nowMs = nowMs||Date.now();
   if (!snap) return 'suspended';
   const ageMs = nowMs - new Date(snap.fetched_at||snap.fetchedAt).getTime();
   if (ageMs > SNAPSHOT_TTL_MS) return 'stale';
-  if (snap.suspended) return 'suspended';
+  // Hard blocks first — final/canceled/suspended come from provider, not from the clock.
+  const evStatus = String(snap.event_status||snap.eventStatus||snap.gameStatus||'').toLowerCase();
+  const mkStatus = String(snap.market_status||snap.marketStatus||'').toLowerCase();
+  if (snap.eventCompleted === true || evStatus === 'final' || evStatus === 'completed' ||
+      mkStatus === 'final' || mkStatus === 'closed' || mkStatus === 'settled')
+    return 'final';
+  if (snap.eventCanceled === true || evStatus === 'canceled' || evStatus === 'cancelled' ||
+      evStatus === 'postponed' || evStatus === 'abandoned')
+    return 'canceled';
+  if (snap.suspended === true || mkStatus === 'suspended' || mkStatus === 'paused')
+    return 'suspended';
+  // Live and pregame both allow placement.
+  if (snap.eventLive === true || evStatus === 'live' || evStatus === 'in_play' || evStatus === 'in_progress')
+    return 'live';
   const ct = snap.commence_time||snap.commenceTime;
-  if (ct) { const ms=new Date(ct).getTime(); if(!isNaN(ms)&&nowMs>=ms) return 'event_started'; }
+  if (ct) { const ms=new Date(ct).getTime(); if(!isNaN(ms)&&nowMs>=ms) return 'live'; }
   return 'active';
 }
 
@@ -3154,10 +4012,13 @@ const pollLiveOddsLoopWithSnapshots = async function() {
   await _origPoll();
   _upsertOddsSnapshots().catch(()=>{});
 };
-// Re-register poller with snapshot write
-const CACHE_POLL_INTERVAL = 30 * 1000;        // 30s poll
+// Re-register poller with snapshot write.
+// Live betting (DK-style) wants 15s refresh so price/score updates feel
+// real-time. Allow env override via LIVE_ODDS_POLL_MS for ops tuning.
+const LIVE_CACHE_POLL_INTERVAL_MS = parseInt(process.env.LIVE_ODDS_POLL_MS,10) || 15 * 1000;
+const CACHE_POLL_INTERVAL = LIVE_CACHE_POLL_INTERVAL_MS; // backwards-compat alias
 if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY))
-  setInterval(pollLiveOddsLoopWithSnapshots, CACHE_POLL_INTERVAL);
+  setInterval(pollLiveOddsLoopWithSnapshots, LIVE_CACHE_POLL_INTERVAL_MS);
 
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -3574,10 +4435,31 @@ const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
 // Odds-API-style key for downstream consistency).
 const _CACHE_SPORTS_BASE = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
 const _CACHE_SPORT_KEY_BY_SHORT = {
-  mlb:'baseball_mlb', nba:'basketball_nba', nfl:'americanfootball_nfl',
-  nhl:'icehockey_nhl', ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf',
-  mma:'mma_mixed_martial_arts', soccer:'soccer', tennis:'tennis',
-  cs2:'cs2', valorant:'valorant', lol:'lol'
+  // US major
+  mlb:'baseball_mlb', nba:'basketball_nba', wnba:'basketball_wnba',
+  nfl:'americanfootball_nfl', nhl:'icehockey_nhl',
+  // US college
+  ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf', ncaabaseball:'baseball_ncaa',
+  // Combat
+  mma:'mma_mixed_martial_arts', boxing:'boxing_boxing',
+  // Motorsports
+  nascar:'nascar', f1:'formula1',
+  // Soccer competitions — all share the unified-odds 'soccer' provider path
+  soccer:'soccer',
+  soccer_epl:'soccer_epl', soccer_ucl:'soccer_uefa_champs_league',
+  soccer_mls:'soccer_usa_mls', soccer_worldcup:'soccer_fifa_world_cup',
+  soccer_euros:'soccer_uefa_european_championship',
+  soccer_laliga:'soccer_spain_la_liga', soccer_seriea:'soccer_italy_serie_a',
+  soccer_bundesliga:'soccer_germany_bundesliga', soccer_ligue1:'soccer_france_ligue_one',
+  // Other international team
+  cricket:'cricket', cricket_ipl:'cricket_ipl', cricket_t20:'cricket_international_t20',
+  rugby:'rugbyunion_six_nations', rugby_league:'rugbyleague', afl:'aussierules_afl',
+  // Individual
+  tennis:'tennis', tennis_atp:'tennis_atp', tennis_wta:'tennis_wta',
+  golf_pga:'golf_pga_championship', golf_liv:'golf_liv', golf_european:'golf_european_tour',
+  table_tennis:'table_tennis',
+  // Esports
+  cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
 const CACHE_SPORTS = (ODDS_PROVIDER === 'owls_insight')
   ? OWLS_SAFE_SPORTS.map(function(s){ return _CACHE_SPORT_KEY_BY_SHORT[s] || s; })
@@ -3611,6 +4493,25 @@ function _makeEmptyCache() {
   };
 }
 
+// Derive 3-state game status from a normalized game record (Odds API or Owls flat).
+function _deriveGameStatus(game) {
+  if (!game) return 'upcoming';
+  // Explicit status wins
+  var s = String(game.status || game.state || game.event_status || '').toLowerCase();
+  if (game.completed === true || /^(final|complete|completed|ended|closed|settled)$/.test(s)) return 'final';
+  if (game.canceled === true || game.cancelled === true ||
+      /^(canceled|cancelled|abandoned|postponed)$/.test(s)) return 'canceled';
+  if (game.isLive === true || game.is_live === true || game.in_play === true ||
+      /^(live|in_play|inprogress|in_progress|started|playing)$/.test(s)) return 'live';
+  // Time fallback: commence_time in the past with no completion signal => live
+  var ct = game.commence_time || game.commenceTime;
+  if (ct) {
+    var ms = new Date(ct).getTime();
+    if (!isNaN(ms) && Date.now() >= ms) return 'live';
+  }
+  return 'upcoming';
+}
+
 function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
   const now = new Date().toISOString();
   if (!Array.isArray(gamesArr) || !gamesArr.length) {
@@ -3624,15 +4525,33 @@ function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
   for (const game of gamesArr) {
     const cKey   = _buildCKeyFromGame(game);
     const gameId = game.id;
+    // Compute and stamp game.status so the Live tab can filter on it
+    const gameStatus = _deriveGameStatus(game);
+    game.status     = gameStatus;
+    game.isLive     = gameStatus === 'live';
+    game.isFinal    = gameStatus === 'final';
+    game.isCanceled = gameStatus === 'canceled';
     for (const bookmaker of (game.bookmakers||[])) {
       for (const market of (bookmaker.markets||[])) {
         const mLabel   = _normalizeMarketKey(market.key);
         const mapKeyC  = cKey + '|' + mLabel;
         const mapKeyI  = gameId + '|' + mLabel;
+        // Owls/legacy may flag market-level suspended/closed
+        const mktSuspended = market.suspended === true || market.is_suspended === true;
+        const mktClosed    = market.closed === true || market.is_closed === true ||
+                             gameStatus === 'final' || gameStatus === 'canceled';
         const entry = {
           cKey, gameId, sport:game.sport_key, market:mLabel,
           bookmaker:bookmaker.key, outcomes:market.outcomes||[],
-          commenceTime:game.commence_time, suspended:false, closed:false,
+          commenceTime:game.commence_time,
+          suspended:!!mktSuspended,
+          closed:!!mktClosed,
+          // Game/event status fields so placement gates can allow live, block final
+          gameStatus:gameStatus,
+          eventCompleted:gameStatus==='final',
+          eventCanceled:gameStatus==='canceled',
+          eventLive:gameStatus==='live',
+          marketStatus: mktSuspended ? 'suspended' : mktClosed ? 'closed' : (gameStatus==='live' ? 'active' : 'active'),
           state:'open', updatedAt:now
         };
         if (!byKey[mapKeyC]) { byKey[mapKeyC]=entry; marketCount++; }
@@ -3651,19 +4570,23 @@ function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
 // Single shared cache instance — replaced atomically
 let LIVE_MARKET_CACHE = _makeEmptyCache();
 
+// Normalize a cache market entry to a placement-relevant state.
+// Live games are 'open' — we want bets on them. Only block on real market
+// problems: suspended, final, canceled, or stale cache.
 function _normalizeMarketState(entry, nowMs) {
   nowMs = nowMs || Date.now();
   if (!entry) return { state:'suspended', reason:'not_found' };
+  if (entry.eventCompleted === true || entry.gameStatus === 'final')
+    return { state:'closed', reason:'game_final' };
+  if (entry.eventCanceled === true || entry.gameStatus === 'canceled')
+    return { state:'closed', reason:'game_canceled' };
   if (entry.suspended) return { state:'suspended', reason:'provider_suspended' };
-  if (entry.closed)    return { state:'closed',    reason:'provider_closed' };
-  if (entry.commenceTime) {
-    const ct = new Date(entry.commenceTime).getTime();
-    if (!isNaN(ct) && nowMs >= ct) return { state:'closed', reason:'game_started' };
-  }
+  if (entry.closed)    return { state:'closed',    reason:'market_closed' };
   if (entry.updatedAt) {
     const age = nowMs - new Date(entry.updatedAt).getTime();
     if (age > CACHE_STALE_THRESHOLD) return { state:'stale', reason:'cache_stale', ageMs:age };
   }
+  // Pregame and live both → open
   return { state:'open', reason:'ok' };
 }
 
@@ -3682,11 +4605,21 @@ async function pollLiveOddsLoop() {
   console.log('[odds-provider] selected='+ODDS_PROVIDER+' hasOwlsKey='+(!!OWLS_KEY)+' hasOddsKey='+(!!ODDS_KEY));
   if (ODDS_PROVIDER === 'owls_insight') {
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
-    const start = Date.now(); const allGames = [];
+    const start = Date.now();
+    const allGames = [];
+    // Per-sport normalized results so we can also harvest the
+    // marketsByCanonicalKey + marketsByProviderGameId that the normalizer
+    // already built. Previously _buildCacheFromGames was called on Owls
+    // games but its bookmaker-iterating loop produces an empty market map
+    // for Owls' flat shape — so the snapshot upsert silently wrote zero
+    // rows. Now we keep the normalizer's maps and overlay them onto the
+    // freshly-built cache after the fact.
+    const owlsResults = [];
     try {
       await Promise.all(CACHE_SPORTS.map(async function(sport) {
         const result = await fetchOddsFromOwlsInsight(sport);
         if (result && result.ok && Array.isArray(result.games)) {
+          owlsResults.push(result);
           result.games.forEach(function(g){ allGames.push(g); });
         } else if (result && !result.ok) {
           console.warn('[owls] fetch error sport='+sport+': '+(result.error||'unknown'));
@@ -3694,9 +4627,64 @@ async function pollLiveOddsLoop() {
       }));
       const fetchDurationMs = Date.now()-start;
       const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+
+      // ── Owls overlay: replace the empty bookmaker-derived market maps
+      //    with the normalizer's flat per-outcome maps. _upsertOddsSnapshots
+      //    detects this shape via the lack of `outcomes[]` on each entry.
+      const overlayByCK = {};
+      const overlayByPGI = {};
+      let overlayMarketCount = 0;
+      for (const r of owlsResults) {
+        const byCK = r.marketsByCanonicalKey || {};
+        const byPGI = r.marketsByProviderGameId || {};
+        for (const ck of Object.keys(byCK)) {
+          const list = byCK[ck] || [];
+          if (!overlayByCK[ck]) overlayByCK[ck] = [];
+          for (const e of list) overlayByCK[ck].push(e);
+          overlayMarketCount += list.length;
+        }
+        for (const pgi of Object.keys(byPGI)) {
+          const list = byPGI[pgi] || [];
+          if (!overlayByPGI[pgi]) overlayByPGI[pgi] = [];
+          for (const e of list) overlayByPGI[pgi].push(e);
+        }
+      }
+
+      // Enrich each Owls entry with the game-level fields _upsertOddsSnapshots
+      // wants but the normalizer didn't stamp (commenceTime, sport_key). We
+      // index games-by-id so the per-outcome enrichment is O(N) overall.
+      const gameById = {};
+      for (const g of allGames) if (g && g.id) gameById[g.id] = g;
+      for (const ck of Object.keys(overlayByCK)) {
+        for (const e of overlayByCK[ck]) {
+          const g = e.providerGameId ? gameById[e.providerGameId] : null;
+          if (g) {
+            if (!e.commenceTime) e.commenceTime = g.commence_time || null;
+            if (!e.sport)        e.sport        = g.sport_key     || null;
+            if (!e.gameId)       e.gameId       = g.id            || null;
+            if (!e.cKey)         e.cKey         = ck;
+          }
+        }
+      }
+
+      // Overlay the maps onto the new cache. We keep newCache.games (the
+      // raw normalized game list — used by the projection layer and the
+      // Live tab) but the marketsByCanonicalKey + marketsByProviderGameId
+      // come from the normalizer.
+      newCache.marketsByCanonicalKey   = overlayByCK;
+      newCache.marketsByProviderGameId = overlayByPGI;
+      newCache.marketCount             = overlayMarketCount;
+
+      // eslint-disable-next-line no-console
+      console.log(`OWLS_CACHE_SNAPSHOTS_READY games=${newCache.gameCount} markets=${overlayMarketCount}`);
+
+      // The previous Owls path skipped the cache replace when sourceStatus
+      // wasn't 'healthy'. We preserve that behavior — but a healthy Owls
+      // run with 0 overlay markets is still better than wiping the old map,
+      // so we only swap when we actually got data.
       if (newCache.sourceStatus==='healthy') {
         LIVE_MARKET_CACHE = newCache;
-        console.log('[owls] cache updated games='+newCache.gameCount+' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
+        console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+' fetch='+fetchDurationMs+'ms');
       } else {
         console.warn('[owls] fetch returned empty — preserving previous cache');
       }
@@ -3771,22 +4759,23 @@ function buildLiveMarketMap(gamesArr, marketType) {
 }
 
 // Validate one leg vs live market map. Returns { ok, code, ... }
+// Live betting is supported: do NOT block solely because commenceTime is in the past.
+// Only block when the market or game is actually unavailable (suspended/final/canceled).
 function validateLegOdds(leg, liveMap, nowMs) {
   nowMs = nowMs || Date.now();
-  // Game started?
-  if (leg.scheduledStart) {
-    const ct = new Date(leg.scheduledStart).getTime();
-    if (!isNaN(ct) && nowMs >= ct) return { ok:false, code:'game_started', leg:leg.pick };
-  }
   // Find live market: try providerGameId first (P1), then cKey (P2)
   const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
   const liveMarket =
     (leg.providerGameId && liveMap[leg.providerGameId+'|'+mLabel]) ||
     (leg.canonicalGameKey && liveMap[leg.canonicalGameKey+'|'+mLabel]);
 
-  if (!liveMarket) return { ok:false, code:'market_closed', leg:leg.pick, reason:'not_found' };
-  if (liveMarket.suspended) return { ok:false, code:'market_closed', leg:leg.pick, reason:'suspended' };
-  if (liveMarket.closed)    return { ok:false, code:'market_closed', leg:leg.pick, reason:'closed' };
+  if (!liveMarket) return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'not_found' };
+  if (liveMarket.eventCompleted || liveMarket.gameStatus === 'final')
+    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_final' };
+  if (liveMarket.eventCanceled || liveMarket.gameStatus === 'canceled')
+    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
+  if (liveMarket.suspended) return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
+  if (liveMarket.closed)    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'closed' };
 
   // Match outcome by pick name (case-insensitive)
   const outcome = (liveMarket.outcomes||[]).find(o =>
@@ -4101,6 +5090,11 @@ function _projectOwlsGameToFlat(g, sportLabel) {
   var moneyline = [];
   var spreads   = [];
   var totals    = [];
+  // Props: one row per (player, propType, line). Each row carries both
+  // over+under odds when the feed supplies them; missing side stays null.
+  // Keyed by `propType|player|line` so a Pinnacle entry can overwrite a
+  // weaker book via the same _pick() rule.
+  var propsByKey = {};   // key -> { propType, playerName, team, line, overOdds, underOdds, marketKey, providerGameId }
   // De-dupe per (marketType, side) preferring Pinnacle; "side" is teamOrSide.
   var seen = {}; // key -> sportsbook chosen
   function _pick(key, sportsbook) {
@@ -4137,21 +5131,144 @@ function _projectOwlsGameToFlat(g, sportLabel) {
         var rt = { name: side, line: m.line, odds: price };
         if (et >= 0) totals[et] = rt; else totals.push(rt);
       }
+    } else if (mt === 'player_prop') {
+      // Only surface props that have a player name AND a numeric line.
+      // Anytime-TD / first-TD-style yes-no markets without a line are
+      // intentionally skipped for the MVP — the UI is line-based today.
+      if (!m.playerName || typeof m.line !== 'number') continue;
+      var propKey = (m.propType||'Other') + '|' +
+                    String(m.playerName).toLowerCase() + '|' + m.line;
+      var pickKey = 'prop|' + propKey + '|' + (m.overUnder||'?');
+      if (!_pick(pickKey, m.sportsbook)) continue;
+      var p = propsByKey[propKey];
+      if (!p) {
+        p = {
+          propType:       m.propType || 'Other',
+          playerName:     m.playerName,
+          team:           m.playerTeam || null,
+          line:           m.line,
+          overOdds:       null,
+          underOdds:      null,
+          marketKey:      m.marketKey || null,
+          providerGameId: m.providerGameId || null,
+        };
+        propsByKey[propKey] = p;
+      }
+      if (m.overUnder === 'under') p.underOdds = price;
+      else                          p.overOdds  = price;
     }
     // team_total / first_half_* intentionally not surfaced in the MVP
     // moneyline/spread/total triplet — they're still in LIVE_MARKET_CACHE
     // for downstream consumers when we're ready.
   }
+  // Materialize props array sorted by propType, then player.
+  var props = Object.values(propsByKey);
+  props.sort(function(a, b) {
+    if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
+    return (a.playerName||'').localeCompare(b.playerName||'');
+  });
+  // Surface game status (upcoming/live/final/canceled) so the frontend
+  // can filter the Live tab and decide whether to show a betting CTA.
+  var status = g.status || _deriveGameStatus(g);
+  var sportShort = String(sportLabel || g.sport_key || '').toLowerCase();
+  var gameStateText = _formatGameStateText(sportShort, {
+    status, period:g.period, clock:g.clock,
+    inning:g.inning, inningHalf:g.inningHalf, outs:g.outs,
+    down:g.down, distance:g.distance
+  });
   return {
     id:    g.id || g.providerGameId || ((g.away_team||'')+'@'+(g.home_team||'')+'@'+(g.commence_time||'')),
     sport: sportLabel || g.sport_key || '',
     home:  g.home_team || '',
     away:  g.away_team || '',
     time:  g.commence_time || null,
+    status: status,                   // 'upcoming' | 'live' | 'final' | 'canceled'
+    isLive: status === 'live',
+    isFinal: status === 'final',
+    isCanceled: status === 'canceled',
+    // Scoreboard — null fields when feed doesn't surface them
+    homeScore: g.homeScore != null ? g.homeScore : null,
+    awayScore: g.awayScore != null ? g.awayScore : null,
+    period:    g.period    || null,
+    clock:     g.clock     || null,
+    inning:    g.inning    || null,
+    inningHalf:g.inningHalf|| null,
+    outs:      g.outs      != null ? g.outs : null,
+    basesOccupied: g.basesOccupied || null,
+    possession:g.possession|| null,
+    down:      g.down      || null,
+    distance:  g.distance  != null ? g.distance : null,
+    gameStateText: gameStateText,
     moneyline: moneyline,
     spreads:   spreads,
-    totals:    totals
+    totals:    totals,
+    // Player props — array of { propType, playerName, team, line, overOdds,
+    // underOdds, marketKey, providerGameId }. Empty when the feed doesn't
+    // provide props for this game.
+    props:     props
   };
+}
+
+// Format a sport-aware human game-state string for the live scoreboard.
+// MLB:  "▲ 2nd 2 Outs"
+// NBA:  "Q3 4:21"
+// NFL:  "3rd & 7 • Q2 12:14"
+// NHL/Soccer/Default: "Q2 12:14" or just the clock
+function _formatGameStateText(sportShort, s) {
+  if (!s) return '';
+  if (s.status === 'final')    return 'Final';
+  if (s.status === 'canceled') return 'Canceled';
+  if (s.status !== 'live')     return '';
+  var sp = String(sportShort||'').toLowerCase();
+  if (sp.indexOf('mlb') >= 0 || sp.indexOf('baseball') >= 0) {
+    var arrow = '';
+    var half = String(s.inningHalf||'').toLowerCase();
+    if (half === 'top'    || half === 't') arrow = '▲';
+    if (half === 'bottom' || half === 'b') arrow = '▼';
+    var inn  = s.inning ? _ordinal(s.inning) : null;
+    var outs = s.outs != null ? s.outs + ' Out' + (s.outs===1?'':'s') : null;
+    return [arrow, inn, outs].filter(Boolean).join(' ');
+  }
+  if (sp.indexOf('nfl') >= 0 || sp.indexOf('football') >= 0 || sp.indexOf('ncaaf') >= 0 || sp.indexOf('ufl') >= 0) {
+    var dd = (s.down && s.distance != null) ? _ordinal(s.down)+' & '+s.distance : null;
+    var qclk = s.period ? 'Q'+s.period+(s.clock?' '+s.clock:'') : (s.clock||'');
+    return [dd, qclk].filter(Boolean).join(' • ');
+  }
+  if (sp.indexOf('nba') >= 0 || sp.indexOf('basketball') >= 0 || sp.indexOf('ncaab') >= 0) {
+    var q = s.period ? 'Q'+s.period : '';
+    return (q + (s.clock?' '+s.clock:'')).trim();
+  }
+  if (sp.indexOf('nhl') >= 0 || sp.indexOf('hockey') >= 0) {
+    var pp = s.period ? 'P'+s.period : '';
+    return (pp + (s.clock?' '+s.clock:'')).trim();
+  }
+  if (sp.indexOf('soccer') >= 0) {
+    return (s.clock ? s.clock+"'" : '');
+  }
+  return [s.period?'Q'+s.period:'', s.clock||''].filter(Boolean).join(' ').trim();
+}
+function _ordinal(n) {
+  n = parseInt(n,10); if (!n) return '';
+  var s = ['th','st','nd','rd'], v = n%100;
+  return n + (s[(v-20)%10] || s[v] || s[0]);
+}
+
+// Sort: live first (by clock proximity), then upcoming (by commence_time asc),
+// then final/canceled at the bottom. Matches DK-style home-screen ordering.
+function _compareGamesForBoard(a, b) {
+  function rank(g) {
+    if (g && g.status === 'live')     return 0;
+    if (g && g.status === 'upcoming') return 1;
+    if (g && g.status === 'final')    return 2;
+    if (g && g.status === 'canceled') return 3;
+    return 1;
+  }
+  var ra = rank(a), rb = rank(b);
+  if (ra !== rb) return ra - rb;
+  // Within same bucket, sort by commence_time ascending (oldest first for live = late game later)
+  var ta = a && a.time ? new Date(a.time).getTime() : Infinity;
+  var tb = b && b.time ? new Date(b.time).getTime() : Infinity;
+  return ta - tb;
 }
 
 // Project ALL Owls cache games matching a sport key into the flat shape.
@@ -4184,7 +5301,11 @@ app.get('/api/odds/:sport', async (req, res) => {
     if (cache && cache.updatedAt) {
       res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
     }
-    console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
+    // Sort live games first, then upcoming by commence_time, then final at the bottom.
+    flat.sort(_compareGamesForBoard);
+    console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+
+      ' live='+flat.filter(function(g){return g.status==='live';}).length+
+      ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
     // Empty is a valid, non-error response — the frontend renders "No games available right now."
     return res.json(flat.slice(0, 50));
   }
@@ -4194,59 +5315,124 @@ app.get('/api/odds/:sport', async (req, res) => {
     const games = await fetchOdds(sport);
     if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server.' }); }
     if (games && games._error) { return res.status(402).json({ error: games._message, error_code: games._error }); }
-    const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => ({
-      id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
-      home: g.home_team, away: g.away_team, time: g.commence_time,
-      spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>({team:o.name,line:o.point,odds:o.price})),
-      totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>({name:o.name,line:o.point,odds:o.price})),
-      moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>({team:o.name,odds:o.price}))
-    }));
+    const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => {
+      const status = _deriveGameStatus(g);
+      return {
+        id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
+        home: g.home_team, away: g.away_team, time: g.commence_time,
+        status, isLive: status==='live', isFinal: status==='final', isCanceled: status==='canceled',
+        // Odds API /odds doesn't include live scores — hydrate from /scores cache when present
+        homeScore: null, awayScore: null, period:null, clock:null, inning:null,
+        outs:null, basesOccupied:null, possession:null, gameStateText: status==='final'?'Final':'',
+        spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>({team:o.name,line:o.point,odds:o.price})),
+        totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>({name:o.name,line:o.point,odds:o.price})),
+        moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>({team:o.name,odds:o.price})),
+        // Legacy Odds API path doesn't currently surface props; the Owls
+        // path is the source of player props. Empty array keeps the UI
+        // contract uniform.
+        props: []
+      };
+    });
+    formatted.sort(_compareGamesForBoard);
     res.json(formatted);
   } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
 });
 
+// ── Sport catalog metadata ──────────────────────────────────────────────────
+// Every sport/competition the backend is willing to advertise. sortOrder is
+// the DK-style static fallback ordering; /api/sports re-sorts at request
+// time by (live first → upcoming → popular US → alphabetical). icon = emoji
+// fallback for clients without bundled SVGs. logoUrl points at a local asset
+// path the frontend can resolve from its public/ tree (or null = use icon).
+// sportGroup is the All Sports-screen category.
+const SPORT_META = {
+  // ── US major (1–10) ──
+  mlb:               { label:'MLB',              sportGroup:'us-major',      icon:'⚾',   logoUrl:'/sports/logos/mlb.svg',           sortOrder: 1 },
+  nba:               { label:'NBA',              sportGroup:'us-major',      icon:'🏀',   logoUrl:'/sports/logos/nba.svg',           sortOrder: 2 },
+  nfl:               { label:'NFL',              sportGroup:'us-major',      icon:'🏈',   logoUrl:'/sports/logos/nfl.svg',           sortOrder: 3 },
+  nhl:               { label:'NHL',              sportGroup:'us-major',      icon:'🏒',   logoUrl:'/sports/logos/nhl.svg',           sortOrder: 4 },
+  wnba:              { label:'WNBA',             sportGroup:'us-major',      icon:'🏀',   logoUrl:'/sports/logos/wnba.svg',          sortOrder: 5 },
+  // ── US college (11–20) ──
+  ncaab:             { label:'NCAAB',            sportGroup:'us-college',    icon:'🏀',   logoUrl:'/sports/logos/ncaa.svg',          sortOrder:11 },
+  ncaaf:             { label:'NCAAF',            sportGroup:'us-college',    icon:'🏈',   logoUrl:'/sports/logos/ncaa.svg',          sortOrder:12 },
+  ncaabaseball:      { label:'College Baseball', sportGroup:'us-college',    icon:'⚾',   logoUrl:'/sports/logos/ncaa.svg',          sortOrder:13 },
+  // ── Combat (21–30) ──
+  mma:               { label:'MMA',              sportGroup:'combat',        icon:'🥊',   logoUrl:'/sports/logos/ufc.svg',           sortOrder:21 },
+  boxing:            { label:'Boxing',           sportGroup:'combat',        icon:'🥊',   logoUrl:'/sports/logos/boxing.svg',        sortOrder:22 },
+  // ── Motorsports (31–40) ──
+  nascar:            { label:'NASCAR',           sportGroup:'motorsports',   icon:'🏁',   logoUrl:'/sports/logos/nascar.svg',        sortOrder:31 },
+  f1:                { label:'Formula 1',        sportGroup:'motorsports',   icon:'🏎',   logoUrl:'/sports/logos/f1.svg',            sortOrder:32 },
+  // ── Soccer competitions (41–60) ──
+  soccer:            { label:'Soccer',           sportGroup:'soccer',        icon:'⚽',   logoUrl:null,                              sortOrder:41 },
+  soccer_worldcup:   { label:'World Cup',        sportGroup:'soccer',        icon:'🏆',   logoUrl:'/sports/logos/worldcup.svg',      sortOrder:42 },
+  soccer_euros:      { label:'Euros',            sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/uefa-euro.svg',     sortOrder:43 },
+  soccer_ucl:        { label:'Champions League', sportGroup:'soccer',        icon:'🏆',   logoUrl:'/sports/logos/ucl.svg',           sortOrder:44 },
+  soccer_epl:        { label:'Premier League',   sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/epl.svg',           sortOrder:45 },
+  soccer_laliga:     { label:'La Liga',          sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/laliga.svg',        sortOrder:46 },
+  soccer_seriea:     { label:'Serie A',          sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/seriea.svg',        sortOrder:47 },
+  soccer_bundesliga: { label:'Bundesliga',       sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/bundesliga.svg',    sortOrder:48 },
+  soccer_ligue1:     { label:'Ligue 1',          sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/ligue1.svg',        sortOrder:49 },
+  soccer_mls:        { label:'MLS',              sportGroup:'soccer',        icon:'⚽',   logoUrl:'/sports/logos/mls.svg',           sortOrder:50 },
+  // ── Other international team (61–70) ──
+  cricket:           { label:'Cricket',          sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/cricket.svg',       sortOrder:61 },
+  cricket_ipl:       { label:'IPL',              sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/ipl.svg',           sortOrder:62 },
+  cricket_t20:       { label:'T20 Intl',         sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/cricket.svg',       sortOrder:63 },
+  rugby:             { label:'Rugby Union',      sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/rugby.svg',         sortOrder:64 },
+  rugby_league:      { label:'Rugby League',     sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/rugby.svg',         sortOrder:65 },
+  afl:               { label:'AFL',              sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/afl.svg',           sortOrder:66 },
+  // ── Individual (71–80) ──
+  tennis:            { label:'Tennis',           sportGroup:'individual',    icon:'🎾',   logoUrl:null,                              sortOrder:71 },
+  tennis_atp:        { label:'ATP',              sportGroup:'individual',    icon:'🎾',   logoUrl:'/sports/logos/atp.svg',           sortOrder:72 },
+  tennis_wta:        { label:'WTA',              sportGroup:'individual',    icon:'🎾',   logoUrl:'/sports/logos/wta.svg',           sortOrder:73 },
+  golf_pga:          { label:'PGA Tour',         sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/pga.svg',           sortOrder:74 },
+  golf_liv:          { label:'LIV Golf',         sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/liv.svg',           sortOrder:75 },
+  golf_european:     { label:'DP World Tour',    sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/european-tour.svg', sortOrder:76 },
+  table_tennis:      { label:'Table Tennis',     sportGroup:'individual',    icon:'🏓',   logoUrl:null,                              sortOrder:77 },
+  // ── Esports (81–90) ──
+  cs2:               { label:'CS2',              sportGroup:'esports',       icon:'🎮',   logoUrl:'/sports/logos/cs2.svg',           sortOrder:81 },
+  valorant:          { label:'Valorant',         sportGroup:'esports',       icon:'🎮',   logoUrl:'/sports/logos/valorant.svg',      sortOrder:82 },
+  lol:               { label:'LoL',              sportGroup:'esports',       icon:'🎮',   logoUrl:'/sports/logos/lol.svg',           sortOrder:83 },
+  dota2:             { label:'Dota 2',           sportGroup:'esports',       icon:'🎮',   logoUrl:'/sports/logos/dota2.svg',         sortOrder:84 },
+  rocketleague:      { label:'Rocket League',    sportGroup:'esports',       icon:'🚗',   logoUrl:'/sports/logos/rocketleague.svg',  sortOrder:85 }
+};
+
+// "Popular US sports" set used by the DK-style live→upcoming→popular sort.
+const _POPULAR_US_SPORTS = { mlb:1, nba:1, nfl:1, nhl:1, wnba:1, ncaab:1, ncaaf:1, mma:1, boxing:1, nascar:1, golf_pga:1 };
+
 // ── GET /api/sports ─────────────────────────────────────────────────────────
-// Returns the list of sports the backend can currently serve, with per-sport
-// game/market counts pulled from the live cache. Used by the frontend to
-// render sport tabs dynamically and decide between "No games available" and
-// hiding the tab entirely. Provider-agnostic shape:
-//   { provider, updatedAt, sourceStatus, sports: [ { key, label, group, games,
-//     markets, sourceStatus, safe } ] }
+// Returns the full sport catalog the backend is willing to advertise. The
+// frontend uses this to build sport tabs dynamically and the All Sports
+// screen. Per the sport-tabs spec:
+//   - OWLS_ENABLED_SPORTS=all       → every sport in OWLS_ALL_SPORTS appears
+//   - OWLS_ENABLED_SPORTS=<list>    → only those sports appear (enabled=true)
+//   - Sports with no current games still appear (frontend dims them) unless
+//     they are not enabled by config
+// Per-sport fields (matches spec exactly, plus a few extras for compat):
+//   { key, label, owlsKey, enabled, hasGames, liveGameCount,
+//     upcomingGameCount, icon, sortOrder, group, markets, games,
+//     finalGameCount, sourceStatus }
 app.get('/api/sports', (req, res) => {
-  const cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+  const cache    = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
   const provider = ODDS_PROVIDER || 'unknown';
-  // Sport metadata table — label + group for the UI. Keys match the short
-  // names used everywhere else (mlb, nba, soccer, etc.).
-  const SPORT_META = {
-    mlb:     { label:'MLB',     group:'us-major' },
-    nba:     { label:'NBA',     group:'us-major' },
-    nfl:     { label:'NFL',     group:'us-major' },
-    nhl:     { label:'NHL',     group:'us-major' },
-    ncaab:   { label:'NCAAB',   group:'us-college' },
-    ncaaf:   { label:'NCAAF',   group:'us-college' },
-    mma:     { label:'MMA',     group:'combat' },
-    soccer:  { label:'Soccer',  group:'international' },
-    tennis:  { label:'Tennis',  group:'international' },
-    cs2:     { label:'CS2',     group:'esports' },
-    valorant:{ label:'Valorant',group:'esports' },
-    lol:     { label:'LoL',     group:'esports' }
-  };
-  // Per-sport counts: how many games + markets are in the cache right now?
+  const nowMs    = Date.now();
+
+  // Per-sport counts pulled from cache (live, upcoming, final, total markets)
   const counts = {};
   if (cache && Array.isArray(cache.games)) {
     for (let i = 0; i < cache.games.length; i++) {
       const g = cache.games[i];
-      // Map game.sport_key (e.g. "baseball_mlb") to the short key ("mlb").
       let short = null;
       const sk = String(g.sport_key||'').toLowerCase();
       for (const k in _CACHE_SPORT_KEY_BY_SHORT) {
         if (_CACHE_SPORT_KEY_BY_SHORT[k] === sk || k === sk) { short = k; break; }
       }
       if (!short) continue;
-      const c = counts[short] || (counts[short] = { games:0, markets:0 });
+      const c = counts[short] || (counts[short] = { games:0, markets:0, live:0, upcoming:0, final:0 });
       c.games++;
-      // Each Owls-normalized game stores its outcomes in g.markets[]; legacy
-      // Odds-API-shaped games store them under bookmakers[].markets[].outcomes
+      const status = g.status || _deriveGameStatus(g);
+      if (status === 'live')          c.live++;
+      else if (status === 'upcoming') c.upcoming++;
+      else if (status === 'final')    c.final++;
       if (Array.isArray(g.markets) && g.markets.length) {
         c.markets += g.markets.length;
       } else if (Array.isArray(g.bookmakers)) {
@@ -4256,31 +5442,101 @@ app.get('/api/sports', (req, res) => {
       }
     }
   }
-  // The set of sports we list = union of safe sports + sports actually present
-  // in the cache (so a manually-enabled tab with games still shows up).
-  const safeSet = {};
-  for (const s of OWLS_SAFE_SPORTS) safeSet[s] = true;
+
+  // Catalog = enabled sports ∪ sports with cache hits. Enabled sports always
+  // appear (so the UI can dim empties); cache hits for a non-enabled sport
+  // still surface so a manually-flipped flag works without code changes.
+  const enabledSet = {};
+  for (const s of OWLS_ENABLED_SPORTS) enabledSet[s] = true;
   const allKeys = {};
-  for (const k in safeSet) allKeys[k] = true;
-  for (const k in counts) allKeys[k] = true;
-  const sports = Object.keys(allKeys).sort().map(function(key){
-    const meta = SPORT_META[key] || { label:key.toUpperCase(), group:'other' };
-    const c    = counts[key] || { games:0, markets:0 };
+  for (const k in enabledSet) allKeys[k] = true;
+  for (const k in counts)     allKeys[k] = true;
+
+  const sports = Object.keys(allKeys).map(function(key){
+    const meta = SPORT_META[key] || {
+      label: key.toUpperCase().replace(/_/g,' '),
+      sportGroup: 'other',
+      icon: '🏆',
+      logoUrl: null,
+      sortOrder: 99
+    };
+    const c    = counts[key] || { games:0, markets:0, live:0, upcoming:0, final:0 };
+    const owlsKey = OWLS_SPORT_MAP[key] || OWLS_SPORT_MAP[_CACHE_SPORT_KEY_BY_SHORT[key]||''] || null;
     return {
-      key:          key,
-      label:        meta.label,
-      group:        meta.group,
-      games:        c.games,
-      markets:      c.markets,
-      sourceStatus: c.games > 0 ? (cache && cache.sourceStatus) || 'unknown' : (safeSet[key] ? 'empty' : 'inactive'),
-      safe:         !!safeSet[key]
+      key:               key,
+      label:             meta.label,
+      owlsKey:           owlsKey,
+      sportGroup:        meta.sportGroup || meta.group || 'other',
+      icon:              meta.icon || null,
+      logoUrl:           meta.logoUrl || null,
+      enabled:           !!enabledSet[key],
+      hasGames:          c.games > 0,
+      liveGameCount:     c.live,
+      upcomingGameCount: c.upcoming,
+      totalGameCount:    c.games,
+      sortOrder:         meta.sortOrder != null ? meta.sortOrder : 99,
+      // ─ Back-compat shims (older clients reading group/games/markets) ─
+      group:             meta.sportGroup || meta.group || 'other',
+      games:             c.games,
+      markets:           c.markets,
+      finalGameCount:    c.final,
+      sourceStatus:      c.games > 0 ? (cache && cache.sourceStatus) || 'unknown'
+                                     : (enabledSet[key] ? 'empty' : 'inactive')
     };
   });
-  res.setHeader('Cache-Control', 'public, max-age=30');
+
+  // DK-style smart ordering:
+  //   1) sports with LIVE games first (by liveGameCount desc)
+  //   2) then sports with UPCOMING games (by upcomingGameCount desc)
+  //   3) then popular US sports (alphabetical within tier)
+  //   4) then everything else alphabetical
+  // Tie-breaker inside each tier: static sortOrder, then label.
+  sports.sort(function(a, b){
+    function tier(s){
+      if (s.liveGameCount > 0)           return 0;
+      if (s.upcomingGameCount > 0)       return 1;
+      if (_POPULAR_US_SPORTS[s.key])     return 2;
+      return 3;
+    }
+    const ta = tier(a), tb = tier(b);
+    if (ta !== tb) return ta - tb;
+    // Within "live" tier, more live games first
+    if (ta === 0 && a.liveGameCount !== b.liveGameCount)
+      return b.liveGameCount - a.liveGameCount;
+    // Within "upcoming" tier, more upcoming games first
+    if (ta === 1 && a.upcomingGameCount !== b.upcomingGameCount)
+      return b.upcomingGameCount - a.upcomingGameCount;
+    // "Popular" + "other" tiers: static sortOrder then label
+    if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+    return a.label < b.label ? -1 : a.label > b.label ? 1 : 0;
+  });
+
+  // Telemetry: visible = enabled+hasGames, dimmed = enabled+!hasGames,
+  // hidden = !enabled (came in only because cache had something).
+  let visible = 0, dimmed = 0, hidden = 0, totalLive = 0, totalUpcoming = 0;
+  for (const s of sports) {
+    totalLive     += s.liveGameCount;
+    totalUpcoming += s.upcomingGameCount;
+    if (!s.enabled)      hidden++;
+    else if (s.hasGames) visible++;
+    else                 dimmed++;
+  }
+  console.log('OWLS_SPORT_CATALOG'
+    +' total='+sports.length
+    +' enabled='+OWLS_ENABLED_SPORTS.length
+    +' live='+totalLive
+    +' upcoming='+totalUpcoming);
+  console.log('SPORT_ICON_RENDER visible='+visible+' dimmed='+dimmed+' hidden='+hidden);
+
+  res.setHeader('Cache-Control', 'public, max-age=15');
   res.json({
     provider:     provider,
     updatedAt:    cache && cache.updatedAt || null,
     sourceStatus: cache && cache.sourceStatus || 'unknown',
+    enabledCount: OWLS_ENABLED_SPORTS.length,
+    catalogCount: OWLS_ALL_SPORTS.length,
+    totalLive:    totalLive,
+    totalUpcoming:totalUpcoming,
     sports:       sports
   });
 });
@@ -5069,6 +6325,80 @@ app.get('/api/markets/live', (req, res) => {
   });
 });
 
+// GET /api/markets/live-count — lightweight payload for the bottom-nav "Live" badge.
+// Returns the number of in-progress games across all sports, plus a per-sport breakdown.
+// Designed to be polled by the frontend on the same cadence as the odds refresh.
+app.get('/api/markets/live-count', (req, res) => {
+  const cache = LIVE_MARKET_CACHE;
+  const games = (cache && Array.isArray(cache.games)) ? cache.games : [];
+  const nowMs = Date.now();
+  const bySport = {};
+  let total = 0;
+  for (let i = 0; i < games.length; i++) {
+    const g = games[i];
+    const status = g.status || _deriveGameStatus(g);
+    if (status !== 'live') continue;
+    total++;
+    // Map full sport key (e.g. "baseball_mlb") back to the short key ("mlb") for the UI
+    let short = String(g.sport_key||'').toLowerCase();
+    for (const k in _CACHE_SPORT_KEY_BY_SHORT) {
+      if (_CACHE_SPORT_KEY_BY_SHORT[k] === short || k === short) { short = k; break; }
+    }
+    bySport[short] = (bySport[short]||0) + 1;
+  }
+  res.setHeader('Cache-Control', 'public, max-age=10');
+  res.json({
+    ok: true,
+    total: total,
+    bySport: bySport,
+    updatedAt: (cache && cache.updatedAt) || null,
+    cacheAgeMs: (cache && cache.updatedAt) ? (nowMs - new Date(cache.updatedAt).getTime()) : null
+  });
+});
+
+// GET /api/odds/live — cross-sport live games feed for the DK-style Live tab.
+// Returns ONLY status==='live' games, projected to the flat board shape (with
+// scoreboard fields where the feed supplies them) and pre-sorted by sport then time.
+// Optional ?sport=mlb,nba narrows the set; default = all sports.
+app.get('/api/odds/live', (req, res) => {
+  const cache = LIVE_MARKET_CACHE;
+  const games = (cache && Array.isArray(cache.games)) ? cache.games : [];
+  const sportFilter = String(req.query.sport||'').toLowerCase().split(',').filter(Boolean);
+  const out = [];
+  for (let i = 0; i < games.length; i++) {
+    const g = games[i];
+    const status = g.status || _deriveGameStatus(g);
+    if (status !== 'live') continue;
+    // Resolve short sport key for projection + filter
+    let short = String(g.sport_key||'').toLowerCase();
+    for (const k in _CACHE_SPORT_KEY_BY_SHORT) {
+      if (_CACHE_SPORT_KEY_BY_SHORT[k] === short || k === short) { short = k; break; }
+    }
+    if (sportFilter.length && sportFilter.indexOf(short) < 0) continue;
+    const flat = _projectOwlsGameToFlat(g, short.toUpperCase());
+    if (flat && flat.home && flat.away) {
+      flat.sportKey = short;
+      out.push(flat);
+    }
+  }
+  // Sort: by sport then by commence_time asc (most-progressed games first)
+  out.sort(function(a,b){
+    if (a.sportKey !== b.sportKey) return a.sportKey < b.sportKey ? -1 : 1;
+    const ta = a.time ? new Date(a.time).getTime() : Infinity;
+    const tb = b.time ? new Date(b.time).getTime() : Infinity;
+    return ta - tb;
+  });
+  res.setHeader('Cache-Control', 'public, max-age=5');
+  res.setHeader('X-Live-Count', String(out.length));
+  res.json({
+    ok: true,
+    total: out.length,
+    games: out,
+    updatedAt: (cache && cache.updatedAt) || null,
+    refreshIntervalMs: LIVE_CACHE_POLL_INTERVAL_MS
+  });
+});
+
 // GET /api/markets/health — cache health widget for host dashboard
 app.get('/api/markets/health', (req, res) => {
   const nowMs = Date.now();
@@ -5091,16 +6421,24 @@ app.get('/api/markets/status', async (req, res) => {
   const cache = LIVE_MARKET_CACHE;
   const cacheAgeMs = cache.updatedAt ? nowMs - new Date(cache.updatedAt).getTime() : null;
   // Count markets by state from cache (fast, no DB hit)
-  let active=0, suspended=0, stale=0, started=0;
+  let active=0, live=0, suspended=0, stale=0, finalCount=0, canceled=0;
   Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
     const state = _classifyMarket({
-      fetched_at: entry.updatedAt, suspended:entry.suspended,
-      commence_time:entry.commenceTime
+      fetched_at: entry.updatedAt,
+      suspended: entry.suspended,
+      commence_time: entry.commenceTime,
+      event_status: entry.gameStatus,
+      market_status: entry.marketStatus,
+      eventCompleted: entry.eventCompleted,
+      eventCanceled: entry.eventCanceled,
+      eventLive: entry.eventLive
     }, nowMs);
     if (state==='active')        active++;
+    else if (state==='live')      { live++; active++; } // live counts as placeable
     else if (state==='suspended') suspended++;
     else if (state==='stale')     stale++;
-    else if (state==='event_started') started++;
+    else if (state==='final')     finalCount++;
+    else if (state==='canceled')  canceled++;
   });
   const warnings = [];
   if (stale > 0)         warnings.push('stale_markets:'+stale);
@@ -5114,8 +6452,12 @@ app.get('/api/markets/status', async (req, res) => {
     ok:true, serviceOk,
     sourceStatus:cache.sourceStatus, lastSuccessAt:cache.lastSuccessAt,
     cacheAgeMs, gameCount:cache.gameCount, marketCount:cache.marketCount,
-    activeMarketCount:active, suspendedMarketCount:suspended,
-    staleMarketCount:stale, startedMarketCount:started,
+    activeMarketCount:active,
+    liveMarketCount:live,
+    suspendedMarketCount:suspended,
+    staleMarketCount:stale,
+    finalMarketCount:finalCount,
+    canceledMarketCount:canceled,
     warnings
   });
 });
@@ -5673,16 +7015,37 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
       if (payoutResult && !payoutResult.ok) {
         const httpStatus = payoutResult.code==='odds_service_unavailable'?503
-          : (payoutResult.code==='odds_changed'||payoutResult.code==='event_started'
-            ||payoutResult.code==='market_closed'||payoutResult.code==='odds_stale')?409 : 422;
+          : (payoutResult.code==='odds_changed'
+            ||payoutResult.code==='market_unavailable'
+            ||payoutResult.code==='market_closed'
+            ||payoutResult.code==='odds_stale')?409 : 422;
         console.log('[bets/place] snapshot validation failed:', payoutResult.code,
-          payoutResult.leg, '('+httpStatus+')');
+          payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
+        // Surface a clean user-facing message for Live tab placement.
+        // Only fire when the market is actually suspended or the game is final/canceled.
+        if (!payoutResult.userMessage) {
+          if (payoutResult.code === 'market_unavailable') {
+            payoutResult.userMessage =
+              payoutResult.reason === 'game_final'    ? 'Market unavailable: game is final.' :
+              payoutResult.reason === 'game_canceled' ? 'Market unavailable: game canceled.' :
+              payoutResult.reason === 'suspended'     ? 'Market unavailable: temporarily suspended.' :
+                                                        'Market unavailable.';
+          } else if (payoutResult.code === 'odds_changed') {
+            payoutResult.userMessage = 'Odds changed — please review and confirm.';
+          } else if (payoutResult.code === 'odds_stale') {
+            payoutResult.userMessage = 'Odds refreshing — please try again.';
+          } else if (payoutResult.code === 'odds_service_unavailable') {
+            payoutResult.userMessage = 'Odds service unavailable — please try again shortly.';
+          }
+        }
         // Emit risk alert for snapshot rejection
         var _snapRaType = { odds_changed:'odds_change_rejections',
-          odds_stale:'stale_line_attempts', event_started:'stale_line_attempts',
-          market_closed:'stale_line_attempts', odds_service_unavailable:null }[payoutResult.code];
+          odds_stale:'stale_line_attempts',
+          market_unavailable:'stale_line_attempts',
+          market_closed:'stale_line_attempts',
+          odds_service_unavailable:null }[payoutResult.code];
         if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
-          { code:payoutResult.code, leg:payoutResult.leg });
+          { code:payoutResult.code, reason:payoutResult.reason, leg:payoutResult.leg });
         return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult));
       }
       if (payoutResult && payoutResult.ok) {
@@ -5716,26 +7079,64 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     // 4. Generate ticket ID
     const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
 
-    // 5. Write ticket_legs (with accepted odds snapshot fields from Phase K)
-    const legRows = legsArr.map(function(leg,i) { return {
-      id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
-      provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
-      canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
-      home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
-      scheduled_start: leg.scheduledStart||leg.commenceTime||null,
-      market: leg.market, pick: leg.pick,
-      odds: leg.accepted_odds_american || leg.odds,
-      line: leg.accepted_point_line!=null ? leg.accepted_point_line : (leg.line!=null?parseFloat(leg.line):null),
-      side: leg.side||null,
-      // Phase K snapshot fields
-      accepted_odds_american: leg.accepted_odds_american||null,
-      accepted_odds_decimal:  leg.accepted_odds_decimal||null,
-      accepted_point_line:    leg.accepted_point_line||null,
-      odds_snapshot_id:       leg.odds_snapshot_id||null,
-      accepted_at:            leg.accepted_at||null
-    }; });
-    const { error: lErr } = await sb.from('ticket_legs').insert(legRows);
-    if (lErr) throw lErr;
+    // 5. Write ticket_legs (with accepted odds snapshot fields from Phase K
+    //    + canonical identity fields from priority #11 cleanup)
+    const legRows = legsArr.map(function(leg,i) {
+      // Build canonical identity for this leg. Same helper that the
+      // snapshot verifier uses, so the persisted ticket leg carries the
+      // exact identity tuple grading + SGP will need later.
+      var ident = _normalizeLegIdentity(leg) || {};
+      return {
+        id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
+        provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
+        canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
+        home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
+        scheduled_start: leg.scheduledStart||leg.commenceTime||null,
+        market: leg.market, pick: leg.pick,
+        odds: leg.accepted_odds_american || leg.odds,
+        line: leg.accepted_point_line!=null ? leg.accepted_point_line : (leg.line!=null?parseFloat(leg.line):null),
+        side: leg.side||null,
+        // Phase K snapshot fields
+        accepted_odds_american: leg.accepted_odds_american||null,
+        accepted_odds_decimal:  leg.accepted_odds_decimal||null,
+        accepted_point_line:    leg.accepted_point_line||null,
+        odds_snapshot_id:       leg.odds_snapshot_id||null,
+        accepted_at:            leg.accepted_at||null,
+        // Canonical identity (priority #11). Optional columns — DB without
+        // them gets stripped automatically by the catch below.
+        market_type:              ident.marketType || _coerceMarketType(leg.market) || leg.market,
+        canonical_market_key:     ident.canonicalMarketKey || null,
+        canonical_selection_key:  ident.canonicalSelectionKey || null,
+        player_name_normalized:   ident.playerName ? _normalizePlayerName(ident.playerName) : null,
+        prop_type_normalized:     ident.propType ? _normalizePropType(ident.propType) : null,
+        prop_side:                ident.marketType === MARKET_TYPES.PLAYER_PROP ? (ident.side || null) : null
+      };
+    });
+    let lErr = null;
+    try {
+      const r = await sb.from('ticket_legs').insert(legRows);
+      lErr = r.error || null;
+      if (lErr) throw lErr;
+    } catch(e1) {
+      const msg = (e1 && e1.message) || '';
+      if (/market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(msg)) {
+        console.warn('[ticket_legs] insert: canonical columns missing on DB, falling back to legacy projection');
+        const legacyRows = legRows.map(function(r) {
+          const copy = Object.assign({}, r);
+          delete copy.market_type;
+          delete copy.canonical_market_key;
+          delete copy.canonical_selection_key;
+          delete copy.player_name_normalized;
+          delete copy.prop_type_normalized;
+          delete copy.prop_side;
+          return copy;
+        });
+        const r2 = await sb.from('ticket_legs').insert(legacyRows);
+        if (r2.error) throw r2.error;
+      } else {
+        throw e1;
+      }
+    }
 
     // 6. Phase I+J: call place_bet_tx RPC (atomic ticket + canonical ledger + risk limits)
     const rpcResult = await _callMoneyRpc('place_bet_tx', {
@@ -6569,5 +7970,8 @@ app.get('/api/grade/status', async (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Server running on port ${PORT}`);
   // Init DB after server is bound
-  initDB().then(() => console.log('✅ DB ready')).catch(e => console.error('DB init failed:', e.message));
+  initDB()
+    .then(() => console.log('✅ DB ready'))
+    .then(() => _migrateOddsSnapshotsSchema())
+    .catch(e => console.error('DB init failed:', e.message));
 });
