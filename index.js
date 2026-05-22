@@ -3751,29 +3751,109 @@ async function _upsertOddsSnapshots() {
 
   const provider = ODDS_PROVIDER === 'owls_insight' ? 'owls_insight' : 'odds-api';
   const rows = [];
-  Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
-    if (!entry) return;
-    // Shape detection: Odds-API entries have an `outcomes[]` array;
-    // Owls entries don't (each entry IS a single outcome).
-    if (Array.isArray(entry.outcomes) && entry.outcomes.length > 0) {
-      // Odds-API path.
-      entry.outcomes.forEach(function(outcome) {
-        const row = _buildSnapshotRow(entry, outcome, { now, exp, provider });
-        if (row) rows.push(row);
-      });
-    } else if (entry.marketType) {
-      // Owls path — entry is itself a per-outcome row from the normalizer.
-      const row = _buildSnapshotRow(entry, null, { now, exp, provider });
-      if (row) rows.push(row);
+
+  // Diagnostic counters — single SNAPSHOT_ITERATION_BEGIN/END pair plus a
+  // bounded sample of per-entry SEEN/PREPARED/SKIPPED lines so we get a
+  // verifiable trace without flooding Railway (1438 markets / 15s poll =
+  // ~5,700 lines/min if uncapped).
+  const cacheKeys = Object.keys(cache.marketsByCanonicalKey);
+  let seenEntries = 0;
+  let loggedSeen = 0, loggedPrepared = 0, loggedSkipped = 0;
+  const TRACE_CAP = 8;
+  const skipReasons = {};
+  const sampleSkips = [];
+  function bumpSkip(reason, sampleKey, sampleShape) {
+    skipReasons[reason] = (skipReasons[reason] || 0) + 1;
+    if (sampleSkips.length < 3) {
+      sampleSkips.push({ reason, key: sampleKey, shape: sampleShape });
     }
-  });
+  }
+  console.log('SNAPSHOT_ITERATION_BEGIN provider='+provider+' keys='+cacheKeys.length+' cacheMarketCount='+cache.marketCount);
+
+  // Normalize each value into an iterable list of per-outcome entries so we
+  // can handle three shapes uniformly:
+  //   1. Odds-API:       { outcomes: [...] }              — one entry, has outcomes
+  //   2. Owls overlay:   [ entry, entry, ... ]            — an ARRAY of per-outcome entries
+  //   3. Single Owls:    { marketType, teamOrSide, ... }  — one bare entry (defensive)
+  //
+  // The previous iteration assumed every value was shape #1 OR shape #3.
+  // The Owls overlay introduced shape #2 (arrays of entries) which silently
+  // produced zero rows because arrays have neither `.outcomes` nor
+  // `.marketType`. Flattening here covers all three.
+  for (const ck of cacheKeys) {
+    const value = cache.marketsByCanonicalKey[ck];
+    if (!value) { bumpSkip('null_value', ck, typeof value); continue; }
+
+    const entries = Array.isArray(value) ? value : [value];
+    for (const entry of entries) {
+      seenEntries++;
+      if (!entry || typeof entry !== 'object') {
+        bumpSkip('not_object', ck, typeof entry);
+        continue;
+      }
+      if (loggedSeen < TRACE_CAP) {
+        console.log('SNAPSHOT_MARKET_SEEN ck='+ck+' marketType='+(entry.marketType||entry.market||'?')+' hasOutcomes='+Array.isArray(entry.outcomes));
+        loggedSeen++;
+      }
+
+      // Odds-API shape: entry has an outcomes[] array.
+      if (Array.isArray(entry.outcomes) && entry.outcomes.length > 0) {
+        for (const outcome of entry.outcomes) {
+          const row = _buildSnapshotRow(entry, outcome, { now, exp, provider });
+          if (row) {
+            rows.push(row);
+            if (loggedPrepared < TRACE_CAP) {
+              console.log('SNAPSHOT_ROW_PREPARED ck='+ck+' market='+row.market_key+' selection='+row.selection_key);
+              loggedPrepared++;
+            }
+          } else {
+            bumpSkip('row_null_oddsapi', ck, JSON.stringify({ outcome: outcome && outcome.name }));
+            if (loggedSkipped < TRACE_CAP) {
+              console.log('SNAPSHOT_ROW_SKIPPED ck='+ck+' reason=row_null_oddsapi outcome='+(outcome && outcome.name));
+              loggedSkipped++;
+            }
+          }
+        }
+        continue;
+      }
+
+      // Owls shape: entry is a single per-outcome row from the normalizer.
+      if (entry.marketType) {
+        const row = _buildSnapshotRow(entry, null, { now, exp, provider });
+        if (row) {
+          rows.push(row);
+          if (loggedPrepared < TRACE_CAP) {
+            console.log('SNAPSHOT_ROW_PREPARED ck='+ck+' market='+row.market_key+' selection='+row.selection_key);
+            loggedPrepared++;
+          }
+        } else {
+          bumpSkip('row_null_owls', ck, JSON.stringify({ mt: entry.marketType, side: entry.teamOrSide }));
+          if (loggedSkipped < TRACE_CAP) {
+            console.log('SNAPSHOT_ROW_SKIPPED ck='+ck+' reason=row_null_owls marketType='+entry.marketType+' side='+entry.teamOrSide);
+            loggedSkipped++;
+          }
+        }
+        continue;
+      }
+
+      // Neither shape matched — log enough context to diagnose without
+      // dumping the full object on every poll.
+      bumpSkip('unknown_shape', ck, Object.keys(entry).slice(0,8).join(','));
+    }
+  }
 
   if (!rows.length) {
-    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+provider+' reason=no_rows_after_iteration cacheMarketCount='+cache.marketCount);
+    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+provider+
+      ' reason=no_rows_after_iteration cacheMarketCount='+cache.marketCount+
+      ' seenEntries='+seenEntries+
+      ' skipReasons='+JSON.stringify(skipReasons)+
+      ' sampleSkips='+JSON.stringify(sampleSkips));
     return;
   }
 
-  console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length);
+  console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length+
+    ' seenEntries='+seenEntries+
+    ' skipReasons='+JSON.stringify(skipReasons));
   try {
     await sb.from('odds_snapshots').upsert(rows,
       { onConflict:'canonical_game_key,market_key,selection_key' });
