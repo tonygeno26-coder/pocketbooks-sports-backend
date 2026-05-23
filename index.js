@@ -6133,7 +6133,7 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
           type:combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
           amount:combined==='won'?profit:0, reason:'server_grade_'+combined,
           created_at:gradedAt, created_by:'server-grade-api'
-        }, { onConflict:'id' }).catch(()=>{});
+        }, { onConflict:'id' }).then(()=>{},()=>{});
 
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type:'ticket_graded_server',
@@ -6823,7 +6823,7 @@ app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), re
       type:'settlement', amount:Math.round((rpcDir==='host_owes_player'?amt:-amt)*100)/100,
       reason:direction+(note?': '+note:''), created_at:executedAt, created_by:'host',
       settlement_week:settlementWeek||null
-    }, { onConflict:'id' }).catch(()=>{});
+    }, { onConflict:'id' }).then(()=>{},()=>{});
 
     // 3. Audit event
     await sb.from('audit_events').insert({
@@ -7321,12 +7321,15 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     }
 
     // 7. Legacy ledger_entries mirror (Phase A compat — fire-and-forget)
+    // NOTE: Supabase v2 query builders are thenables but not real Promises
+    // until awaited or .then()'d — calling .catch() directly throws
+    // "upsert(...).catch is not a function". Use .then(noop, noop) instead.
     sb.from('ledger_entries').upsert({
       id: idempotencyKey, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_placed',
       amount: rnd(-stakeAmt), reason: 'bet_placed:'+betType,
       created_at: now, created_by: playerId
-    }, { onConflict:'id' }).catch(()=>{});
+    }, { onConflict:'id' }).then(()=>{},()=>{});
 
     // 8. Audit event
     await sb.from('audit_events').insert({
@@ -7417,7 +7420,7 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
       id: idempotencyKey, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_canceled', amount: riskAmt,
       reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: playerId
-    }, { onConflict:'id' }).catch(()=>{});
+    }, { onConflict:'id' }).then(()=>{},()=>{});
 
     // 6. Audit event
     await sb.from('audit_events').insert({
