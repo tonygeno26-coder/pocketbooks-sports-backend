@@ -7197,8 +7197,10 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     // 4. Generate ticket ID
     const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
 
-    // 5. Write ticket_legs (with accepted odds snapshot fields from Phase K
-    //    + canonical identity fields from priority #11 cleanup)
+    // 5. Build ticket_legs rows in memory (Phase K accepted-odds snapshot +
+    //    priority #11 canonical identity fields). NOTE: we no longer insert
+    //    here — the parent `tickets` row must exist first to satisfy the
+    //    ticket_legs.ticket_id FK. Actual insert happens in step 6b below.
     const legRows = legsArr.map(function(leg,i) {
       // Build canonical identity for this leg. Same helper that the
       // snapshot verifier uses, so the persisted ticket leg carries the
@@ -7230,33 +7232,10 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
         prop_side:                ident.marketType === MARKET_TYPES.PLAYER_PROP ? (ident.side || null) : null
       };
     });
-    let lErr = null;
-    try {
-      const r = await sb.from('ticket_legs').insert(legRows);
-      lErr = r.error || null;
-      if (lErr) throw lErr;
-    } catch(e1) {
-      const msg = (e1 && e1.message) || '';
-      if (/market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(msg)) {
-        console.warn('[ticket_legs] insert: canonical columns missing on DB, falling back to legacy projection');
-        const legacyRows = legRows.map(function(r) {
-          const copy = Object.assign({}, r);
-          delete copy.market_type;
-          delete copy.canonical_market_key;
-          delete copy.canonical_selection_key;
-          delete copy.player_name_normalized;
-          delete copy.prop_type_normalized;
-          delete copy.prop_side;
-          return copy;
-        });
-        const r2 = await sb.from('ticket_legs').insert(legacyRows);
-        if (r2.error) throw r2.error;
-      } else {
-        throw e1;
-      }
-    }
 
-    // 6. Phase I+J: call place_bet_tx RPC (atomic ticket + canonical ledger + risk limits)
+    // 6. Phase I+J: call place_bet_tx RPC FIRST (atomic ticket + canonical
+    //    ledger + risk limits). Ticket parent row must exist before legs
+    //    are inserted, otherwise ticket_legs_ticket_id_fkey rejects.
     const rpcResult = await _callMoneyRpc('place_bet_tx', {
       p_ticket_id:        ticketId,
       p_club_id:          clubId||'',
@@ -7276,8 +7255,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
       p_is_live:          legsArr.some(function(l){ return !!l.isLive; })
     });
     if (!rpcResult.ok && !rpcResult.idempotent) {
-      // RPC rejected — remove the legs we just inserted
-      await sb.from('ticket_legs').delete().eq('ticket_id',ticketId).catch(()=>{});
+      // RPC rejected — nothing inserted yet (legs come after). No cleanup needed.
       // Risk limit rejection from Postgres
       if (rpcResult.code && RISK_CODE_STATUS[rpcResult.code]) {
         return res.status(RISK_CODE_STATUS[rpcResult.code]).json(
@@ -7287,6 +7265,59 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
         return res.status(400).json({ ok:false, error:'insufficient_balance',
           available:rpcResult.available, stake:stakeAmt });
       return res.status(400).json({ ok:false, error:rpcResult.error||'placement_failed' });
+    }
+
+    // 6b. Insert ticket_legs AFTER the parent ticket exists so the
+    //     ticket_legs_ticket_id_fkey FK is satisfied. On failure here we must
+    //     compensate by voiding the just-created ticket — otherwise we leave
+    //     an orphan ticket with no legs (and a real balance reservation).
+    try {
+      try {
+        const r = await sb.from('ticket_legs').insert(legRows);
+        if (r.error) throw r.error;
+      } catch(e1) {
+        const msg = (e1 && e1.message) || '';
+        if (/market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(msg)) {
+          console.warn('[ticket_legs] insert: canonical columns missing on DB, falling back to legacy projection');
+          const legacyRows = legRows.map(function(r) {
+            const copy = Object.assign({}, r);
+            delete copy.market_type;
+            delete copy.canonical_market_key;
+            delete copy.canonical_selection_key;
+            delete copy.player_name_normalized;
+            delete copy.prop_type_normalized;
+            delete copy.prop_side;
+            return copy;
+          });
+          const r2 = await sb.from('ticket_legs').insert(legacyRows);
+          if (r2.error) throw r2.error;
+        } else {
+          throw e1;
+        }
+      }
+    } catch(legErr) {
+      // Compensation: cancel the just-created parent ticket so we don't
+      // strand the player's balance reservation. Use cancel_bet_tx (the
+      // same atomic primitive /api/bets/cancel uses) with a derived
+      // idempotency key so it cannot collide with the placement key.
+      console.error('[bets/place] ticket_legs insert failed AFTER RPC ok — compensating:', legErr.message, 'ticketId='+ticketId);
+      try {
+        const cancelResult = await _callMoneyRpc('cancel_bet_tx', {
+          p_ticket_id:       ticketId,
+          p_club_id:         clubId||'',
+          p_player_id:       playerId,
+          p_idempotency_key: idempotencyKey+':compensate',
+          p_reason:          'ticket_legs_insert_failed',
+          p_created_by:      playerId
+        });
+        if (!cancelResult || (!cancelResult.ok && !cancelResult.idempotent)) {
+          console.error('[bets/place] CRITICAL: cancel_bet_tx compensation failed for orphan ticketId='+ticketId, cancelResult);
+        }
+      } catch(cancelErr) {
+        console.error('[bets/place] CRITICAL: cancel_bet_tx compensation threw for orphan ticketId='+ticketId, cancelErr.message);
+      }
+      return res.status(500).json({ ok:false, error:'ticket_legs_insert_failed',
+        detail: legErr.message, ticketId });
     }
 
     // 7. Legacy ledger_entries mirror (Phase A compat — fire-and-forget)
