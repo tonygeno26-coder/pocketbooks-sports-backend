@@ -7040,7 +7040,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
   if (!VALID_TYPES.has(betType)) errors.push('invalid_betType:'+betType);
   const stakeAmt = parseFloat(stake);
   if (isNaN(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
-  const legsArr = Array.isArray(legs) ? legs : [];
+  let legsArr = Array.isArray(legs) ? legs : [];
   if (!legsArr.length) errors.push('no_legs');
   legsArr.forEach(function(leg,i) {
     if (!leg.pick) errors.push('leg'+i+'_missing_pick');
