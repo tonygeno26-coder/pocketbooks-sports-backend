@@ -189,12 +189,46 @@ BEGIN
 
 EXCEPTION
   WHEN OTHERS THEN
-    -- Surface SQLERRM so the handler logs something useful instead of a 500.
-    RETURN jsonb_build_object(
-      'ok',    false,
-      'error', 'place_bet_tx_failed',
-      'detail', SQLERRM
-    );
+    -- Surface full PG diagnostics so the handler can log what actually failed
+    -- inside the transaction. GET STACKED DIAGNOSTICS must run inside an
+    -- exception handler — pulls the structured fields Postgres attaches to
+    -- the error.
+    DECLARE
+      v_sqlstate    text;
+      v_msg         text;
+      v_detail      text;
+      v_hint        text;
+      v_context     text;
+      v_schema      text;
+      v_table       text;
+      v_column      text;
+      v_constraint  text;
+    BEGIN
+      GET STACKED DIAGNOSTICS
+        v_sqlstate   = RETURNED_SQLSTATE,
+        v_msg        = MESSAGE_TEXT,
+        v_detail     = PG_EXCEPTION_DETAIL,
+        v_hint       = PG_EXCEPTION_HINT,
+        v_context    = PG_EXCEPTION_CONTEXT,
+        v_schema     = SCHEMA_NAME,
+        v_table      = TABLE_NAME,
+        v_column     = COLUMN_NAME,
+        v_constraint = CONSTRAINT_NAME;
+
+      RETURN jsonb_build_object(
+        'ok',         false,
+        'error',      'place_bet_tx_failed',
+        'sqlstate',   v_sqlstate,
+        'message',    v_msg,
+        'detail',     v_detail,
+        'hint',       v_hint,
+        'context',    v_context,
+        'schema',     v_schema,
+        'table',      v_table,
+        'column',     v_column,
+        'constraint', v_constraint
+      );
+    END;
 END;
 $$;
 
