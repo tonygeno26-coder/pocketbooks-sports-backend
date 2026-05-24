@@ -7178,18 +7178,36 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
     }
 
     // 3b. Conflict check: active legs on same game+market
-    const { data: activeTix } = await sb.from('tickets').select('id')
-      .eq('player_id', playerId).in('status',['active','open']);
-    if (activeTix && activeTix.length) {
-      const activeTicketIds = activeTix.map(function(t){ return t.id; });
-      const { data: activeLegs } = await sb.from('ticket_legs')
-        .select('canonical_game_key,market').in('ticket_id', activeTicketIds);
-      const activeLegsArr = activeLegs || [];
-      for (var i=0; i<legsArr.length; i++) {
-        var newToken = legsArr[i].canonicalGameKey + '|' + (legsArr[i].market||'').toLowerCase();
-        for (var j=0; j<activeLegsArr.length; j++) {
-          var exToken = activeLegsArr[j].canonical_game_key + '|' + (activeLegsArr[j].market||'').toLowerCase();
-          if (newToken === exToken) return res.status(409).json({ ok:false, error:'conflict_active_bet:'+legsArr[i].canonicalGameKey });
+    //     Bypass paths (testing / staging):
+    //       - env BETS_BYPASS_CONFLICT=1            → globally disabled
+    //       - req.body._bypassConflict === true     → per-request (must be
+    //                                                  explicitly allowed by
+    //                                                  BETS_ALLOW_BYPASS_FLAG)
+    //     Bypass attempts are always logged so we can't accidentally ship
+    //     prod with this on.
+    const _conflictGloballyOff = process.env.BETS_BYPASS_CONFLICT === '1';
+    const _conflictPerReqAllowed = process.env.BETS_ALLOW_BYPASS_FLAG === '1'
+                                && req.body && req.body._bypassConflict === true;
+    const _conflictBypass = _conflictGloballyOff || _conflictPerReqAllowed;
+    if (_conflictBypass) {
+      console.warn('[bets/place] CONFLICT CHECK BYPASSED',
+        { playerId, clubId, via: _conflictGloballyOff ? 'env' : 'request',
+          ticketCount: legsArr.length });
+    }
+    if (!_conflictBypass) {
+      const { data: activeTix } = await sb.from('tickets').select('id')
+        .eq('player_id', playerId).in('status',['active','open']);
+      if (activeTix && activeTix.length) {
+        const activeTicketIds = activeTix.map(function(t){ return t.id; });
+        const { data: activeLegs } = await sb.from('ticket_legs')
+          .select('canonical_game_key,market').in('ticket_id', activeTicketIds);
+        const activeLegsArr = activeLegs || [];
+        for (var i=0; i<legsArr.length; i++) {
+          var newToken = legsArr[i].canonicalGameKey + '|' + (legsArr[i].market||'').toLowerCase();
+          for (var j=0; j<activeLegsArr.length; j++) {
+            var exToken = activeLegsArr[j].canonical_game_key + '|' + (activeLegsArr[j].market||'').toLowerCase();
+            if (newToken === exToken) return res.status(409).json({ ok:false, error:'conflict_active_bet:'+legsArr[i].canonicalGameKey });
+          }
         }
       }
     }
