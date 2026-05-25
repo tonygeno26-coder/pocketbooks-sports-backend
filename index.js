@@ -5146,6 +5146,8 @@ app.post('/api/mirror/ledger-bulk', async (req, res) => {
 
 // POST /api/mirror/ledger-debug — synchronous insert, returns actual Supabase error for diagnosis
 app.post('/api/mirror/ledger-debug', async (req, res) => {
+  if (!BROWSER_LEDGER_MIRROR_WRITES_ENABLED)
+    return res.json({ ok:true, disabled:true, containment:true });
   const sb = getSupabase();
   if (!sb) return res.json({ ok: false, reason: 'supabase_not_configured' });
   const entry = req.body;
@@ -6270,30 +6272,8 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
         if (!gradeResult.ok && !gradeResult.idempotent)
           throw new Error('grade_rpc_rejected:'+gradeResult.error);
 
-        // Legacy mirror (fire-and-forget for ordering, but surface errors
-        // instead of swallowing them — same anti-pattern we fixed in the
-        // snapshot upsert. Audit risk #8: silent DB mirror failures.)
-        const legacyId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
-        sb.from('ledger_entries').upsert({ id:legacyId, ticket_id:ticket.id,
-          player_id:ticket.player_id, club_id:ticket.club_id,
-          type:combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
-          amount:combined==='won'?profit:0, reason:'server_grade_'+combined,
-          created_at:gradedAt, created_by:'server-grade-api'
-        }, { onConflict:'id' }).then(function(r){
-          if (r && r.error) {
-            console.warn('[grade] legacy ledger mirror error'+
-              ' ticketId='+ticket.id+
-              ' legacyId='+legacyId+
-              ' code='+(r.error.code||'?')+
-              ' msg='+JSON.stringify(String(r.error.message||'').slice(0,200))+
-              ' details='+JSON.stringify(String(r.error.details||'').slice(0,200))+
-              ' hint='+JSON.stringify(String(r.error.hint||'').slice(0,200)));
-          }
-        }, function(threw){
-          console.warn('[grade] legacy ledger mirror threw'+
-            ' ticketId='+ticket.id+
-            ' msg='+JSON.stringify(String(threw && threw.message || threw).slice(0,200)));
-        });
+        console.log('[grade/run] canonical settlement ok ticketId='+ticket.id+
+          ' result='+combined+' ledgerEntryId='+(gradeResult.ledger_entry_id||iKey));
 
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type:'ticket_graded_server',
@@ -6303,7 +6283,8 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
         }).select('id');
 
         row.statusAfter=combined; row.result=combined; row.payoutDelta=delta;
-        row.ledgerEntryId=legacyId; row.canonicalLedgerId='LE_GR_'+ticket.id+'_'+combined;
+        row.ledgerEntryId=gradeResult.ledger_entry_id||iKey;
+        row.canonicalLedgerId=gradeResult.ledger_entry_id||iKey;
         row.auditEventId=auditData&&auditData[0]?auditData[0].id:null;
         row.balanceAfter=gradeResult.balance_after;
         graded++;
