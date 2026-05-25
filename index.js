@@ -7296,16 +7296,31 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
         if (r.error) throw r.error;
       } catch(e1) {
         const msg = (e1 && e1.message) || '';
-        if (/market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(msg)) {
-          console.warn('[ticket_legs] insert: canonical columns missing on DB, falling back to legacy projection');
+        // Strip columns the DB doesn't know about yet (pre-migration) and retry
+        const _missingCanonical  = /market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(msg);
+        const _missingPhaseK     = /accepted_at|accepted_odds_american|accepted_odds_decimal|accepted_point_line|odds_snapshot_id/.test(msg);
+        if (_missingCanonical || _missingPhaseK) {
+          const _stripped = _missingCanonical ? 'canonical' : '';
+          const _strippedK = _missingPhaseK ? 'phaseK' : '';
+          console.warn('[ticket_legs] insert: missing columns on DB ('+[_stripped,_strippedK].filter(Boolean).join('+')
+            +'), falling back — run migration 021 in Supabase');
           const legacyRows = legRows.map(function(r) {
             const copy = Object.assign({}, r);
+            // Strip canonical identity columns
             delete copy.market_type;
             delete copy.canonical_market_key;
             delete copy.canonical_selection_key;
             delete copy.player_name_normalized;
             delete copy.prop_type_normalized;
             delete copy.prop_side;
+            // Strip Phase K columns if also missing
+            if (_missingPhaseK) {
+              delete copy.accepted_odds_american;
+              delete copy.accepted_odds_decimal;
+              delete copy.accepted_point_line;
+              delete copy.odds_snapshot_id;
+              delete copy.accepted_at;
+            }
             return copy;
           });
           const r2 = await sb.from('ticket_legs').insert(legacyRows);
