@@ -3855,8 +3855,9 @@ async function _upsertOddsSnapshots() {
     ' seenEntries='+seenEntries+
     ' skipReasons='+JSON.stringify(skipReasons));
   try {
-    await sb.from('odds_snapshots').upsert(rows,
+    const { error: upsertErr } = await sb.from('odds_snapshots').upsert(rows,
       { onConflict:'canonical_game_key,market_key,selection_key' });
+    if (upsertErr) throw upsertErr;
     console.log('[snapshot] upserted '+rows.length+' odds snapshots');
   } catch(e) {
     // If the DB hasn't been migrated with the new canonical columns the
