@@ -49,6 +49,37 @@ function _ipHash(req) {
   return Math.abs(h).toString(16).slice(0,8);
 }
 
+function _envFlag(name, defaultValue) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return !!defaultValue;
+  return String(raw).toLowerCase() === 'true';
+}
+
+const GRADING_SETTLEMENT_ENABLED = _envFlag('GRADING_SETTLEMENT_ENABLED', false);
+const GRADE_RUN_DRY_RUN_ENABLED = _envFlag('GRADE_RUN_DRY_RUN_ENABLED', true);
+const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLED', false);
+const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', false);
+const BROWSER_TICKET_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_TICKET_MIRROR_WRITES_ENABLED', false);
+const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRITES_ENABLED', false);
+const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
+const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
+
+function _gradingContainmentStatus() {
+  return {
+    settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+    gradeRunDryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED,
+    workerSettlementEnabled:WORKER_GRADE_SETTLEMENT_ENABLED,
+    manualSettlementEnabled:MANUAL_GRADE_SETTLEMENT_ENABLED,
+    browserTicketMirrorWritesEnabled:BROWSER_TICKET_MIRROR_WRITES_ENABLED,
+    browserLedgerMirrorWritesEnabled:BROWSER_LEDGER_MIRROR_WRITES_ENABLED,
+    reason:GRADING_SETTLEMENT_ENABLED?null:GRADING_DISABLED_REASON
+  };
+}
+
+function _mirrorNoopPayload(reason, extra) {
+  return Object.assign({ ok:true, queued:false, disabled:true, containment:true, reason }, extra||{});
+}
+
 function rateLimitMiddleware(req, res, next) {
   const cfg = _getRlConfig(req.path);
   if (!cfg) return next();
@@ -341,6 +372,12 @@ async function _runGradeCore(fakeReq, sb) {
       const outcome = _deriveTicketOutcome(ticket, ticketLegs, resultsByKey);
       if (outcome.outcome==='error'||outcome.outcome==='pending') { skipped++; continue; }
       const profit = parseFloat(ticket.potential_profit)||0;
+      if (!GRADING_SETTLEMENT_ENABLED || !WORKER_GRADE_SETTLEMENT_ENABLED) {
+        console.warn('[grading] worker settlement blocked ticketId='+ticket.id+
+          ' outcome='+outcome.outcome+' reason='+GRADING_DISABLED_REASON);
+        skipped++;
+        continue;
+      }
       const gr = await _callMoneyRpc('grade_ticket_tx',{
         p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
         p_grade_result:outcome.outcome, p_profit:profit,
@@ -5039,19 +5076,30 @@ app.get('/api/env-check', (req, res) => {
 // ── Supabase mirror endpoints (Phase A) ────────────────────────────────────────
 // POST /api/mirror/ticket — fire-and-forget from client after localStorage write
 app.post('/api/mirror/ticket', async (req, res) => {
-  res.json({ queued: true }); // respond immediately
   const { ticket, ledgerEntry } = req.body.ticket ? req.body : { ticket: req.body, ledgerEntry: null };
   const t = ticket || req.body;
+  const browserStatus = String((t&&t.status)||'').toLowerCase();
+  if (!BROWSER_TICKET_MIRROR_WRITES_ENABLED)
+    return res.json(_mirrorNoopPayload('browser_ticket_mirror_writes_disabled',
+      { endpoint:'/api/mirror/ticket' }));
+  if (!GRADING_SETTLEMENT_ENABLED && _BROWSER_TERMINAL_STATUSES.has(browserStatus))
+    return res.json(_mirrorNoopPayload('browser_terminal_status_mirror_blocked',
+      { endpoint:'/api/mirror/ticket', status:browserStatus }));
+  res.json({ queued: true }); // respond immediately
   if (!t || !t.id) return;
   mirrorTicketToSupabase(t).catch(function(e){ console.warn('[mirror/ticket] error:', e.message); });
   // Also mirror ledger entry if provided in same call
   if (ledgerEntry && ledgerEntry.id) {
+    if (!BROWSER_LEDGER_MIRROR_WRITES_ENABLED) return;
     mirrorLedgerEntry(ledgerEntry).catch(function(e){ console.warn('[mirror/ledger] error:', e.message); });
   }
 });
 
 // POST /api/mirror/ledger — mirror a single ledger entry (append-only, idempotent)
 app.post('/api/mirror/ledger', async (req, res) => {
+  if (!BROWSER_LEDGER_MIRROR_WRITES_ENABLED)
+    return res.json(_mirrorNoopPayload('browser_ledger_mirror_writes_disabled',
+      { endpoint:'/api/mirror/ledger' }));
   res.json({ queued: true }); // respond immediately
   const entry = req.body;
   if (!entry || !entry.id) return;
@@ -5060,6 +5108,9 @@ app.post('/api/mirror/ledger', async (req, res) => {
 
 // POST /api/mirror/ledger-bulk — mirror array of ledger entries in one batch (for replay)
 app.post('/api/mirror/ledger-bulk', async (req, res) => {
+  if (!BROWSER_LEDGER_MIRROR_WRITES_ENABLED)
+    return res.json(_mirrorNoopPayload('browser_ledger_mirror_writes_disabled',
+      { endpoint:'/api/mirror/ledger-bulk' }));
   const sb = getSupabase();
   if (!sb) return res.json({ ok: false, reason: 'supabase_not_configured', inserted: 0 });
   const entries = Array.isArray(req.body) ? req.body : (req.body.entries || []);
@@ -6066,6 +6117,9 @@ app.post('/api/grade/manual', requirePermissionScoped('run_server_grade'), async
     return res.status(400).json({ ok:false, error:'missing_required_field' });
   if (!['won','lost','push'].includes(result))
     return res.status(400).json({ ok:false, error:'invalid_result:'+result });
+  if (!GRADING_SETTLEMENT_ENABLED || !MANUAL_GRADE_SETTLEMENT_ENABLED)
+    return res.status(503).json({ ok:false, error:'grading_settlement_disabled',
+      reason:GRADING_DISABLED_REASON, containment:_gradingContainmentStatus() });
   try {
     const { data:tData } = await sb.from('tickets')
       .select('id,status,player_id,club_id,risk_amount,potential_profit').eq('id',ticketId).limit(1);
@@ -6195,6 +6249,17 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
         const payout = combined==='won'?Math.round((risk+profit)*100)/100:combined==='push'?risk:0;
         const delta  = combined==='won'?profit:combined==='push'?0:-risk;
 
+        if (!GRADING_SETTLEMENT_ENABLED) {
+          if (!GRADE_RUN_DRY_RUN_ENABLED)
+            throw new Error('grading_settlement_disabled:'+GRADING_DISABLED_REASON);
+          row.statusAfter=ticket.status; row.result=combined; row.payoutDelta=delta;
+          row.dryRun=true; row.settlementDisabled=true; row.reason='dry_run:'+GRADING_DISABLED_REASON;
+          row.wouldPayout=payout; row.wouldCanonicalLedgerId='LE_GR_'+ticket.id+'_'+combined;
+          skipped++;
+          results.push(row);
+          continue;
+        }
+
         // Phase I+M: call grade_ticket_tx RPC
         const iKey = 'SG_'+combined+'_'+ticket.id;
         const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
@@ -6252,7 +6317,11 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
       results.push(row);
     }
 
-    res.json({ ok:true, checked:tickets.length, graded, skipped, errors, results });
+    res.json({ ok:true,
+      mode:GRADING_SETTLEMENT_ENABLED?'settlement':'dry_run',
+      settlementDisabled:!GRADING_SETTLEMENT_ENABLED,
+      containment:_gradingContainmentStatus(),
+      checked:tickets.length, graded, skipped, errors, results });
   } catch(e) {
     console.error('[server grade] fatal:', e.message);
     res.status(500).json({ ok:false, error:e.message });
@@ -8233,7 +8302,10 @@ app.get('/api/host/settlement-reconciliation', requirePermissionScoped('view_set
 // GET /api/grade/status — returns last-graded timestamp + recent results
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
-  if (!sb) return res.json({ enabled:false, reason:'supabase_not_configured' });
+  const containment = _gradingContainmentStatus();
+  if (!sb) return res.json({ enabled:false, reason:'supabase_not_configured',
+    containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+    dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   try {
     const { data: recent } = await sb.from('audit_events')
       .select('id,event_type,ticket_id,payload,created_at')
@@ -8242,7 +8314,9 @@ app.get('/api/grade/status', async (req, res) => {
     const { data: active } = await sb.from('tickets')
       .select('id',{ count:'exact' }).in('status',['active','open']);
     res.json({ enabled:true, lastGradedAt: recent&&recent[0] ? recent[0].created_at : null,
-      recentGrades: recent||[], activeTicketCount: active ? active.length : 0 });
+      recentGrades: recent||[], activeTicketCount: active ? active.length : 0,
+      containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+      dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
 });
 // ════════════════════════════════════════════════════════════════════════════
@@ -8255,6 +8329,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('║  PORT='+PORT+'  NODE_ENV='+process.env.NODE_ENV+'  DEV_AUTH_BYPASS='+process.env.DEV_AUTH_BYPASS);
   console.log('║  SUPABASE_URL='+(process.env.SUPABASE_URL?'set':'MISSING'));
   console.log('║  SESSION_SECRET='+(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'dev-insecure-secret-change-in-prod' ? 'set':'MISSING/default'));
+  if (!GRADING_SETTLEMENT_ENABLED)
+    console.warn('[grading] SETTLEMENT DISABLED reason='+GRADING_DISABLED_REASON+
+      ' dryRun='+GRADE_RUN_DRY_RUN_ENABLED+
+      ' workerSettlement='+WORKER_GRADE_SETTLEMENT_ENABLED+
+      ' manualSettlement='+MANUAL_GRADE_SETTLEMENT_ENABLED);
+  if (!BROWSER_TICKET_MIRROR_WRITES_ENABLED || !BROWSER_LEDGER_MIRROR_WRITES_ENABLED)
+    console.warn('[mirror] browser writes containment ticketWrites='+BROWSER_TICKET_MIRROR_WRITES_ENABLED+
+      ' ledgerWrites='+BROWSER_LEDGER_MIRROR_WRITES_ENABLED);
   console.log('╚══════════════════════════════════════════════════╝\n');
   console.log(`✅ Server running on port ${PORT}`);
   // Init DB after server is bound
