@@ -3735,6 +3735,59 @@ function _buildSnapshotRow(entry, outcome, opts) {
   return row;
 }
 
+// Module-scope flag so we introspect odds_snapshots' actual column set
+// exactly once per process. Diagnoses schema-drift PGRST204 failures (the
+// table has different columns than the code writes) without spamming logs.
+let _loggedSnapshotSchema = false;
+async function _logSnapshotSchemaOnce(sb, sampleRow) {
+  if (_loggedSnapshotSchema || !sb) return;
+  _loggedSnapshotSchema = true;
+  try {
+    // Lightweight HEAD-style probe: select 0 rows but force PostgREST to
+    // resolve the schema. The returned `error` object (if any) will name
+    // the first missing column it sees, which is the fastest path to a
+    // pinpoint diagnosis.
+    const { error } = await sb.from('odds_snapshots').select('snapshot_id').limit(0);
+    const sampleCols = sampleRow ? Object.keys(sampleRow).sort().join(',') : '(no sample)';
+    if (error) {
+      console.warn('ODDS_SNAPSHOTS_SCHEMA_PROBE_ERR'+
+        ' code='+(error.code||'?')+
+        ' message='+JSON.stringify((error.message||'').slice(0,200))+
+        ' details='+JSON.stringify((error.details||'').slice(0,200))+
+        ' hint='+JSON.stringify((error.hint||'').slice(0,200))+
+        ' writeColumns='+sampleCols);
+    } else {
+      console.log('ODDS_SNAPSHOTS_SCHEMA_PROBE_OK writeColumns='+sampleCols);
+    }
+  } catch(e) {
+    console.warn('ODDS_SNAPSHOTS_SCHEMA_PROBE_THREW msg='+(e&&e.message||e));
+  }
+}
+
+// Verbose error formatter for Supabase JS PostgREST errors. Surfaces the
+// fields the catch blocks were previously dropping: code, details, hint,
+// plus a bounded preview of the failing row's column set. Hardened so the
+// next schema-drift event surfaces in 30 seconds instead of a week.
+function _fmtSnapshotErr(label, e, rows) {
+  const code    = (e && (e.code||e.statusCode))     || '?';
+  const msg     = (e && e.message) || String(e || '');
+  const details = (e && e.details) || '';
+  const hint    = (e && e.hint)    || '';
+  const sample  = (rows && rows[0]) ? rows[0] : null;
+  const cols    = sample ? Object.keys(sample).sort().join(',') : '(no rows)';
+  const samplePreview = sample
+    ? JSON.stringify(sample).slice(0, 360)
+    : '';
+  return label+
+    ' code='+code+
+    ' msg='+JSON.stringify(msg.slice(0,300))+
+    ' details='+JSON.stringify(String(details).slice(0,200))+
+    ' hint='+JSON.stringify(String(hint).slice(0,200))+
+    ' rowCount='+(rows?rows.length:0)+
+    ' columns='+cols+
+    ' sample='+samplePreview;
+}
+
 async function _upsertOddsSnapshots() {
   const sb  = getSupabase();
   const now = new Date().toISOString();
@@ -3854,6 +3907,9 @@ async function _upsertOddsSnapshots() {
   console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length+
     ' seenEntries='+seenEntries+
     ' skipReasons='+JSON.stringify(skipReasons));
+  // One-shot schema introspection. Logs what columns the code is trying
+  // to write so a schema mismatch is visible in 30 seconds, not a week.
+  await _logSnapshotSchemaOnce(sb, rows[0]);
   try {
     const { error: upsertErr } = await sb.from('odds_snapshots').upsert(rows,
       { onConflict:'canonical_game_key,market_key,selection_key' });
@@ -3865,6 +3921,10 @@ async function _upsertOddsSnapshots() {
     // (PG code 42703). Retry once with the legacy projection so the system
     // keeps working until the migration runs.
     const msg = (e && e.message) || '';
+    const code = (e && (e.code||e.statusCode)) || '?';
+    // Surface the full error envelope BEFORE any retry decisions so we see
+    // what the DB actually returned even when the strip-fallback path runs.
+    console.warn(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR primary', e, rows));
     // Drop any column the migration hasn't applied yet. We strip the
     // priority-#11 canonical columns AND the priority-#12 player-prop +
     // provider columns in one pass so a single retry covers either state.
@@ -3891,11 +3951,14 @@ async function _upsertOddsSnapshots() {
         console.log('[snapshot] upserted '+legacyRows.length+' odds snapshots (legacy projection)');
         return;
       } catch(e2) {
-        console.warn('[snapshot] legacy upsert error:', e2.message);
+        console.warn(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR legacy', e2, legacyRows));
         return;
       }
     }
-    console.warn('[snapshot] upsert error:', msg);
+    // Non-canonical error path (e.g. PGRST204 schema cache, 23505 unique
+    // violation, 42P10 conflict-target mismatch). Already logged above via
+    // _fmtSnapshotErr; nothing else to retry without code change.
+    void code;
   }
 }
 
@@ -4765,18 +4828,33 @@ async function pollLiveOddsLoop() {
       // Enrich each Owls entry with the game-level fields _upsertOddsSnapshots
       // wants but the normalizer didn't stamp (commenceTime, sport_key). We
       // index games-by-id so the per-outcome enrichment is O(N) overall.
+      //
+      // CRITICAL: e.cKey is always set from the overlay map key, even when
+      // the game lookup misses. Previously this was gated on `if (g)`, which
+      // meant any provider_game_id ↔ normalizer-id mismatch caused
+      // _buildSnapshotRow() to return null on every outcome (cKey gate at
+      // line ~3640) — silently producing zero rows. The map key `ck` IS the
+      // canonical key by definition; using it as a fallback is safe.
       const gameById = {};
+      let cKeyFallbackHits = 0;
       for (const g of allGames) if (g && g.id) gameById[g.id] = g;
       for (const ck of Object.keys(overlayByCK)) {
         for (const e of overlayByCK[ck]) {
+          // Always-on: canonical key from the map key. Source of truth.
+          if (!e.cKey) e.cKey = ck;
           const g = e.providerGameId ? gameById[e.providerGameId] : null;
           if (g) {
             if (!e.commenceTime) e.commenceTime = g.commence_time || null;
             if (!e.sport)        e.sport        = g.sport_key     || null;
             if (!e.gameId)       e.gameId       = g.id            || null;
-            if (!e.cKey)         e.cKey         = ck;
+          } else if (e.providerGameId) {
+            cKeyFallbackHits++;
           }
         }
+      }
+      if (cKeyFallbackHits > 0) {
+        console.log('OWLS_ENRICH_CKEY_FALLBACK count='+cKeyFallbackHits+
+          ' reason=providerGameId_not_in_gameById (cKey still set from map key)');
       }
 
       // Overlay the maps onto the new cache. We keep newCache.games (the
