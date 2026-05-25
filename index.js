@@ -6205,14 +6205,30 @@ app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdem
         if (!gradeResult.ok && !gradeResult.idempotent)
           throw new Error('grade_rpc_rejected:'+gradeResult.error);
 
-        // Legacy mirror
+        // Legacy mirror (fire-and-forget for ordering, but surface errors
+        // instead of swallowing them — same anti-pattern we fixed in the
+        // snapshot upsert. Audit risk #8: silent DB mirror failures.)
         const legacyId = 'SG_'+combined+'_'+ticket.id+'_'+gradedAt;
         sb.from('ledger_entries').upsert({ id:legacyId, ticket_id:ticket.id,
           player_id:ticket.player_id, club_id:ticket.club_id,
           type:combined==='won'?'bet_won':combined==='push'?'bet_push':'bet_lost',
           amount:combined==='won'?profit:0, reason:'server_grade_'+combined,
           created_at:gradedAt, created_by:'server-grade-api'
-        }, { onConflict:'id' }).then(()=>{},()=>{});
+        }, { onConflict:'id' }).then(function(r){
+          if (r && r.error) {
+            console.warn('[grade] legacy ledger mirror error'+
+              ' ticketId='+ticket.id+
+              ' legacyId='+legacyId+
+              ' code='+(r.error.code||'?')+
+              ' msg='+JSON.stringify(String(r.error.message||'').slice(0,200))+
+              ' details='+JSON.stringify(String(r.error.details||'').slice(0,200))+
+              ' hint='+JSON.stringify(String(r.error.hint||'').slice(0,200)));
+          }
+        }, function(threw){
+          console.warn('[grade] legacy ledger mirror threw'+
+            ' ticketId='+ticket.id+
+            ' msg='+JSON.stringify(String(threw && threw.message || threw).slice(0,200)));
+        });
 
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type:'ticket_graded_server',
