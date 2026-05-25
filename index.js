@@ -3885,8 +3885,9 @@ async function _upsertOddsSnapshots() {
         return copy;
       });
       try {
-        await sb.from('odds_snapshots').upsert(legacyRows,
+        const { error: legacyErr } = await sb.from('odds_snapshots').upsert(legacyRows,
           { onConflict:'canonical_game_key,market_key,selection_key' });
+        if (legacyErr) throw legacyErr;
         console.log('[snapshot] upserted '+legacyRows.length+' odds snapshots (legacy projection)');
         return;
       } catch(e2) {
@@ -4825,9 +4826,8 @@ async function pollLiveOddsLoop() {
 }
 
 // Start poller on boot
-if (ODDS_KEY) {
-  pollLiveOddsLoop(); // immediate
-  setInterval(pollLiveOddsLoop, CACHE_POLL_INTERVAL);
+if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
+  pollLiveOddsLoopWithSnapshots(); // immediate — also fires _upsertOddsSnapshots on first tick
 }
 
 // ── ODDS VALIDATION HELPERS ───────────────────────────────────────────────────────────────────────────
