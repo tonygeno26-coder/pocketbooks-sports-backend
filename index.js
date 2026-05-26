@@ -3194,6 +3194,8 @@ function requireActor(req) {
       }
     }
 
+
+
     console.log('[auth] ok actor='+p.sub+' role='+role+' club='+club+(jti?' jti='+jti:''));
     return { actorId:p.sub||p.actorId, role, clubId:club, platformRole:platRole,
              jti, isDevBypass:false, fromToken:true };
@@ -3229,6 +3231,8 @@ function _checkClubScope(actor, requestedClubId) {
   if (!requestedClubId) return { ok:true }; // no club in request — DB filter applies
   if (actor.platformRole === 'platform_admin') return { ok:true, crossClub:true };
   if (actor.isDevBypass) return { ok:true };
+  // Membership-verified legacy tokens: clubId was DB-confirmed at auth time
+  if (actor.membershipVerified) return { ok:true };
   if (actor.clubId && actor.clubId !== requestedClubId) {
     return {
       ok:false, reason:'club_scope_mismatch', status:403,
@@ -3247,7 +3251,8 @@ function _deriveClubId(actor, req) {
   // platform_admin and dev bypass may use body/query
   if (actor.platformRole === 'platform_admin') return bodyClub || queryClub || actor.clubId;
   if (actor.isDevBypass) return bodyClub || queryClub || actor.clubId;
-  // Production: ONLY trust token clubId
+  // Production: trust token clubId; also trust reqClub for membership-verified legacy tokens
+  if (actor.membershipVerified) return actor.clubId || null;
   return actor.clubId || null;
 }
 
@@ -4509,7 +4514,56 @@ function _safeClubId(req) {
 
 function requirePermissionScoped(action, getTargetPlayerId) {
   return async function(req, res, next) {
-    const actor = requireActor(req);
+    let actor = requireActor(req);
+
+    // ── Legacy token async membership resolution ──────────────────────────────
+    // Tokens from /api/auth/login carry {id,email,role:'user'} with no clubId.
+    // requireActor is sync so it tags these as legacyToken=true.
+    // We resolve membership here where we can safely await.
+    if (actor.legacyToken && !actor.error) {
+      const _reqClub = actor.reqClub || (req.body && req.body.clubId) || (req.query && req.query.clubId) || (req.headers['x-club-id']||'').trim() || '';
+      const _legacyId = actor.actorId;
+      console.log('[auth] LEGACY_MEMBERSHIP_LOOKUP actor='+_legacyId+' reqClub='+_reqClub+' action='+action);
+      let _legacyMem = null;
+      if (_reqClub) {
+        try {
+          const _sb = getSupabase();
+          if (_sb) {
+            const _numId = parseInt(_legacyId, 10);
+            const _orFilter = isNaN(_numId)
+              ? 'actor_id.eq.'+_legacyId+',player_id.eq.'+_legacyId
+              : 'actor_id.eq.'+_legacyId+',player_id.eq.'+_legacyId+',actor_id.eq.'+_numId+',player_id.eq.'+_numId;
+            const { data:_md } = await _sb.from('club_memberships')
+              .select('actor_id,player_id,club_id,role,status')
+              .eq('club_id', _reqClub)
+              .or(_orFilter)
+              .limit(1);
+            _legacyMem = _md && _md[0] ? _md[0] : null;
+          }
+        } catch(_me) { console.warn('[auth] legacy membership lookup error:', _me.message); }
+      }
+      if (!_reqClub || !_legacyMem) {
+        const _reason = !_reqClub ? 'missing_clubId' : 'membership_not_found';
+        console.log('[auth] LEGACY_MEMBERSHIP_REJECT actor='+_legacyId+' reqClub='+(_reqClub||'(none)')+' reason='+_reason);
+        _writeAuthAudit(_reason, _legacyId, _reqClub, req.path);
+        return res.status(403).json({ ok:false, error:_reason,
+          hint:'token has no clubId claim; '+(_reqClub?'no approved membership found in club':'no clubId in request') });
+      }
+      if (_legacyMem.status !== 'active' && _legacyMem.status !== 'approved') {
+        console.log('[auth] LEGACY_MEMBERSHIP_REJECT actor='+_legacyId+' status='+_legacyMem.status);
+        _writeAuthAudit('membership_inactive', _legacyId, _reqClub, req.path, { status:_legacyMem.status });
+        return res.status(403).json({ ok:false, error:'membership_inactive', membershipStatus:_legacyMem.status });
+      }
+      const _LEGACY_ROLE_MAP = { host:'full_admin', admin:'full_admin', cohost:'settlement_manager', staff:'risk_viewer' };
+      const _rawRole = _legacyMem.role || 'player';
+      const _mapped  = _LEGACY_ROLE_MAP[_rawRole] || _rawRole;
+      const _dbRole  = ROLE_RANK[_mapped] != null ? _mapped : 'player';
+      console.log('[auth] LEGACY_MEMBERSHIP_OK actor='+_legacyId+' reqClub='+_reqClub+' dbRole='+_dbRole+' status='+_legacyMem.status);
+      actor = Object.assign({}, actor, { role:_dbRole, clubId:String(_reqClub), membershipVerified:true });
+      req._legacyMembership = _legacyMem;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Club scope: derive from token; check against body/query value (must match)
     const requestedClubId = (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
     console.log('BACKEND_CLUB_SCOPE_CHECK'
