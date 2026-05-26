@@ -7732,7 +7732,16 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
     if (tErr) throw tErr;
     const ticket = tickets && tickets[0];
     if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
-    if (ticket.player_id !== playerId) return res.status(403).json({ ok:false, error:'not_owner' });
+    const _cancelActor = req._actor || {};
+    const _cancelActorRank = ROLE_RANK[_cancelActor.role] != null ? ROLE_RANK[_cancelActor.role] : -99;
+    const _isPrivilegedCancel = _cancelActorRank >= ROLE_RANK.full_admin || _cancelActor.platformRole === 'platform_admin';
+    // Privileged actors (full_admin+) can cancel any ticket in the club; players must own the ticket
+    if (!_isPrivilegedCancel && ticket.player_id !== playerId) {
+      return res.status(403).json({ ok:false, error:'not_owner',
+        hint:'player can only cancel own tickets; host/admin can cancel any' });
+    }
+    // Use ticket's actual player_id for ledger operations (body.playerId may differ when host cancels for player)
+    const _effectivePlayerId = ticket.player_id || playerId;
     if (clubId && ticket.club_id && ticket.club_id !== clubId) return res.status(403).json({ ok:false, error:'wrong_club' });
     const s = ticket.status.toLowerCase();
     if (s === 'canceled' || s === 'voided') return res.json({ ok:true, idempotent:true, ticketId, message:'already_canceled' });
@@ -7753,10 +7762,10 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
     const cancelResult = await _callMoneyRpc('cancel_bet_tx', {
       p_ticket_id:       ticketId,
       p_club_id:         clubId||ticket.club_id||'',
-      p_player_id:       playerId,
+      p_player_id:       _effectivePlayerId,
       p_idempotency_key: idempotencyKey,
       p_reason:          reason||'player_request',
-      p_created_by:      playerId
+      p_created_by:      _cancelActor.actorId || _effectivePlayerId
     });
     if (!cancelResult.ok && !cancelResult.idempotent) {
       const code = cancelResult.error||'cancel_failed';
@@ -7767,26 +7776,28 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
 
     // 5. Legacy ledger_entries mirror (fire-and-forget)
     sb.from('ledger_entries').upsert({
-      id: idempotencyKey, club_id: clubId||null, player_id: playerId,
+      id: idempotencyKey, club_id: clubId||null, player_id: _effectivePlayerId,
       ticket_id: ticketId, type: 'bet_canceled', amount: riskAmt,
-      reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: playerId
+      reason: 'cancel:'+(reason||'player_request'), created_at: now, created_by: _cancelActor.actorId||_effectivePlayerId
     }, { onConflict:'id' }).then(()=>{},()=>{});
 
     // 6. Audit event
     await sb.from('audit_events').insert({
-      event_type: 'ticket_canceled', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
+      event_type: 'ticket_canceled', player_id: _effectivePlayerId, club_id: clubId||null, ticket_id: ticketId,
       payload: { reason:reason||'player_request', refundAmount:riskAmt,
+                 canceledBy:_cancelActor.actorId||_effectivePlayerId,
                  idempotencyKey, txResult:cancelResult }
     });
 
     const refundAmt = cancelResult.refund || riskAmt;
-    console.log('[bets/cancel] RPC ok ticketId='+ticketId+' refund=$'+refundAmt);
+    console.log('[bets/cancel] RPC ok ticketId='+ticketId+' refund=$'+refundAmt+' player='+_effectivePlayerId);
     emitEvent('ticket_canceled',{ ticketId, refundAmount:refundAmt, balanceAfter:cancelResult.balance_after },
-      { clubId, actorId:playerId, playerId }, req.requestId);
-    emitEvent('balance_changed',{ playerId, balanceAfter:cancelResult.balance_after },
-      { clubId, playerId }, req.requestId);
+      { clubId, actorId:_cancelActor.actorId||_effectivePlayerId, playerId:_effectivePlayerId }, req.requestId);
+    emitEvent('balance_changed',{ playerId:_effectivePlayerId, balanceAfter:cancelResult.balance_after },
+      { clubId, playerId:_effectivePlayerId }, req.requestId);
     res.json({ ok:true, ticketId, status:'canceled', refundAmount:refundAmt,
-               ledgerEntryId:idempotencyKey, balanceAfter:cancelResult.balance_after });
+               ledgerEntryId:idempotencyKey, balanceAfter:cancelResult.balance_after,
+               canceledBy:_cancelActor.actorId||_effectivePlayerId });
   } catch(e) {
     console.error('[bets/cancel] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
