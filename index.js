@@ -3138,7 +3138,23 @@ function requireActor(req) {
     const jti     = p.jti || null;
 
     // Phase F: production requires jti + session store check
+    // Exception: legacy login tokens (jwt.sign format: {id, email, role}, no sub/actorId/jti)
+    // are tagged for async membership verification instead of hard-rejected.
     if (IS_PRODUCTION && !jti) {
+      const _isLegacyLoginToken = !p.sub && !p.actorId && !p.clubId && (p.id || p.email);
+      if (_isLegacyLoginToken) {
+        const _legacyActorId = String(p.id || p.email || '');
+        console.log('[auth] legacy_login_token actor='+_legacyActorId+' — tagging for membership lookup (no jti)');
+        return {
+          actorId: _legacyActorId,
+          role: 'view_only',
+          clubId: '',
+          platformRole: null,
+          jti: null, isDevBypass: false, fromToken: true,
+          legacyToken: true,
+          reqClub: reqClub
+        };
+      }
       console.log('[auth] legacy_token_missing_jti from '+req.path);
       _writeAuthAudit('legacy_token_missing_jti', p.sub||p.actorId, club, req.path);
       return { error:'legacy_token_missing_jti', status:401, auditEvent:'legacy_token_missing_jti' };
@@ -3234,7 +3250,13 @@ function _checkClubScope(actor, requestedClubId) {
   if (actor.isDevBypass) return { ok:true };
   // Membership-verified legacy tokens: clubId was DB-confirmed at auth time
   if (actor.membershipVerified) return { ok:true };
+  // Only reject if token has a NON-EMPTY clubId that differs from requested.
+  // Empty clubId = legacy login token (no club claim) — let membership lookup decide.
   if (actor.clubId && actor.clubId !== requestedClubId) {
+    console.log('[auth] CLUB_SCOPE_MISMATCH_RETURN actorClub='+actor.clubId
+      +' requestedClub='+requestedClubId
+      +' legacyToken='+(actor.legacyToken||false)
+      +' membershipVerified='+(actor.membershipVerified||false));
     return {
       ok:false, reason:'club_scope_mismatch', status:403,
       auditEvent:'club_scope_mismatch',
@@ -4521,7 +4543,9 @@ function requirePermissionScoped(action, getTargetPlayerId) {
     // Tokens from /api/auth/login carry {id,email,role:'user'} with no clubId.
     // requireActor is sync so it tags these as legacyToken=true.
     // We resolve membership here where we can safely await.
-    if (actor.legacyToken && !actor.error) {
+    // Gate: legacy token tagged, OR any actor with empty clubId + a requested club
+    // (covers: IS_PRODUCTION=true + jti check blocked tag, or other auth paths)
+    if (!actor.error && (actor.legacyToken || (!actor.clubId && !actor.isDevBypass))) {
       const _reqClub = actor.reqClub || (req.body && req.body.clubId) || (req.query && req.query.clubId) || (req.headers['x-club-id']||'').trim() || '';
       const _legacyId = actor.actorId;
       console.log('[auth] LEGACY_MEMBERSHIP_LOOKUP actor='+_legacyId+' reqClub='+_reqClub+' action='+action);
