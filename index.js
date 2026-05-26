@@ -4612,16 +4612,29 @@ function requirePermissionScoped(action, getTargetPlayerId) {
         try {
           const _sb = getSupabase();
           if (_sb) {
+            // club_memberships schema: actor_id text, club_id text, role text, status text
+            // Query: match club_id exactly, then find by actor_id (string AND numeric forms)
             const _numId = parseInt(_legacyId, 10);
-            const _orFilter = isNaN(_numId)
-              ? 'actor_id.eq.'+_legacyId+',player_id.eq.'+_legacyId
-              : 'actor_id.eq.'+_legacyId+',player_id.eq.'+_legacyId+',actor_id.eq.'+_numId+',player_id.eq.'+_numId;
-            const { data:_md } = await _sb.from('club_memberships')
-              .select('actor_id,player_id,club_id,role,status')
+            // Try string actor_id first (most common)
+            let _md = null;
+            const _r1 = await _sb.from('club_memberships')
+              .select('actor_id,club_id,role,status')
               .eq('club_id', _reqClub)
-              .or(_orFilter)
+              .eq('actor_id', _legacyId)
               .limit(1);
-            _legacyMem = _md && _md[0] ? _md[0] : null;
+            if (_r1.data && _r1.data[0]) {
+              _md = _r1.data[0];
+            } else if (!isNaN(_numId)) {
+              // Try numeric form
+              const _r2 = await _sb.from('club_memberships')
+                .select('actor_id,club_id,role,status')
+                .eq('club_id', _reqClub)
+                .eq('actor_id', String(_numId))
+                .limit(1);
+              _md = _r2.data && _r2.data[0] ? _r2.data[0] : null;
+            }
+            console.log('[auth] MEMBERSHIP_QUERY clubId='+_reqClub+' actorId='+_legacyId+' found='+(!!_md)+(_md?' status='+_md.status+' role='+_md.role:''));
+            _legacyMem = _md || null;
           }
         } catch(_me) { console.warn('[auth] legacy membership lookup error:', _me.message); }
       }
