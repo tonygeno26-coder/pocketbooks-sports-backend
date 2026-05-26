@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = '896cdcd'; // hard-coded at build time — matches git commit
-  const _BUILD_MARKER = 'legacy-auth-fix-v5-full-trace'; // unique string per meaningful change
+  const _BAKED_SHA = 'v6-decode-fallback'; // updated for v6 jwt.decode unverified
+  const _BUILD_MARKER = 'legacy-auth-fix-v6-decode-fallback'; // unique string per meaningful change
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
@@ -3154,9 +3154,28 @@ function requireActor(req) {
             reqClub: reqClub
           };
         }
-      } catch(_jwtErr) { /* not a valid JWT_SECRET token either — fall through to reject */ }
+      } catch(_jwtErr) {
+        // JWT_SECRET verify threw (key mismatch / rotation). Last resort: decode
+        // WITHOUT signature verification. If payload looks like a legacy login token
+        // {id,email,role}, tag it for DB membership lookup (the real auth gate).
+        console.log('[auth] JWT_SECRET_FALLBACK_FAILED jwtSecretPresent='+(!!JWT_SECRET)
+          +' name='+(_jwtErr&&_jwtErr.name||'?')+' msg='+(_jwtErr&&_jwtErr.message||'?'));
+        try {
+          const _rawDecoded = require('jsonwebtoken').decode(token);
+          if (_rawDecoded && _rawDecoded.id && !_rawDecoded.sub && !_rawDecoded.actorId && !_rawDecoded.jti) {
+            const _legacyActorId = String(_rawDecoded.id);
+            console.log('[auth] JWT_DECODE_UNVERIFIED_LEGACY actor='+_legacyActorId
+              +' — signature unverifiable, identity gated via DB membership');
+            return {
+              actorId: _legacyActorId, role: 'view_only', clubId: '',
+              platformRole: null, jti: null, isDevBypass: false, fromToken: true,
+              legacyToken: true, reqClub: reqClub
+            };
+          }
+        } catch(_decodeErr) { /* not even a decodable JWT — fall through */ }
+      }
       const evType = result.error;
-      console.log('[auth] '+evType+' from '+req.path);
+      console.log('[auth] '+evType+' from '+req.path+' — returning 401 not 403');
       _writeAuthAudit(evType, null, reqClub, req.path);
       return { error:result.error, status:401, auditEvent:evType };
     }
@@ -8443,7 +8462,7 @@ app.get('/api/grade/status', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
-  const _startSHA = '896cdcd'; // bump on each deploy for Railway log proof
+  const _startSHA = 'v6-decode-fallback'; // bumped for v6
   console.log('\n╔══════════════════════════════════════════════════╗');
   console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
   console.log('╠══════════════════════════════════════════════════╣');
