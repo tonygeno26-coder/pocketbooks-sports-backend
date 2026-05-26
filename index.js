@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = '8c12ff1'; // hard-coded at build time — matches git commit
-  const _BUILD_MARKER = 'legacy-auth-fix-v4-jwt-fallback'; // unique string per meaningful change
+  const _BAKED_SHA = '896cdcd'; // hard-coded at build time — matches git commit
+  const _BUILD_MARKER = 'legacy-auth-fix-v5-full-trace'; // unique string per meaningful change
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
@@ -3134,6 +3134,12 @@ function requireActor(req) {
       try {
         const _jwtLib = require('jsonwebtoken');
         const _decoded = _jwtLib.verify(token, JWT_SECRET);
+        console.log('[auth] JWT_SECRET_FALLBACK_DECODED id='+(_decoded&&_decoded.id||'?')
+          + ' sub='+(_decoded&&_decoded.sub||'none')
+          + ' actorId='+(_decoded&&_decoded.actorId||'none')
+          + ' jti='+(_decoded&&_decoded.jti||'none')
+          + ' clubId='+(_decoded&&_decoded.clubId||'none')
+          + ' isLegacy='+!!(_decoded && _decoded.id && !_decoded.sub && !_decoded.actorId && !_decoded.jti));
         // Only treat as legacy if it has id/email but no sub/actorId/jti/clubId
         if (_decoded && _decoded.id && !_decoded.sub && !_decoded.actorId && !_decoded.jti) {
           const _legacyActorId = String(_decoded.id);
@@ -4561,6 +4567,16 @@ function _safeClubId(req) {
 function requirePermissionScoped(action, getTargetPlayerId) {
   return async function(req, res, next) {
     let actor = requireActor(req);
+    // ── Entry trace: log raw actor immediately after requireActor ─────────────
+    console.log('[auth] RPS_ENTRY action='+action
+      + ' actor.error='       + (actor.error       || 'none')
+      + ' actor.actorId='     + (actor.actorId      || '?')
+      + ' actor.clubId="'     + (actor.clubId        || '') + '"'
+      + ' actor.legacyToken=' + (actor.legacyToken   || false)
+      + ' actor.isDevBypass=' + (actor.isDevBypass   || false)
+      + ' actor.fromToken='   + (actor.fromToken     || false)
+      + ' reqClub_header='    + (req.headers['x-club-id']||'(none)')
+      + ' body.clubId='       + ((req.body && req.body.clubId)||'(none)'));
 
     // ── Legacy token async membership resolution ──────────────────────────────
     // Tokens from /api/auth/login carry {id,email,role:'user'} with no clubId.
@@ -4633,9 +4649,31 @@ function requirePermissionScoped(action, getTargetPlayerId) {
         + ' mismatch=YES');
       _writeAuthAudit('club_scope_mismatch', actor.actorId, actor.clubId, req.path,
         { requestedClubId, action, role:actor.role });
+      // ── DIAGNOSTIC v4: full actor state at the moment of 403 ──────────────
+      console.error('[auth] CSM_RETURN_v4'
+        + ' buildMarker=legacy-auth-fix-v4-jwt-fallback'
+        + ' actor.error='          + (actor.error         || 'none')
+        + ' actor.actorId='        + (actor.actorId        || '?')
+        + ' actor.clubId="'        + (actor.clubId         || '') + '"'
+        + ' actor.legacyToken='    + (actor.legacyToken    || false)
+        + ' actor.membershipVerified=' + (actor.membershipVerified || false)
+        + ' actor.isDevBypass='    + (actor.isDevBypass    || false)
+        + ' actor.fromToken='      + (actor.fromToken      || false)
+        + ' actor.role='           + (actor.role           || '?')
+        + ' requestedClubId='      + (requestedClubId      || '(none)')
+        + ' action='               + action
+        + ' path='                 + req.path
+        + ' authHeader_prefix='    + ((req.headers['authorization']||'').slice(0,20))
+        + ' x-club-id='            + (req.headers['x-club-id']||'(none)')
+        + ' body.clubId='          + ((req.body && req.body.clubId) || '(none)'));
       return res.status(403).json({ ok:false, error:'club_scope_mismatch',
         actorClubId:actor.clubId, requestedClubId, action,
-        hint:'token_club_must_match_payload_clubId' });
+        hint:'token_club_must_match_payload_clubId',
+        _debug:{ buildMarker:'legacy-auth-fix-v5-full-trace',
+                 actorError:actor.error||null, actorClubId:actor.clubId||'',
+                 legacyToken:actor.legacyToken||false,
+                 membershipVerified:actor.membershipVerified||false,
+                 isDevBypass:actor.isDevBypass||false } });
     }
     // Permission check (role)
     const targetId = typeof getTargetPlayerId === 'function'
@@ -8405,7 +8443,7 @@ app.get('/api/grade/status', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
-  const _startSHA = '8c12ff1'; // bump on each deploy for Railway log proof
+  const _startSHA = '896cdcd'; // bump on each deploy for Railway log proof
   console.log('\n╔══════════════════════════════════════════════════╗');
   console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
   console.log('╠══════════════════════════════════════════════════╣');
