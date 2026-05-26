@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = '18f5a4d'; // hard-coded at build time — matches git commit
-  const _BUILD_MARKER = 'legacy-auth-fix-v3'; // unique string per meaningful change
+  const _BAKED_SHA = '8c12ff1'; // hard-coded at build time — matches git commit
+  const _BUILD_MARKER = 'legacy-auth-fix-v4-jwt-fallback'; // unique string per meaningful change
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
@@ -3128,6 +3128,27 @@ function requireActor(req) {
     const token  = authHeader.slice(7);
     const result = _verifyToken(token);
     if (!result.ok) {
+      // ── Legacy JWT fallback: token signed with JWT_SECRET (login tokens) ──
+      // If SESSION_SECRET-based verify fails, try JWT_SECRET-based verify.
+      // Login tokens from /api/auth/login use jwt.sign with JWT_SECRET.
+      try {
+        const _jwtLib = require('jsonwebtoken');
+        const _decoded = _jwtLib.verify(token, JWT_SECRET);
+        // Only treat as legacy if it has id/email but no sub/actorId/jti/clubId
+        if (_decoded && _decoded.id && !_decoded.sub && !_decoded.actorId && !_decoded.jti) {
+          const _legacyActorId = String(_decoded.id);
+          console.log('[auth] legacy_login_token actor='+_legacyActorId+' — tagging for membership lookup (JWT_SECRET verified)');
+          return {
+            actorId: _legacyActorId,
+            role: 'view_only',
+            clubId: '',
+            platformRole: null,
+            jti: null, isDevBypass: false, fromToken: true,
+            legacyToken: true,
+            reqClub: reqClub
+          };
+        }
+      } catch(_jwtErr) { /* not a valid JWT_SECRET token either — fall through to reject */ }
       const evType = result.error;
       console.log('[auth] '+evType+' from '+req.path);
       _writeAuthAudit(evType, null, reqClub, req.path);
@@ -8384,7 +8405,7 @@ app.get('/api/grade/status', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
-  const _startSHA = '18f5a4d'; // bump on each deploy for Railway log proof
+  const _startSHA = '8c12ff1'; // bump on each deploy for Railway log proof
   console.log('\n╔══════════════════════════════════════════════════╗');
   console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
   console.log('╠══════════════════════════════════════════════════╣');
