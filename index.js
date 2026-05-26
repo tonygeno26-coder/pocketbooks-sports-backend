@@ -1732,8 +1732,9 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
+  const _BAKED_SHA = '814ad8a'; // hard-coded at build time — matches git commit
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
-    commit:process.env.COMMIT_SHA||null, dbStatus, oddsStatus,
+    commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA, dbStatus, oddsStatus,
     resultStatus:'unknown', queueStatus:'not_implemented',
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:null,
     requestId:req.requestId });
@@ -8357,7 +8358,7 @@ app.get('/api/grade/status', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════
 
 app.listen(PORT, '0.0.0.0', () => {
-  const _startSHA = '749a7e0'; // bump on each deploy for Railway log proof
+  const _startSHA = '814ad8a'; // bump on each deploy for Railway log proof
   console.log('\n╔══════════════════════════════════════════════════╗');
   console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
   console.log('╠══════════════════════════════════════════════════╣');
