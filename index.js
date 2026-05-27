@@ -7555,57 +7555,57 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     let serverPayout = null;
     let serverProfit = null;
 
-    if (!_bodyRaw.oddsAccepted) {
-      // Verify all legs against odds_snapshots table
-      const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
-      if (payoutResult && !payoutResult.ok) {
-        const httpStatus = payoutResult.code==='odds_service_unavailable'?503
-          : (payoutResult.code==='odds_changed'
-            ||payoutResult.code==='market_unavailable'
-            ||payoutResult.code==='market_closed'
-            ||payoutResult.code==='odds_stale')?409 : 422;
-        console.log('[bets/place] snapshot validation failed:', payoutResult.code,
-          payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
-        // Surface a clean user-facing message for Live tab placement.
-        // Only fire when the market is actually suspended or the game is final/canceled.
-        if (!payoutResult.userMessage) {
-          if (payoutResult.code === 'market_unavailable') {
-            payoutResult.userMessage =
-              payoutResult.reason === 'game_final'    ? 'Market unavailable: game is final.' :
-              payoutResult.reason === 'game_canceled' ? 'Market unavailable: game canceled.' :
-              payoutResult.reason === 'suspended'     ? 'Market unavailable: temporarily suspended.' :
-                                                        'Market unavailable.';
-          } else if (payoutResult.code === 'odds_changed') {
-            payoutResult.userMessage = 'Odds changed — please review and confirm.';
-          } else if (payoutResult.code === 'odds_stale') {
-            payoutResult.userMessage = 'Odds refreshing — please try again.';
-          } else if (payoutResult.code === 'odds_service_unavailable') {
-            payoutResult.userMessage = 'Odds service unavailable — please try again shortly.';
-          }
+    // Snapshot validation is unconditional — oddsAccepted is a UI-only signal
+    // and must never bypass server authority over payout calculation.
+    // A client sending { oddsAccepted: true, payout: 9999 } gets no special treatment.
+    const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
+    if (payoutResult && !payoutResult.ok) {
+      const httpStatus = payoutResult.code==='odds_service_unavailable'?503
+        : (payoutResult.code==='odds_changed'
+          ||payoutResult.code==='market_unavailable'
+          ||payoutResult.code==='market_closed'
+          ||payoutResult.code==='odds_stale')?409 : 422;
+      console.log('[bets/place] snapshot validation failed:', payoutResult.code,
+        payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
+      // Surface a clean user-facing message for Live tab placement.
+      // Only fire when the market is actually suspended or the game is final/canceled.
+      if (!payoutResult.userMessage) {
+        if (payoutResult.code === 'market_unavailable') {
+          payoutResult.userMessage =
+            payoutResult.reason === 'game_final'    ? 'Market unavailable: game is final.' :
+            payoutResult.reason === 'game_canceled' ? 'Market unavailable: game canceled.' :
+            payoutResult.reason === 'suspended'     ? 'Market unavailable: temporarily suspended.' :
+                                                      'Market unavailable.';
+        } else if (payoutResult.code === 'odds_changed') {
+          payoutResult.userMessage = 'Odds changed — please review and confirm.';
+        } else if (payoutResult.code === 'odds_stale') {
+          payoutResult.userMessage = 'Odds refreshing — please try again.';
+        } else if (payoutResult.code === 'odds_service_unavailable') {
+          payoutResult.userMessage = 'Odds service unavailable — please try again shortly.';
         }
-        // Emit risk alert for snapshot rejection
-        var _snapRaType = { odds_changed:'odds_change_rejections',
-          odds_stale:'stale_line_attempts',
-          market_unavailable:'stale_line_attempts',
-          market_closed:'stale_line_attempts',
-          odds_service_unavailable:null }[payoutResult.code];
-        if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
-          { code:payoutResult.code, reason:payoutResult.reason, leg:payoutResult.leg });
-        const _updatedLegs = (payoutResult.code === 'odds_changed' && payoutResult.legs)
-          ? payoutResult.legs.map(function(l){ return { pick:l.pick, odds:l.liveOdds||l.odds, market:l.market, gameId:l.gameId }; })
-          : undefined;
-        return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult,
-          _updatedLegs ? { updatedLegs: _updatedLegs } : {}));
       }
-      if (payoutResult && payoutResult.ok) {
-        // Override client payout with server-calculated value
-        legsArr = payoutResult.legs;
-        serverPayout = payoutResult.payout;
-        serverProfit = rnd(serverPayout - stakeAmt);
-        const anyFallback = legsArr.some(function(l){ return l.dev_fallback; });
-        console.log('[bets/place] server payout recalculated:', payoutResult.payout,
-          '(client:', parseFloat(payout)||0, anyFallback?'[DEV FALLBACK]':'');
-      }
+      // Emit risk alert for snapshot rejection
+      var _snapRaType = { odds_changed:'odds_change_rejections',
+        odds_stale:'stale_line_attempts',
+        market_unavailable:'stale_line_attempts',
+        market_closed:'stale_line_attempts',
+        odds_service_unavailable:null }[payoutResult.code];
+      if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
+        { code:payoutResult.code, reason:payoutResult.reason, leg:payoutResult.leg });
+      const _updatedLegs = (payoutResult.code === 'odds_changed' && payoutResult.legs)
+        ? payoutResult.legs.map(function(l){ return { pick:l.pick, odds:l.liveOdds||l.odds, market:l.market, gameId:l.gameId }; })
+        : undefined;
+      return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult,
+        _updatedLegs ? { updatedLegs: _updatedLegs } : {}));
+    }
+    if (payoutResult && payoutResult.ok) {
+      // Server payout is always authoritative — client payout value is ignored.
+      legsArr = payoutResult.legs;
+      serverPayout = payoutResult.payout;
+      serverProfit = rnd(serverPayout - stakeAmt);
+      const anyFallback = legsArr.some(function(l){ return l.dev_fallback; });
+      console.log('[bets/place] server payout recalculated:', payoutResult.payout,
+        '(client submitted:', parseFloat(payout)||0, anyFallback?'[DEV FALLBACK]':'');
     }
 
     // 3b. Conflict check: active legs on same game+market
