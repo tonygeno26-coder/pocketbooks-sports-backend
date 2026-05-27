@@ -7493,32 +7493,32 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       .eq('player_id', playerId)
       .eq('club_id', clubId);
 
-    // Starting balance: read from player_limits (modern, club-scoped source).
-    // club_members is legacy; it has no rows for UUID-club players and no club_id filter.
-    // IMPORTANT: a missing player_limits row is an EXPLICIT REJECTION — there is no
-    // silent $1,000 fallback. If no row exists the player has no account at this club
-    // and must not be allowed to place bets. The RPC enforces its own balance check
-    // atomically; this precheck is the fast early-exit before we hit the DB further.
+    // Starting balance: read from club_members (the balance table for this schema).
+    // club_members.balance_start is the authoritative starting balance, scoped by
+    // club_id + player_id. player_limits holds risk limits (max_bet, max_payout),
+    // not balance. IMPORTANT: a missing club_members row is an EXPLICIT REJECTION —
+    // there is no silent $1,000 fallback. The RPC re-checks atomically; this precheck
+    // is the fast early-exit before the atomic write.
     let startBal = null;
     try {
-      const { data:mem } = await sb.from('player_limits').select('balance_start')
+      const { data:mem } = await sb.from('club_members').select('balance_start')
         .eq('club_id',clubId).eq('player_id',playerId).limit(1);
       if (mem&&mem[0]) {
         const _parsed = parseFloat(mem[0].balance_start);
         if (!isNaN(_parsed)) startBal = _parsed;
       }
     } catch(_limitsErr) {
-      // DB error reading limits — fail-open here (RPC is the authoritative gate).
+      // DB error reading balance — fail-open here (RPC is the authoritative gate).
       // Log and allow the RPC to make the final call.
-      console.warn('[bets/place] player_limits read error (RPC will enforce):', _limitsErr.message);
+      console.warn('[bets/place] club_members read error (RPC will enforce):', _limitsErr.message);
       startBal = 0; // conservative: 0 means only ledger gains can cover the stake
     }
 
     if (startBal === null) {
       return res.status(400).json({
         ok: false,
-        error: 'no_player_limits_found',
-        hint: 'No balance record found for this player at this club. A player_limits row must exist before bets can be placed.'
+        error: 'no_club_member_balance_found',
+        hint: 'No balance record found for this player at this club. A club_members row must exist before bets can be placed.'
       });
     }
 
