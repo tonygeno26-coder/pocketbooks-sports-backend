@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = 'cancel-membership-fix-v1'; // cancel_bet membership verification
-  const _BUILD_MARKER = 'cancel-membership-fix-v1'; // unique string per meaningful change
+  const _BAKED_SHA = 'club-id-normalization-v1'; // club ID normalization guard
+  const _BUILD_MARKER = 'club-id-normalization-v1'; // unique string per meaningful change
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
@@ -3329,6 +3329,41 @@ function _deriveClubId(actor, req) {
 
 // Extend requirePermission to enforce club scope
 // _safeClubId: get canonical clubId for a request (req._clubId set by scope middleware, or body/query in dev)
+
+// ── Club ID normalization guard ───────────────────────────────────────────────
+// Modern Supabase-backed routes require canonical UUID/text club IDs.
+// Numeric-only club IDs (e.g. "1", "42") are legacy PostgreSQL integer PKs
+// from the old /api/clubs system and must not reach Supabase RPC/query paths.
+// Apply this middleware BEFORE requirePermissionScoped on protected routes.
+//
+// Accepts: UUIDs, slug-style text, any string containing non-numeric chars
+// Rejects: strings that are purely numeric ("1", "42", "100")
+// Bypass:  dev bypass actors; also skipped when clubId is absent (other guards handle that)
+const _NUMERIC_CLUB_ID_RE = /^\d+$/;
+
+function requireCanonicalClubId(req, res, next) {
+  const clubId = (req.body && req.body.clubId)
+    || (req.query && req.query.clubId)
+    || (req.headers['x-club-id'] || '').trim()
+    || '';
+  // If no clubId present, let downstream guards handle missing-clubId
+  if (!clubId) return next();
+  // Dev bypass: allow numeric IDs in dev/test environments
+  const bypassAllowed = process.env.NODE_ENV !== 'production' || process.env.DEV_AUTH_BYPASS === 'true';
+  if (bypassAllowed) return next();
+  // Reject purely numeric club IDs on production Supabase routes
+  if (_NUMERIC_CLUB_ID_RE.test(clubId)) {
+    console.log('[club-id] NUMERIC_CLUB_ID_REJECTED clubId='+clubId+' path='+req.path);
+    return res.status(400).json({
+      ok: false,
+      error: 'legacy_club_id_not_supported',
+      clubId,
+      hint: 'This route requires a UUID club ID. Numeric club IDs ('+clubId+') are legacy and not supported on this endpoint. Obtain a canonical club UUID via GET /api/clubs or the lobby.'
+    });
+  }
+  next();
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // CANONICAL LEDGER ENGINE
 // ════════════════════════════════════════════════════════════════════════════
@@ -6279,7 +6314,7 @@ async function _sgFetchCompletedGames(daysBack) {
 }
 
 // POST /api/grade/manual — admin manual grade override
-app.post('/api/grade/manual', requirePermissionScoped('run_server_grade'), async (req, res) => {
+app.post('/api/grade/manual', requireCanonicalClubId, requirePermissionScoped('run_server_grade'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
@@ -6327,7 +6362,7 @@ app.post('/api/grade/manual', requirePermissionScoped('run_server_grade'), async
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-app.post('/api/grade/run', requirePermissionScoped('grade_trigger'), requireIdempotency({required:false}), async (req, res) => {
+app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grade_trigger'), requireIdempotency({required:false}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
 
@@ -6621,7 +6656,7 @@ app.post('/api/club/members/remove', requirePermissionScoped('settle_player'), a
 
 // ══ SESSION TOKEN ISSUANCE ═══════════════════════════════════════════════════════════════════════════
 // POST /api/auth/token — issue a signed session token (role from DB in production)
-app.post('/api/auth/token', async (req, res) => {
+app.post('/api/auth/token', requireCanonicalClubId, async (req, res) => {
   const { actorId, clubId, role: requestedRole } = req.body || {};
   if (!actorId) return res.status(400).json({ ok:false, error:'missing_actorId' });
   if (!clubId)  return res.status(400).json({ ok:false, error:'missing_clubId'  });
@@ -6904,7 +6939,7 @@ app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh')
 // ───────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/dashboard?clubId=...
-app.get('/api/host/dashboard', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
@@ -6989,7 +7024,7 @@ app.get('/api/host/dashboard', requirePermissionScoped('view_host_dashboard'), a
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
-app.get('/api/host/settlements-preview', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
@@ -7073,7 +7108,7 @@ app.get('/api/host/settlements-preview', requirePermissionScoped('view_settlemen
 });
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
-app.post('/api/host/settle-player', requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -7332,7 +7367,7 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 
 // ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
 // POST /api/bets/place
-app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('place_bet'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -7707,7 +7742,7 @@ app.post('/api/bets/place', requirePermissionScoped('place_bet'), requireIdempot
 // ───────────────────────────────────────────────────────────────────────═
 
 // POST /api/bets/cancel — DB-authoritative ticket cancellation
-app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('cancel_bet'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -7805,7 +7840,7 @@ app.post('/api/bets/cancel', requirePermissionScoped('cancel_bet'), requireIdemp
 });
 
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
-app.get('/api/player/dashboard', requirePermissionScoped('view_player_dashboard'), async (req, res) => {
+app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped('view_player_dashboard'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', balance:null });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
@@ -8184,7 +8219,7 @@ app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('vie
 });
 
 // POST /api/host/settlements/close-week
-app.post('/api/host/settlements/close-week', requirePermissionScoped('settlement_manager'), async (req, res) => {
+app.post('/api/host/settlements/close-week', requireCanonicalClubId, requirePermissionScoped('settlement_manager'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor   = req._actor||{};
   const actorRank = ROLE_RANK[actor.role]||0;
@@ -8332,7 +8367,7 @@ app.post('/api/host/settlements/reopen-week', requirePermissionScoped('settle_pl
 // ───────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/reconciliation — Phase H atomic ledger balance reconciliation
-app.get('/api/host/reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+app.get('/api/host/reconciliation', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
   const sb = getSupabase();
@@ -8380,7 +8415,7 @@ app.get('/api/host/reconciliation', requirePermissionScoped('view_settlement_his
 });
 
 // GET /api/host/settlement-reconciliation — read-only balance proof
-app.get('/api/host/settlement-reconciliation', requirePermissionScoped('view_settlement_history'), async (req, res) => {
+app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
