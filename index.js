@@ -381,7 +381,7 @@ async function _runGradeCore(fakeReq, sb) {
       const gr = await _callMoneyRpc('grade_ticket_tx',{
         p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
         p_grade_result:outcome.outcome, p_profit:profit,
-        p_idempotency_key:'WK_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker'
+        p_idempotency_key:'GR_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker'
       });
       if (gr.ok||gr.idempotent) graded++; else skipped++;
     } catch(_e) { logEvent('error','grade_core_ticket_error',{ ticketId:ticket.id, err:_e.message }); skipped++; }
@@ -6339,7 +6339,7 @@ app.post('/api/grade/manual', requireCanonicalClubId, requirePermissionScoped('r
     if (['won','lost','push','canceled','voided'].includes(ticket.status))
       return res.status(409).json({ ok:false, error:'already_graded', status:ticket.status });
     const profit = parseFloat(ticket.potential_profit)||0;
-    const iKey   = 'MANUAL_'+result+'_'+ticketId;
+    const iKey   = 'GR_'+result+'_'+ticketId;
     const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
       p_ticket_id:ticket.id, p_club_id:ticket.club_id||clubId||'',
       p_player_id:ticket.player_id, p_grade_result:result, p_profit:profit,
@@ -6472,7 +6472,7 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
         }
 
         // Phase I+M: call grade_ticket_tx RPC
-        const iKey = 'SG_'+combined+'_'+ticket.id;
+        const iKey = 'GR_'+combined+'_'+ticket.id;
         const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
           p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
           p_grade_result:combined, p_profit:profit,
