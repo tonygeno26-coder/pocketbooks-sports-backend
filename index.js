@@ -8862,8 +8862,12 @@ app.post('/api/admin/run-migration-023', async (req, res) => {
     const pool2 = require('pg').Pool ? new (require('pg').Pool)({
       connectionString: process.env.DATABASE_URL, ssl:{ rejectUnauthorized:false } }) : null;
     if (!pool2) return res.status(503).json({ ok:false, error:'pg_not_available' });
-    const sql = require('fs').readFileSync(
+    let sql = require('fs').readFileSync(
       require('path').join(__dirname, 'migrations', '2026-05-27_grade_ticket_tx_push_reduced.sql'), 'utf8');
+    // Strip Supabase-specific REVOKE/GRANT block — those roles don't exist on Railway PG
+    var _revokeIdx = sql.indexOf('\n-- Revoke from all non-service roles');
+    if (_revokeIdx === -1) _revokeIdx = sql.lastIndexOf('\nREVOKE EXECUTE');
+    if (_revokeIdx > 0) sql = sql.slice(0, _revokeIdx);
     const c = await pool2.connect();
     let result;
     try {
