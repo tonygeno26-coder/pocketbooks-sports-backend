@@ -8961,16 +8961,22 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
       ORDER BY r.rolname
     `);
     
-    const rows = verifyRes.data || [];
-    const authed = rows.find(function(r){ return r.rolname==='authenticated'; });
-    const svc    = rows.find(function(r){ return r.rolname==='service_role'; });
+    // Normalize verifyRes.data — Supabase pg/query wraps rows differently
+    var rawRows = verifyRes.data;
+    var rows = [];
+    if (Array.isArray(rawRows)) rows = rawRows;
+    else if (rawRows && Array.isArray(rawRows.rows)) rows = rawRows.rows;
+    else if (rawRows && typeof rawRows === 'object') rows = Object.values(rawRows);
+    
+    const authed = rows.find ? rows.find(function(r){ return r.rolname==='authenticated'; }) : null;
+    const svc    = rows.find ? rows.find(function(r){ return r.rolname==='service_role'; })    : null;
     const ok = !!(authed && !authed.can_execute && svc && svc.can_execute);
     
     console.log('[migration-pl6] REVOKE result:', JSON.stringify(revokeResult));
-    console.log('[migration-pl6] verify rows:', JSON.stringify(rows));
+    console.log('[migration-pl6] verify raw:', JSON.stringify(verifyRes));
     
     res.json({ ok, migration:'pl6_revoke_authenticated',
-      revokeResult, signature, verifyResult: rows,
+      revokeResult, signature, verifyResult: rows, verifyRaw: verifyRes,
       authenticated_can_execute: authed ? authed.can_execute : 'role_not_found',
       service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
