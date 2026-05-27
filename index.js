@@ -8892,7 +8892,6 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
 
     // Step 2: Apply the helper via Supabase RPC (using pg REST with service role)
     // We can't run raw DDL via sb.rpc() directly, but we can use the Supabase pg endpoint
-    const fetch3 = require('node-fetch') || null;
     const https = require('https');
     const sbUrl = process.env.SUPABASE_URL;
     const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
