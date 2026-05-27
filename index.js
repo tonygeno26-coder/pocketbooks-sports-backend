@@ -4372,7 +4372,7 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
     const { data:csData } = await sb.from('club_risk_settings').select('*')
       .eq('club_id',clubId).limit(1);
     if (csData&&csData[0]) cs = csData[0];
-  } catch(_e){}
+  } catch(_e){ console.warn('[bets/place] club_risk_settings read error (cs defaults applied):', _e.message); }
 
   const s   = parseFloat(stake)||0;
   const pay = parseFloat(potentialPayout)||0;
