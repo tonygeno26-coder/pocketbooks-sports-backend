@@ -8862,12 +8862,22 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
     return res.status(403).json({ ok:false, error:'missing_migration_secret' });
   try {
     const fs = require('fs'), path2 = require('path');
-    const sql = fs.readFileSync(
-      path2.join(__dirname, 'migrations', '2026-05-27_place_bet_tx_revoke_authenticated.sql'), 'utf8');
     const pool2 = new (require('pg').Pool)({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
     const c = await pool2.connect();
-    let verifyResult;
+    let verifyResult, introspect;
     try {
+      // First introspect actual function signatures
+      const iRes = await c.query(`
+        SELECT p.oid, pg_get_function_identity_arguments(p.oid) AS args
+        FROM pg_proc p WHERE p.proname = 'place_bet_tx'
+      `);
+      introspect = iRes.rows;
+      if (req.body.introspectOnly) {
+        c.release(); await pool2.end();
+        return res.json({ ok:true, signatures: introspect });
+      }
+      const sql = fs.readFileSync(
+        path2.join(__dirname, 'migrations', '2026-05-27_place_bet_tx_revoke_authenticated.sql'), 'utf8');
       await c.query(sql);
       // Verify privileges
       const v = await c.query(`
@@ -8886,7 +8896,8 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
     console.log('[migration-pl6] REVOKE authenticated result:', JSON.stringify(verifyResult));
     res.json({ ok, migration:'pl6_revoke_authenticated', verifyResult,
       authenticated_can_execute: authed ? authed.can_execute : 'role_not_found',
-      service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found' });
+      service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found',
+      signatures: introspect });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
