@@ -8538,7 +8538,7 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
         latestRollover = { rolloverWeek:rr[0].rollover_week, performedAt:rr[0].performed_at, ...rt }; }
     } catch(_e){}
 
-    // 5. Mismatches
+    // 5. Legacy mismatches (kept for backward compat)
     var mismatches = [];
     var pNet = previewTotals.net;
     if (Math.abs(ticketTotals.profit - pNet) > 0.02)
@@ -8551,9 +8551,96 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
           detail:'calcNet='+snapCalcNet+' snapshotNet='+latestRollover.net });
     }
 
+    // 5b. TRUE cross-source check: ticket-derived net vs canonical ledger net (BUG11_FIXED_ledger_vs_ticket_xcheck)
+    // Previous code compared ticket scan vs ticket scan (different aggregations of the same data)
+    // which would always show "balanced" even when ledger_entries diverged from tickets.
+    // Now we build per-player nets from BOTH sources and flag any divergence.
+    var ledgerXCheck = [];
+    try {
+      // 5b-i. Ticket-derived per-player settled net (won - lost, no canceled/voided/push/active/open)
+      var ticketNetByPlayer = {};
+      var ticketIdsByPlayer = {};
+      (tickets||[]).forEach(function(t) {
+        var s = (t.status||'').toLowerCase();
+        if (s==='canceled'||s==='voided'||s==='push'||s==='pushed'||s==='active'||s==='open') return;
+        var pid = t.player_id||'unknown';
+        if (!ticketNetByPlayer[pid]) { ticketNetByPlayer[pid]=0; ticketIdsByPlayer[pid]=[]; }
+        if (s==='won')  ticketNetByPlayer[pid] += parseFloat(t.potential_profit)||0;
+        if (s==='lost') ticketNetByPlayer[pid] -= parseFloat(t.risk_amount)||0;
+        ticketIdsByPlayer[pid].push(t.id||'?');
+      });
+
+      // 5b-ii. Canonical ledger net per player
+      // Use the 'ledger' table (canonical — credit/debit rows) not 'ledger_entries' (mirror).
+      // settlement-relevant event types: BET_GRADED_WIN (credit), BET_GRADED_LOSS (neutral by
+      // convention — loss risk was already debited at placement), SETTLEMENT_APPLIED.
+      // Simpler cross-check: sum credits - debits for settlement event types per player.
+      var ledgerNetByPlayer = {};
+      var ledgerIdsByPlayer = {};
+      var SETTLEMENT_CREDIT_EVENTS = new Set(['BET_GRADED_WIN','BET_GRADED_PUSH','BET_CANCELED_REFUND','SETTLEMENT_APPLIED']);
+      var SETTLEMENT_DEBIT_EVENTS  = new Set(['BET_PLACED','BET_GRADED_LOSS']);
+      var lrq = sb.from('ledger').select('ledger_id,player_id,event_type,amount,direction');
+      if (clubId) lrq = lrq.eq('club_id', clubId);
+      const { data: canonLedger } = await lrq;
+      (canonLedger||[]).forEach(function(r) {
+        var pid = r.player_id||'unknown';
+        var amt = parseFloat(r.amount||0);
+        var et  = (r.event_type||'').toUpperCase();
+        if (!SETTLEMENT_CREDIT_EVENTS.has(et) && !SETTLEMENT_DEBIT_EVENTS.has(et)) return;
+        if (!ledgerNetByPlayer[pid]) { ledgerNetByPlayer[pid]=0; ledgerIdsByPlayer[pid]=[]; }
+        if (r.direction==='credit') ledgerNetByPlayer[pid] += amt;
+        else if (r.direction==='debit') ledgerNetByPlayer[pid] -= amt;
+        ledgerIdsByPlayer[pid].push(r.ledger_id||'?');
+      });
+
+      // 5b-iii. Compare per-player: players that appear in either source
+      var allPids = new Set([
+        ...Object.keys(ticketNetByPlayer),
+        ...Object.keys(ledgerNetByPlayer)
+      ]);
+      allPids.forEach(function(pid) {
+        var tNet = rnd(ticketNetByPlayer[pid] || 0);
+        var lNet = rnd(ledgerNetByPlayer[pid] || 0);
+        var delta = rnd(tNet - lNet);
+        if (Math.abs(delta) > 0.02) {
+          ledgerXCheck.push({
+            playerId:     pid,
+            ticketNet:    tNet,
+            ledgerNet:    lNet,
+            delta:        delta,
+            ticketIds:    (ticketIdsByPlayer[pid]||[]).slice(0,10),
+            ledgerIds:    (ledgerIdsByPlayer[pid]||[]).slice(0,10),
+            detail:       'ticketNet='+tNet+' ledgerNet='+lNet+' delta='+delta
+          });
+        }
+      });
+
+      // Also flag: club has tickets but NO ledger entries at all (fully missing ledger)
+      var hasAnyTicketNet = Object.keys(ticketNetByPlayer).length > 0;
+      var hasAnyLedger    = Object.keys(ledgerNetByPlayer).length > 0;
+      if (hasAnyTicketNet && !hasAnyLedger) {
+        mismatches.push({ category:'ledger_entirely_missing',
+          detail:'tickets exist but canonical ledger has no settlement entries for this club' });
+      }
+    } catch(_xcErr) {
+      console.warn('[settlement-reconciliation] ledger x-check error:', _xcErr.message);
+      ledgerXCheck = [{ error:_xcErr.message, detail:'ledger_xcheck_failed' }];
+    }
+
+    // Merge ledger x-check mismatches into main mismatches array
+    ledgerXCheck.forEach(function(x) {
+      if (!x.error) mismatches.push(Object.assign({ category:'ticket_vs_ledger' }, x));
+    });
+
+    var overallStatus = mismatches.length===0 ? 'balanced' : 'mismatch';
+    console.log('[settlement-reconciliation] clubId='+clubId+' status='+overallStatus+
+      ' legacyMismatches='+(mismatches.filter(function(m){return m.category!=='ticket_vs_ledger';}).length)+
+      ' ledgerXCheckMismatches='+ledgerXCheck.filter(function(x){return !x.error;}).length);
+
     res.json({ ok:true, clubId:clubId||null, ticketTotals, ledgerTotals,
       settlementPreviewTotals:previewTotals, latestRollover,
-      mismatches, status:mismatches.length===0?'balanced':'mismatch' });
+      ledgerCrossCheck: ledgerXCheck,
+      mismatches, status:overallStatus });
   } catch(e) {
     console.error('[reconciliation] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
