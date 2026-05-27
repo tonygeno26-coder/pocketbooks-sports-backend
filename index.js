@@ -7598,7 +7598,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           odds_service_unavailable:null }[payoutResult.code];
         if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
           { code:payoutResult.code, reason:payoutResult.reason, leg:payoutResult.leg });
-        return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult));
+        const _updatedLegs = (payoutResult.code === 'odds_changed' && payoutResult.legs)
+          ? payoutResult.legs.map(function(l){ return { pick:l.pick, odds:l.liveOdds||l.odds, market:l.market, gameId:l.gameId }; })
+          : undefined;
+        return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult,
+          _updatedLegs ? { updatedLegs: _updatedLegs } : {}));
       }
       if (payoutResult && payoutResult.ok) {
         // Override client payout with server-calculated value
