@@ -4738,12 +4738,8 @@ function requirePermissionScoped(action, getTargetPlayerId) {
         + ' body.clubId='          + ((req.body && req.body.clubId) || '(none)'));
       return res.status(403).json({ ok:false, error:'club_scope_mismatch',
         actorClubId:actor.clubId, requestedClubId, action,
-        hint:'token_club_must_match_payload_clubId',
-        _debug:{ buildMarker:'legacy-auth-fix-v5-full-trace',
-                 actorError:actor.error||null, actorClubId:actor.clubId||'',
-                 legacyToken:actor.legacyToken||false,
-                 membershipVerified:actor.membershipVerified||false,
-                 isDevBypass:actor.isDevBypass||false } });
+        hint:'token_club_must_match_payload_clubId'
+  ;
     }
     // Permission check (role)
     const targetId = typeof getTargetPlayerId === 'function'
