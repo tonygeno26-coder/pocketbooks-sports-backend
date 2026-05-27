@@ -7040,14 +7040,19 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Load club members for balance/username
+    // Load balance_start from player_limits (modern UUID-club source) (BUG4_FIXED_player_limits_balance_start)
+    // Legacy path used club_members (PostgreSQL int-PK table) which has no rows
+    // for UUID-club players created through the new Supabase system.
+    // player_limits is the canonical source used by close-week, reconciliation, and Bug #2.
     var memberMap = {};
     try {
-      let mq = sb.from('club_members').select('player_id,balance_start');
-      if (clubId) mq = mq.eq('club_id', clubId);
-      const { data: members } = await mq;
-      (members||[]).forEach(function(m){ memberMap[m.player_id] = m; });
-    } catch(_e) {}
+      let plq = sb.from('player_limits').select('player_id,balance_start');
+      if (clubId) plq = plq.eq('club_id', clubId);
+      const { data: plRows } = await plq;
+      (plRows||[]).forEach(function(r) {
+        if (r.player_id != null) memberMap[String(r.player_id)] = { balance_start: parseFloat(r.balance_start)||1000 };
+      });
+    } catch(_e) { console.warn('[settlements-preview] player_limits fetch error:', _e.message); }
 
     // Derive per-player settlement from tickets
     var byPlayer = {};
