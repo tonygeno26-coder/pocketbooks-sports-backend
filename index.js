@@ -7039,19 +7039,17 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Load balance_start from player_limits (modern UUID-club source) (BUG4_FIXED_player_limits_balance_start)
-    // Legacy path used club_members (PostgreSQL int-PK table) which has no rows
-    // for UUID-club players created through the new Supabase system.
-    // player_limits is the canonical source used by close-week, reconciliation, and Bug #2.
+    // Load balance_start from club_members — canonical balance table (PL-3 fix).
+    // player_limits holds risk controls only; it has no balance_start column.
     var memberMap = {};
     try {
-      let plq = sb.from('player_limits').select('player_id,balance_start');
+      let plq = sb.from('club_members').select('player_id,balance_start');
       if (clubId) plq = plq.eq('club_id', clubId);
       const { data: plRows } = await plq;
       (plRows||[]).forEach(function(r) {
-        if (r.player_id != null) memberMap[String(r.player_id)] = { balance_start: parseFloat(r.balance_start)||1000 };
+        if (r.player_id != null) memberMap[String(r.player_id)] = { balance_start: r.balance_start != null ? parseFloat(r.balance_start) : null };
       });
-    } catch(_e) { console.warn('[settlements-preview] player_limits fetch error:', _e.message); }
+    } catch(_e) { console.warn('[settlements-preview] club_members balance fetch error:', _e.message); }
 
     // Derive per-player settlement from tickets
     var byPlayer = {};
@@ -7061,7 +7059,7 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
         byPlayer[pid] = {
           playerId:     pid,
           username:     username || pid,
-          balance:      parseFloat(meta.balance_start || 1000),
+          balance:      meta.balance_start != null ? parseFloat(meta.balance_start) : null,
           openRisk:     0,
           settledNet:   0,
           owesHost:     0,
@@ -7286,17 +7284,17 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at')
       .eq('club_id', clubId);
 
-    // 2b. Load player starting balances for rollover RPC (BUG2_FIXED_player_limits_balMap)
-    // Without this, p_starting_balance is hardcoded to 1000 for ALL players.
+    // 2b. Load player starting balances from club_members (PL-3 fix).
+    // player_limits = risk controls only; club_members = membership + balance_start.
     var balMap = {};
     try {
-      const { data: _plRows } = await sb.from('player_limits').select('player_id,balance_start')
+      const { data: _plRows } = await sb.from('club_members').select('player_id,balance_start')
         .eq('club_id', clubId);
       (_plRows||[]).forEach(function(r) {
         if (r.player_id != null && r.balance_start != null)
           balMap[String(r.player_id)] = parseFloat(r.balance_start);
       });
-    } catch(_balErr) { console.warn('[weekly-rollover] player_limits fetch error:', _balErr.message); }
+    } catch(_balErr) { console.warn('[weekly-rollover] club_members balance fetch error:', _balErr.message); }
 
     // 3. Derive per-player snapshot
     var byPlayer = {};
@@ -7383,7 +7381,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
             p_club_id:          clubId,
             p_player_id:        p.playerId,
             p_week_start:       week,
-            p_starting_balance: balMap[String(p.playerId)] || 1000, // actual starting balance (Bug #2 fix)
+            p_starting_balance: balMap[String(p.playerId)] ?? null, // null if no club_members row — RPC rejects rather than using phantom $1k
             p_created_by:       performedBy||'host'
           });
         } catch(_e) { /* non-fatal: snapshot already exists */ }
@@ -7530,7 +7528,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       else if (s==='won')  settledGains+=p;
       else if (s==='lost') settledLosses+=r;
     });
-    // Formula: player_limits.balance_start + settled_gains - open_risk - settled_losses
+    // Formula: club_members.balance_start + settled_gains - open_risk - settled_losses
     // NOTE: ledger adjustments (BALANCE_ADJUSTMENT, WEEKLY_ROLLOVER, SETTLEMENT_APPLIED)
     // are not included here — tracked as RISK-4 follow-up (requires ledger balance view).
     // The RPC re-checks atomically; this precheck is informational early rejection only.
@@ -8011,15 +8009,16 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Starting balance from player_limits scoped by club_id (CLUBMEMBERS_CLEANUP_player_limits_scope)
-    // club_members is legacy PostgreSQL; has no rows for UUID-club players and no club_id filter
-    var startingBalance = 1000;
+    // Starting balance from club_members — canonical balance table (PL-3 fix).
+    // player_limits = risk controls only; club_members = membership + balance_start.
+    var startingBalance = null;
     try {
-      const { data: mem } = await sb.from('player_limits')
+      const { data: mem } = await sb.from('club_members')
         .select('balance_start').eq('club_id', clubId).eq('player_id', playerId)
         .limit(1);
-      if (mem && mem[0] && mem[0].balance_start) startingBalance = parseFloat(mem[0].balance_start)||1000;
-    } catch(_e) {}
+      if (mem && mem[0] && mem[0].balance_start != null) startingBalance = parseFloat(mem[0].balance_start);
+    } catch(_e) { console.warn('[player/summary] club_members balance fetch error:', _e.message); }
+    if (startingBalance === null) console.warn('[player/summary] no club_members row for player='+playerId+' club='+clubId+' — balance shown as null');
 
     // Derive balance
     var openRisk=0, settledGains=0, settledLosses=0;
@@ -8034,8 +8033,9 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
       else if (s==='lost')            { settledLosses+=r; settled.push(t); }
       else if (s==='push'||s==='pushed') { settled.push(t); } // push: no net change
     });
-    var available = rnd(startingBalance - openRisk - settledLosses + settledGains);
-    if (available<0) warnings.push('available_negative:'+available);
+    var available = startingBalance !== null ? rnd(startingBalance - openRisk - settledLosses + settledGains) : null;
+    if (available !== null && available<0) warnings.push('available_negative:'+available);
+    if (startingBalance === null) warnings.push('missing_balance_start');
 
     // Weekly stats
     var now = new Date();
@@ -8455,16 +8455,16 @@ app.post('/api/host/settlements/close-week', requireCanonicalClubId, requirePerm
     // Compute player snapshots from canonical ledger
     const { data:members } = await sb.from('club_memberships')
       .select('actor_id').eq('club_id',clubId).eq('status','active');
-    const { data:limits } = await sb.from('player_limits')
+    const { data:limits } = await sb.from('club_members')
       .select('player_id,balance_start').eq('club_id',clubId);
-    const balMap = {}; (limits||[]).forEach(function(l){ balMap[l.player_id]=parseFloat(l.balance_start)||1000; });
+    const balMap = {}; (limits||[]).forEach(function(l){ if (l.balance_start != null) balMap[l.player_id]=parseFloat(l.balance_start); });
     const { data:allTix } = await sb.from('tickets')
       .select('player_id,status,risk_amount,potential_profit').eq('club_id',clubId);
     const nextRevision = (period.revision||0) + 1;
     const snapRows = [];
     for (const m of (members||[])) {
       const pid = m.actor_id;
-      const starting = balMap[pid]||1000;
+      const starting = balMap[pid] ?? null; // null = no club_members row; shown in snapshot as null (no phantom $1k)
       const { data:lRows } = await sb.from('ledger').select('amount,direction')
         .eq('club_id',clubId).eq('player_id',pid);
       const ptix = (allTix||[]).filter(function(t){ return t.player_id===pid; });
@@ -8480,9 +8480,9 @@ app.post('/api/host/settlements/close-week', requireCanonicalClubId, requirePerm
         if(s==='won') gains+=p;
         if(s==='lost') losses+=r;
       });
-      const ledBal  = Math.round((starting+cred-deb)*100)/100;
+      const ledBal  = starting !== null ? Math.round((starting+cred-deb)*100)/100 : null;
       const netRes  = Math.round((gains-losses)*100)/100;
-      const finBal  = Math.round((ledBal-Math.round(openRisk*100)/100)*100)/100;
+      const finBal  = ledBal !== null ? Math.round((ledBal-Math.round(openRisk*100)/100)*100)/100 : null;
       snapRows.push({
         period_id:periodId, revision:nextRevision, club_id:clubId, player_id:pid,
         starting_limit:starting,
@@ -8573,15 +8573,15 @@ app.get('/api/host/reconciliation', requireCanonicalClubId, requirePermissionSco
     // Load all club players
     const { data: members } = await sb.from('club_memberships')
       .select('actor_id,role').eq('club_id',clubId).eq('status','active');
-    const { data: limits }  = await sb.from('player_limits')
+    const { data: limits }  = await sb.from('club_members')
       .select('player_id,balance_start').eq('club_id',clubId);
     const balanceMap = {};
-    (limits||[]).forEach(function(l){ balanceMap[l.player_id]=parseFloat(l.balance_start)||1000; });
+    (limits||[]).forEach(function(l){ if (l.balance_start != null) balanceMap[l.player_id]=parseFloat(l.balance_start); });
 
     const players = [];
     for (const m of (members||[])) {
       const pid = m.actor_id;
-      const startingLimit = balanceMap[pid]||1000;
+      const startingLimit = balanceMap[pid] ?? null; // null = missing club_members row; no phantom $1k
       // Ledger-derived balance
       const { data: ledgerRows } = await sb.from('ledger').select('amount,direction')
         .eq('club_id',clubId).eq('player_id',pid);
