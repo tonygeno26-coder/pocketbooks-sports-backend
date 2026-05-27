@@ -7416,9 +7416,13 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       return res.json({ ok:true, idempotent:true, ticket: existTicket&&existTicket[0], ledgerEntryId:idempotencyKey });
     }
 
-    // 2. Derive DB balance for player
+    // 2. Derive DB balance for player — MUST filter by club_id (Bug #1 fix)
+    // Without the club filter, losses/open risk from OTHER clubs reduce this
+    // player's available balance here, which is incorrect.
     const { data: playerTix } = await sb.from('tickets')
-      .select('status,risk_amount,potential_profit').eq('player_id', playerId);
+      .select('status,risk_amount,potential_profit')
+      .eq('player_id', playerId)
+      .eq('club_id', clubId);
     var startBal = 1000;
     try {
       const { data:mem } = await sb.from('club_members').select('balance_start')
