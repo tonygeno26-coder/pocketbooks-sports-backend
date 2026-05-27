@@ -4424,7 +4424,7 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
       return { ok:false, code:'market_blocked', market, legIndex:i, source:'player_limit' };
     if (pl.allowed_sports && !pl.allowed_sports.includes(sport))
       return { ok:false, code:'sport_not_allowed', sport, legIndex:i };
-    if (cs.allow_live_betting===false && leg.isLive)
+    if (cs.allow_live_betting===false && leg.server_is_live)
       return { ok:false, code:'live_betting_disabled', legIndex:i };
   }
 
@@ -7538,30 +7538,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     if (stakeAmt > available + 0.005)
       return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
 
-    // 2b. Risk limits check (JS-side; Postgres RPC also enforces, this gives early rejection)
-    try {
-      const riskCheck = await _checkRiskLimitsJs(sb, clubId, playerId, {
-        stake: stakeAmt, potentialPayout: parseFloat(payout)||0,
-        betType, legs: legsArr
-      });
-      if (!riskCheck.ok) {
-        const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
-        console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
-        // Emit risk alert based on rejection code
-        var _raType = {
-          payout_above_max:'large_payout_attempt', player_open_risk_exceeded:'over_limit_attempt',
-          club_open_risk_exceeded:'over_limit_attempt', event_risk_exceeded:'over_limit_attempt',
-          market_risk_exceeded:'over_limit_attempt', stake_above_max:'over_limit_attempt'
-        }[riskCheck.code];
-        if (_raType) emitRiskAlert(_raType, clubId, playerId,
-          { code:riskCheck.code, stake:stakeAmt, payout:parseFloat(payout)||0 });
-        return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
-      }
-    } catch(riskErr) {
-      console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
-    }
-
-    // 2c. Phase AA: active-bettor charge check
+    // 2b. Phase AA: active-bettor charge check
     const _habResult = await _processActiveBettorCharge(sb, clubId, playerId, null, Date.now());
     if (!_habResult.ok) {
       if (_habResult.httpStatus === 402) {
@@ -7640,7 +7617,32 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         '(client submitted:', parseFloat(payout)||0, anyFallback?'[DEV FALLBACK]':'');
     }
 
-    // 3b. Conflict check: active legs on same game+market
+    // 3b. Risk limits check — runs after snapshot verification so legs carry
+    //     server_is_live (authoritative). Postgres RPC also enforces; this gives
+    //     early JS-side rejection before the atomic write.
+    try {
+      const riskCheck = await _checkRiskLimitsJs(sb, clubId, playerId, {
+        stake: stakeAmt, potentialPayout: parseFloat(payout)||0,
+        betType, legs: legsArr
+      });
+      if (!riskCheck.ok) {
+        const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
+        console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
+        // Emit risk alert based on rejection code
+        var _raType = {
+          payout_above_max:'large_payout_attempt', player_open_risk_exceeded:'over_limit_attempt',
+          club_open_risk_exceeded:'over_limit_attempt', event_risk_exceeded:'over_limit_attempt',
+          market_risk_exceeded:'over_limit_attempt', stake_above_max:'over_limit_attempt'
+        }[riskCheck.code];
+        if (_raType) emitRiskAlert(_raType, clubId, playerId,
+          { code:riskCheck.code, stake:stakeAmt, payout:parseFloat(payout)||0 });
+        return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
+      }
+    } catch(riskErr) {
+      console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
+    }
+
+    // 3c. Conflict check: active legs on same game+market
     //     Bypass paths (testing / staging):
     //       - env BETS_BYPASS_CONFLICT=1            → globally disabled
     //       - req.body._bypassConflict === true     → per-request (must be
