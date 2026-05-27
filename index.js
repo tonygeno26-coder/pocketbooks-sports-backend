@@ -1039,7 +1039,7 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
     createdBy:'system', reason:'active_bettor_fee:'+playerId+':'+weekStart,
     idempotencyKey:ledgerId, metadata:{ playerId, weekStart, ticketId }
   });
-  console.log('[host/active-bettor] CHARGED clubId='+clubId+' playerId='+playerId+
+  console.log('[host/active-bettor] CHARGED playerId='+playerId+
     ' -'+HOST_ACTIVE_BETTOR_FEE+'d week='+weekStart+' balance='+(host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE));
 
   return {
@@ -1115,7 +1115,7 @@ app.post('/api/admin/host-diamonds/topup', requirePermissionScoped('settle_playe
     });
     _writeAuthAudit('host_diamond_topup', actor.actorId, clubId,
       '/admin/host-diamonds/topup', { amt, method });
-    console.log('[host/topup] clubId='+clubId+' +'+amt+'d bal='+balBefore+'->'+balAfter);
+    console.log('[host/topup] +'+amt+'d bal='+balBefore+'->'+balAfter);
     res.json({ ok:true, clubId, balanceBefore:balBefore, balanceAfter:balAfter,
                amountDiamonds:amt, ledgerId });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -1187,7 +1187,7 @@ app.post('/api/admin/host-diamonds/seed', async (req, res) => {
     }, { onConflict:'club_id' });
     _writeAuthAudit('host_balance_seeded', actor.actorId, clubId,
       '/admin/host-diamonds/seed', { hostActorId, bal, force:!!force });
-    console.log('[host/seed] clubId='+clubId+' hostActorId='+hostActorId+' bal='+bal+' force='+!!force);
+    console.log('[host/seed] hostActorId='+hostActorId+' bal='+bal+' force='+!!force);
     res.json({ ok:true, clubId, hostActorId, balanceDiamonds:bal,
       created:!(existing&&existing[0]), overwritten:!!(existing&&existing[0]) });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -3110,7 +3110,7 @@ async function issueSessionToken(actorId, role, clubId, expiresInSec, platformRo
     revoked_at:null, revoke_reason:null, last_seen_at:now
   };
   await _sessionSave(row);
-  console.log('[session] issued jti='+jti+' actor='+actorId+' role='+role+' club='+(clubId||''));
+  console.log('[session] issued jti='+jti+' role='+role);
   _writeAuthAudit('session_created', actorId, clubId, '/auth/token',
     { jti, role, expiresIn:expiresInSec||86400 });
   return { token, jti };
@@ -3301,9 +3301,7 @@ function _checkClubScope(actor, requestedClubId) {
   // Only reject if token has a NON-EMPTY clubId that differs from requested.
   // Empty clubId = legacy login token (no club claim) — let membership lookup decide.
   if (actor.clubId && actor.clubId !== requestedClubId) {
-    console.log('[auth] CLUB_SCOPE_MISMATCH_RETURN actorClub='+actor.clubId
-      +' requestedClub='+requestedClubId
-      +' legacyToken='+(actor.legacyToken||false)
+    console.log('[auth] CLUB_SCOPE_MISMATCH_RETURN requestedClub='+requestedClubId
       +' membershipVerified='+(actor.membershipVerified||false));
     return {
       ok:false, reason:'club_scope_mismatch', status:403,
@@ -3356,7 +3354,7 @@ function requireCanonicalClubId(req, res, next) {
   if (!isProduction) return next();
   // Reject purely numeric club IDs on production Supabase routes
   if (_NUMERIC_CLUB_ID_RE.test(clubId)) {
-    console.log('[club-id] NUMERIC_CLUB_ID_REJECTED clubId='+clubId+' path='+req.path);
+    console.log('[club-id] NUMERIC_CLUB_ID_REJECTED path='+req.path);
     return res.status(400).json({
       ok: false,
       error: 'legacy_club_id_not_supported',
@@ -3432,7 +3430,7 @@ async function _writeLedgerEntry(params) {
     if (e.code==='23505') return { ok:true, idempotent:true, ledgerId };
     throw e;
   }
-  console.log('[ledger] '+eventType+' club='+clubId+' player='+playerId+' amt='+amt+
+  console.log('[ledger] '+eventType+' player='+playerId+' amt='+amt+
     (ticketId?' ticket='+ticketId:'')+(idempotencyKey?' idem='+idempotencyKey:''));
   return { ok:true, ledgerId, row };
 }
@@ -4671,7 +4669,7 @@ function requirePermissionScoped(action, getTargetPlayerId) {
                 .limit(1);
               _md = _r2.data && _r2.data[0] ? _r2.data[0] : null;
             }
-            console.log('[auth] MEMBERSHIP_QUERY clubId='+_reqClub+' actorId='+_legacyId+' found='+(!!_md)+(_md?' status='+_md.status+' role='+_md.role:''));
+            console.log('[auth] MEMBERSHIP_QUERY found='+(!!_md)+(_md?' status='+_md.status+' role='+_md.role:''));
             _legacyMem = _md || null;
           }
         } catch(_me) { console.warn('[auth] legacy membership lookup error:', _me.message); }
@@ -4707,14 +4705,10 @@ function requirePermissionScoped(action, getTargetPlayerId) {
       + ' path='            + req.path);
     const scope = _checkClubScope(actor, requestedClubId);
     if (!scope.ok) {
-      console.log('[auth] CLUB_SCOPE_MISMATCH actor='+(actor.actorId||'?')+
-        ' actorClub='+(actor.clubId||'?')+' requestedClub='+(requestedClubId||'?')+' action='+action);
+      console.log('[auth] CLUB_SCOPE_MISMATCH requestedClub='+(requestedClubId||'?')+' action='+action);
       console.log('BACKEND_CLUB_SCOPE'
         + ' request.clubId='   + (requestedClubId   || '(none)')
-        + ' actor.clubId='     + (actor.clubId       || '(none)')
-        + ' actor.actorId='    + (actor.actorId      || '?')
         + ' actor.role='       + (actor.role         || '?')
-        + ' resolvedClubId='   + (actor.clubId       || '(from token)')
         + ' path='             + req.path
         + ' mismatch=YES');
       _writeAuthAudit('club_scope_mismatch', actor.actorId, actor.clubId, req.path,
@@ -4746,7 +4740,7 @@ function requirePermissionScoped(action, getTargetPlayerId) {
       ? getTargetPlayerId(req) : (req.body && req.body.playerId) || (req.query && req.query.playerId);
     const perm = _checkPermission(actor, action, targetId);
     if (!perm.allowed) {
-      console.log('[auth] DENIED actor='+(actor.actorId||'?')+' role='+(actor.role||'?')+
+      console.log('[auth] DENIED role='+(actor.role||'?')+
         ' action='+action+' reason='+perm.reason);
       _writeAuthAudit('permission_denied', actor.actorId, actor.clubId, req.path,
         { action, role:actor.role, reason:perm.reason, required:perm.required, requestedClubId });
@@ -4756,7 +4750,7 @@ function requirePermissionScoped(action, getTargetPlayerId) {
     // Stamp canonical clubId onto req for handler use
     req._actor  = actor;
     req._clubId = _deriveClubId(actor, req);
-    if (actor.isDevBypass) console.log('[auth] DEV BYPASS passthrough action='+action+' club='+req._clubId);
+    if (actor.isDevBypass) console.log('[auth] DEV BYPASS passthrough action='+action);
     // Audit sensitive grants
     const SENSITIVE = new Set(['settle_player','weekly_rollover','run_server_grade',
                                 'grade_trigger','force_market_refresh']);
@@ -4803,7 +4797,7 @@ requirePermission = function(action, getTargetPlayerId) {
       ? getTargetPlayerId(req) : (req.body && req.body.playerId) || (req.query && req.query.playerId);
     const perm = _checkPermission(actor, action, targetId);
     if (!perm.allowed) {
-      console.log('[auth] DENIED actor='+(actor.actorId||'?')+' role='+(actor.role||'?')+' action='+action+' reason='+perm.reason);
+      console.log('[auth] DENIED role='+(actor.role||'?')+' action='+action+' reason='+perm.reason);
       // Write audit event (fire-and-forget)
       try {
         const sb = getSupabase();
@@ -6356,7 +6350,7 @@ app.post('/api/grade/manual', requireCanonicalClubId, requirePermissionScoped('r
     });
     emitRiskAlert('manual_override_used', clubId||ticket.club_id, actor.actorId,
       { ticketId, result, overrideCode });
-    console.log('[grade/manual] ticketId='+ticketId+' result='+result+' by='+(actor.actorId||'?')+' code='+overrideCode);
+    console.log('[grade/manual] ticketId='+ticketId+' result='+result+' code='+overrideCode);
     res.json({ ok:true, ticketId, result, overrideCode, balanceAfter:gradeResult.balance_after });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -6662,14 +6656,14 @@ app.post('/api/auth/token', requireCanonicalClubId, async (req, res) => {
   // Phase G: DB is source of truth for role
   const resolved = await _resolveTokenRole(actorId, clubId, requestedRole);
   if (!resolved.ok) {
-    console.log('[auth/token] denied actor='+actorId+' club='+clubId+' reason='+resolved.error);
+    console.log('[auth/token] denied reason='+resolved.error);
     _writeAuthAudit(resolved.error, actorId, clubId, '/auth/token', { requestedRole });
     return res.status(403).json({ ok:false, error:resolved.error, status:resolved.status });
   }
   const finalRole   = resolved.role;
   const platRole    = PLATFORM_ADMIN_ALLOWLIST.includes(actorId) ? 'platform_admin' : null;
   const { token, jti } = await issueSessionToken(actorId, finalRole, clubId, 86400, platRole);
-  console.log('[auth/token] issued actor='+actorId+' role='+finalRole+' club='+clubId+(platRole?' [platform_admin]':''));
+  console.log('[auth/token] issued role='+finalRole+(platRole?' [platform_admin]':''));
   res.json({ ok:true, token, jti, actorId, role:finalRole, clubId, expiresIn:86400 });
 });
 
@@ -6707,7 +6701,7 @@ app.post('/api/auth/logout', async (req, res) => {
     }
     _writeAuthAudit('session_revoked', actor.actorId, actor.clubId, '/auth/logout',
       { jti:actor.jti, reason:'logout' });
-    console.log('[session] logout jti='+actor.jti+' actor='+actor.actorId);
+    console.log('[session] logout jti='+actor.jti);
   }
   res.json({ ok:true, loggedOut:true });
 });
@@ -7393,7 +7387,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       payload: { rolloverWeek:week, playersCount:players.length, totals, performedBy:performedBy||'host' }
     });
 
-    console.log('[weekly-rollover] week='+week+' club='+clubId+' players='+players.length);
+    console.log('[weekly-rollover] week='+week+' players='+players.length);
     res.json({
       ok: true, rolloverWeek: week, playersSnapshotted: players.length,
       totals, nextWeekInitialized: true, performedAt
@@ -7452,7 +7446,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           idempotencyKey, playerUsername } = _bodyRaw;
   const playerId = _resolvedPlayerId;
   if (_actor && !_bodyRaw.playerId && _actor.actorId) {
-    console.log('TOKEN_SCOPE role='+(_actor.role||'?')+' clubId='+(_actor.clubId||'?')+' playerCapable=true playerId='+_actor.actorId+' (resolved from token)');
+    console.log('TOKEN_SCOPE role='+(_actor.role||'?')+' playerCapable=true (resolved from token)');
   }
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   const now = new Date().toISOString();
@@ -8489,7 +8483,7 @@ app.post('/api/host/settlements/reopen-week', requirePermissionScoped('settle_pl
       event_type:'settlement_period_reopened', club_id:clubId,
       payload:{ periodId, weekStart, reopenedBy:actor.actorId, reason:reason||null }
     });
-    console.log('[reopen-week] periodId='+periodId+' by='+actor.actorId);
+    console.log('[reopen-week] periodId='+periodId);
     res.json({ ok:true, periodId, weekStart, status:'reopened' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -8700,7 +8694,7 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
     });
 
     var overallStatus = mismatches.length===0 ? 'balanced' : 'mismatch';
-    console.log('[settlement-reconciliation] clubId='+clubId+' status='+overallStatus+
+    console.log('[settlement-reconciliation] status='+overallStatus+
       ' legacyMismatches='+(mismatches.filter(function(m){return m.category!=='ticket_vs_ledger';}).length)+
       ' ledgerXCheckMismatches='+ledgerXCheck.filter(function(x){return !x.error;}).length);
 
