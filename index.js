@@ -7255,6 +7255,18 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at')
       .eq('club_id', clubId);
 
+    // 2b. Load player starting balances for rollover RPC (BUG2_FIXED_player_limits_balMap)
+    // Without this, p_starting_balance is hardcoded to 1000 for ALL players.
+    var balMap = {};
+    try {
+      const { data: _plRows } = await sb.from('player_limits').select('player_id,balance_start')
+        .eq('club_id', clubId);
+      (_plRows||[]).forEach(function(r) {
+        if (r.player_id != null && r.balance_start != null)
+          balMap[String(r.player_id)] = parseFloat(r.balance_start);
+      });
+    } catch(_balErr) { console.warn('[weekly-rollover] player_limits fetch error:', _balErr.message); }
+
     // 3. Derive per-player snapshot
     var byPlayer = {};
     function goc(pid, uname) {
@@ -7310,7 +7322,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
             p_club_id:          clubId,
             p_player_id:        p.playerId,
             p_week_start:       week,
-            p_starting_balance: 1000, // snapshot value
+            p_starting_balance: balMap[String(p.playerId)] || 1000, // actual starting balance (Bug #2 fix)
             p_created_by:       performedBy||'host'
           });
         } catch(_e) { /* non-fatal: snapshot already exists */ }
