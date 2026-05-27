@@ -7147,14 +7147,27 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     var net = hostOwes - owesHost; // positive = host owes player
     if (net > 0) { hostOwes=net; owesHost=0; } else { owesHost=-net; hostOwes=0; }
 
-    // Direction / overpay validation
+    // Direction / overpay validation — with prior payment deduction (BUG56_FIXED_prior_payments_subtracted)
+    // Subtract confirmed prior payments to derive remaining payable (Bugs #5/#6 fix).
+    var priorPaid = 0;
+    try {
+      const { data: _priorRows } = await sb.from('settlement_payments')
+        .select('amount')
+        .eq('club_id', clubId).eq('player_id', playerId)
+        .eq('direction', direction).eq('status', 'confirmed');
+      priorPaid = (_priorRows||[]).reduce(function(s,r){ return s+parseFloat(r.amount||0); }, 0);
+      priorPaid = Math.round(priorPaid * 100) / 100;
+    } catch(_prErr) { console.warn('[settle-player] prior payments fetch error:', _prErr.message); }
+
     if (direction==='player_paid_host' && owesHost<=0)
       return res.status(400).json({ ok:false, error:'player_does_not_owe_host', owesHost, hostOwes });
     if (direction==='host_paid_player' && hostOwes<=0)
       return res.status(400).json({ ok:false, error:'host_does_not_owe_player', owesHost, hostOwes });
-    var maxAmt = direction==='player_paid_host' ? owesHost : hostOwes;
+    var grossAmt = direction==='player_paid_host' ? owesHost : hostOwes;
+    var maxAmt   = Math.round(Math.max(0, grossAmt - priorPaid) * 100) / 100;
     if (amt > maxAmt + 0.01)
-      return res.status(400).json({ ok:false, error:'overpay_blocked', amount:amt, maxAmount:maxAmt });
+      return res.status(400).json({ ok:false, error:'overpay_blocked', amount:amt,
+        maxAmount:maxAmt, grossOwed:grossAmt, priorPaid, remaining:maxAmt });
 
     // 2. Phase I: settle_player_tx RPC (atomic canonical ledger)
     const rpcDir = direction==='host_paid_player' ? 'host_owes_player' : 'player_owes_host';
@@ -7289,6 +7302,36 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       else        { pl.hostOwes=rnd(net);  pl.owesHost=0; }
       pl.openRisk=rnd(pl.openRisk); pl.settledNet=rnd(pl.settledNet);
     });
+    // 3b. Subtract confirmed prior payments from snapshot (BUG56_FIXED_prior_payments_subtracted)
+    // Without this, weekly rollover snapshots show gross owed even when player
+    // already paid part of it — leading to double-collection.
+    try {
+      const _playerIds = Object.keys(byPlayer);
+      if (_playerIds.length) {
+        const { data: _pmtRows } = await sb.from('settlement_payments')
+          .select('player_id,direction,amount')
+          .eq('club_id', clubId).eq('status', 'confirmed')
+          .in('player_id', _playerIds);
+        (_pmtRows||[]).forEach(function(r) {
+          var pl = byPlayer[r.player_id];
+          if (!pl) return;
+          var a = parseFloat(r.amount)||0;
+          if (r.direction === 'player_paid_host') {
+            // Player paid host: reduces how much player still owes
+            pl.owesHost = Math.max(0, Math.round((pl.owesHost - a)*100)/100);
+          } else if (r.direction === 'host_paid_player') {
+            // Host paid player: reduces how much host still owes
+            pl.hostOwes = Math.max(0, Math.round((pl.hostOwes - a)*100)/100);
+          }
+        });
+        // Re-clamp: payments can't make a value go negative (should not happen, but guard it)
+        Object.values(byPlayer).forEach(function(pl) {
+          pl.owesHost = Math.max(0, rnd(pl.owesHost));
+          pl.hostOwes = Math.max(0, rnd(pl.hostOwes));
+        });
+      }
+    } catch(_pmtErr) { console.warn('[weekly-rollover] prior payments fetch error:', _pmtErr.message); }
+
     var players = Object.values(byPlayer);
     var playersOweTot = players.reduce(function(s,p){ return s+p.owesHost; },0);
     var hostOwesTot   = players.reduce(function(s,p){ return s+p.hostOwes; },0);
