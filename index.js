@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = 'club-id-normalization-v1'; // club ID normalization guard
-  const _BUILD_MARKER = 'club-id-normalization-v1'; // unique string per meaningful change
+  const _BAKED_SHA = 'bd2c05b'; // settlement-audit-fixes-complete
+  const _BUILD_MARKER = 'settlement-audit-fixes-complete'; // Bugs #1/#2/#4/#5/#6/#11 fixed
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
