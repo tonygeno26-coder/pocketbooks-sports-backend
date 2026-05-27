@@ -7559,6 +7559,9 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (csData&&csData[0]) oddsChangePolicy = csData[0].odds_change_policy||'reject';
     } catch(_e){}
 
+    let serverPayout = null;
+    let serverProfit = null;
+
     if (!_bodyRaw.oddsAccepted) {
       // Verify all legs against odds_snapshots table
       const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
@@ -7600,12 +7603,12 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (payoutResult && payoutResult.ok) {
         // Override client payout with server-calculated value
         legsArr = payoutResult.legs;
+        serverPayout = payoutResult.payout;
+        serverProfit = rnd(serverPayout - stakeAmt);
         const anyFallback = legsArr.some(function(l){ return l.dev_fallback; });
         console.log('[bets/place] server payout recalculated:', payoutResult.payout,
           '(client:', parseFloat(payout)||0, anyFallback?'[DEV FALLBACK]':'');
       }
-    } else {
-      console.log('[bets/place] oddsAccepted=true — skipping snapshot validation');
     }
 
     // 3b. Conflict check: active legs on same game+market
@@ -7692,8 +7695,8 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       p_player_username:  playerUsername||null,
       p_bet_type:         betType,
       p_stake:            rnd(stakeAmt),
-      p_potential_profit: rnd(parseFloat(potentialProfit)||0),
-      p_estimated_payout: rnd(parseFloat(payout)||0),
+      p_potential_profit: serverProfit != null ? serverProfit : rnd(parseFloat(potentialProfit)||0),
+      p_estimated_payout: serverPayout != null ? rnd(serverPayout) : rnd(parseFloat(payout)||0),
       p_idempotency_key:  idempotencyKey,
       p_created_by:       playerId,
       // Phase J risk limit params
