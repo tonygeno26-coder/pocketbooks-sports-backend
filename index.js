@@ -7683,7 +7683,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
       }
     } catch(riskErr) {
-      console.warn('[bets/place] risk check error (fail-open):', riskErr.message);
+      // PL-6: fail-CLOSED — a broken risk check must not allow unchecked bets through
+      console.error('[bets/place] risk check exception — failing closed. actor='+playerId+
+        ' club='+clubId+' err='+riskErr.message);
+      return res.status(503).json({ ok:false, error:'risk_check_unavailable',
+        message:'Risk checks temporarily unavailable. Please retry.' });
     }
 
     // 3c. Conflict check: active legs on same game+market
@@ -8849,6 +8853,42 @@ app.get('/api/grade/status', async (req, res) => {
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
 });
 // ════════════════════════════════════════════════════════════════════════════
+
+
+// POST /api/admin/run-migration-pl6 — one-shot: revoke place_bet_tx from authenticated
+app.post('/api/admin/run-migration-pl6', async (req, res) => {
+  const { secret } = req.body||{};
+  if (secret !== 'PL6_REVOKE_AUTHENTICATED_PLACE_BET_TX')
+    return res.status(403).json({ ok:false, error:'missing_migration_secret' });
+  try {
+    const fs = require('fs'), path2 = require('path');
+    const sql = fs.readFileSync(
+      path2.join(__dirname, 'migrations', '2026-05-27_place_bet_tx_revoke_authenticated.sql'), 'utf8');
+    const pool2 = new (require('pg').Pool)({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
+    const c = await pool2.connect();
+    let verifyResult;
+    try {
+      await c.query(sql);
+      // Verify privileges
+      const v = await c.query(`
+        SELECT p.proname, r.rolname,
+          has_function_privilege(r.rolname, p.oid, 'EXECUTE') AS can_execute
+        FROM pg_proc p
+        CROSS JOIN pg_roles r
+        WHERE p.proname = 'place_bet_tx'
+          AND r.rolname IN ('authenticated','service_role')
+        ORDER BY r.rolname`);
+      verifyResult = v.rows;
+    } finally { c.release(); await pool2.end(); }
+    const authed = verifyResult.find(function(r){ return r.rolname==='authenticated'; });
+    const svc    = verifyResult.find(function(r){ return r.rolname==='service_role'; });
+    const ok = authed && !authed.can_execute && svc && svc.can_execute;
+    console.log('[migration-pl6] REVOKE authenticated result:', JSON.stringify(verifyResult));
+    res.json({ ok, migration:'pl6_revoke_authenticated', verifyResult,
+      authenticated_can_execute: authed ? authed.can_execute : 'role_not_found',
+      service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
 
 
 app.listen(PORT, '0.0.0.0', () => {
