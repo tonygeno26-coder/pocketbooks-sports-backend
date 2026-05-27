@@ -8887,7 +8887,66 @@ app.post('/api/admin/run-migration-023', async (req, res) => {
     const allPass = Object.values(result).every(function(v){ return v === true || typeof v === 'number'; });
     if (!allPass) return res.status(500).json({ ok:false, error:'verification_failed', result });
     console.log('[migration-023] GRD-2 applied and verified:', result);
-    res.json({ ok:true, migration:'023_grade_ticket_tx_push_reduced', verified:true, result });
+
+    // ── DB-backed smoke test ─────────────────────────────────────────────────
+    // Use an existing GRD5 test ticket: SMOKE_T1_1779871272417
+    // risk=5, potential_profit=0.05, status=active, club=d616dc2a...
+    var smokeResult = null;
+    try {
+      var sb2 = getSupabase();
+      if (sb2) {
+        var _smTicketId = 'SMOKE_T1_1779871272417';
+        var _smClubId   = 'd616dc2a-95a6-473a-97b1-7da330878479';
+        var _smPlayerId = '0a1885b8-0fe3-4e75-aeda-f89662c87d49';
+        var _smRisk     = 5;
+        var _smOverride = 3.16;  // reduced profit: +158/-182 on $5 stake ≈ $3.16
+        var _smIkey     = 'GRD2_SMOKE_TEST_'+_smTicketId;
+
+        // Reset ticket to active for test (in case it was previously graded)
+        await sb2.from('tickets').update({ status:'active', graded_at:null,
+          potential_profit:0.05 }).eq('id',_smTicketId);
+
+        // Call grade_ticket_tx with p_override_profit
+        var _gr = await _callMoneyRpc('grade_ticket_tx', {
+          p_ticket_id: _smTicketId, p_club_id: _smClubId, p_player_id: _smPlayerId,
+          p_grade_result: 'won', p_profit: _smOverride, p_override_profit: _smOverride,
+          p_idempotency_key: _smIkey, p_created_by: 'smoke_test',
+          p_grading_source: 'smoke_test_grd2'
+        });
+
+        // Check ticket was updated
+        var { data: _tAfter } = await sb2.from('tickets').select('status,potential_profit').eq('id',_smTicketId).limit(1);
+        var _t = _tAfter && _tAfter[0];
+
+        // Idempotent replay
+        var _gr2 = await _callMoneyRpc('grade_ticket_tx', {
+          p_ticket_id: _smTicketId, p_club_id: _smClubId, p_player_id: _smPlayerId,
+          p_grade_result: 'won', p_profit: _smOverride, p_override_profit: _smOverride,
+          p_idempotency_key: _smIkey, p_created_by: 'smoke_test'
+        });
+
+        // Check ledger entry
+        var { data: _ledger } = await sb2.from('ledger_entries').select('id,amount,type,balance_after')
+          .eq('id',_smIkey).limit(1);
+        var _le = _ledger && _ledger[0];
+
+        smokeResult = {
+          rpcOk:             _gr.ok || _gr.idempotent,
+          rpcIdempotent:     _gr.idempotent || false,
+          rpcPushReduced:    _gr.push_reduced || _gr.pushReduced || false,
+          ticketStatus:      _t ? _t.status : 'not_found',
+          ticketProfit:      _t ? parseFloat(_t.potential_profit) : null,
+          profitUpdated:     _t ? Math.abs(parseFloat(_t.potential_profit)-_smOverride) < 0.01 : false,
+          ledgerAmount:      _le ? parseFloat(_le.amount) : null,
+          ledgerType:        _le ? _le.type : null,
+          ledgerAmountOk:    _le ? Math.abs(parseFloat(_le.amount)-(_smRisk+_smOverride)) < 0.01 : false,
+          replayIdempotent:  _gr2.idempotent || false,
+          replayOk:          _gr2.ok || _gr2.idempotent,
+        };
+      }
+    } catch(_smErr) { smokeResult = { error: _smErr.message }; }
+
+    res.json({ ok:true, migration:'023_grade_ticket_tx_push_reduced', verified:true, result, smokeTest:smokeResult });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
