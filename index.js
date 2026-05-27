@@ -8866,7 +8866,7 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
     const c = await pool2.connect();
     let verifyResult, introspect;
     try {
-      // First introspect actual function signatures
+      // First introspect actual function signatures on Railway PG
       const iRes = await c.query(`
         SELECT p.oid, pg_get_function_identity_arguments(p.oid) AS args
         FROM pg_proc p WHERE p.proname = 'place_bet_tx'
@@ -8874,7 +8874,21 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
       introspect = iRes.rows;
       if (req.body.introspectOnly) {
         c.release(); await pool2.end();
-        return res.json({ ok:true, signatures: introspect });
+        // Also check Supabase via rpc probe
+        var sbProbe = null;
+        try {
+          const sb2 = getSupabase();
+          if (sb2) {
+            const { data:sbData, error:sbErr } = await sb2.rpc('place_bet_tx', {
+              p_ticket_id:'INTROSPECT_PROBE', p_club_id:'PROBE', p_player_id:'PROBE',
+              p_player_username:null, p_bet_type:'Single', p_stake:0,
+              p_potential_profit:0, p_estimated_payout:0,
+              p_idempotency_key:'INTROSPECT_PROBE', p_created_by:'probe'
+            });
+            sbProbe = { data:sbData, error:sbErr ? sbErr.message : null };
+          }
+        } catch(_pe){ sbProbe = { probeError:_pe.message }; }
+        return res.json({ ok:true, railwaySignatures: introspect, supabaseProbe: sbProbe });
       }
       const sql = fs.readFileSync(
         path2.join(__dirname, 'migrations', '2026-05-27_place_bet_tx_revoke_authenticated.sql'), 'utf8');
