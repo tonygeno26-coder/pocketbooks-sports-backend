@@ -7470,14 +7470,10 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
   try {
-    // 1. Idempotency: check if this exact bet was already placed
-    const { data: existLedger } = await sb.from('ledger_entries')
-      .select('id,ticket_id').eq('id', idempotencyKey).limit(1);
-    if (existLedger && existLedger[0]) {
-      // Already placed — return the existing ticket
-      const { data: existTicket } = await sb.from('tickets').select('*').eq('id', existLedger[0].ticket_id).limit(1);
-      return res.json({ ok:true, idempotent:true, ticket: existTicket&&existTicket[0], ledgerEntryId:idempotencyKey });
-    }
+    // Idempotency is handled entirely by requireIdempotency middleware above.
+    // The middleware checks idempotency_keys, marks requests pending/completed,
+    // and replays stored responses — no second preflight check needed here.
+    // The RPC's DB unique constraint on p_idempotency_key is the final atomic guard.
 
     // 2. Derive DB balance for player — MUST filter by club_id (Bug #1 fix)
     // Without the club filter, losses/open risk from OTHER clubs reduce this
