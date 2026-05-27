@@ -3471,7 +3471,7 @@ async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const SNAPSHOT_TTL_MS  = 5 * 60 * 1000;  // 5 min
-const SNAPSHOT_TOLERANCE = 3;             // ±3 American odds points
+// SNAPSHOT_TOLERANCE removed — RISK-9: exact-match odds required; no drift window allowed.
 
 function _snapKey(cKey, market, selection) {
   return cKey+'|'+(market||'').toLowerCase()+'|'+(selection||'').toLowerCase();
@@ -4230,19 +4230,25 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
   // 'active' and 'live' both allow placement — fall through to odds drift check below.
 
-  // Odds drift check
-  const submittedOdds = parseInt(leg.odds,10);
-  const serverOdds    = snap.odds_american;
-  const drift         = !isNaN(submittedOdds) ? Math.abs(submittedOdds-serverOdds) : 0;
-  if (!isNaN(submittedOdds) && drift > SNAPSHOT_TOLERANCE) {
-    const policy = oddsChangePolicy||'reject';
-    if (policy==='accept_any_with_confirm') { /* allow with changed flag */ }
-    else if (policy==='accept_better') {
-      if (serverOdds <= submittedOdds)
-        return { ok:false, code:'odds_changed', leg:leg.pick, submittedOdds, serverOdds, drift };
-    } else {
-      return { ok:false, code:'odds_changed', leg:leg.pick, submittedOdds, serverOdds, drift };
-    }
+  // RISK-9: Zero-tolerance exact-match odds.
+  // No drift window, no accept_better, no accept_any_with_confirm.
+  // submitted odds must equal server snapshot odds exactly (integer comparison).
+  const submittedOdds = Number(leg.odds);
+  const serverOdds    = Number(snap.odds_american);
+
+  if (!Number.isFinite(submittedOdds) || !Number.isFinite(serverOdds)) {
+    return { ok:false, code:'invalid_snapshot_odds', leg:leg.pick };
+  }
+
+  if (submittedOdds !== serverOdds) {
+    return {
+      ok:          false,
+      code:        'odds_changed',
+      leg:         leg.pick,
+      submittedOdds,
+      serverOdds,
+      reason:      'exact_match_required'
+    };
   }
 
   return {
@@ -4842,7 +4848,7 @@ requirePermission = function(action, getTargetPlayerId) {
 // Atomic replace only — never partially mutated.
 // ════════════════════════════════════════════════════════════════════════════
 
-const ODDS_TOLERANCE_PTS  = 3;
+// ODDS_TOLERANCE_PTS removed — RISK-9: exact-match odds required; no tolerance window allowed.
 const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
 // Sports the live-odds poller actually fetches. Owls polls use these keys;
 // the Odds API legacy path also accepts them. When ODDS_PROVIDER=owls_insight,
@@ -5214,7 +5220,7 @@ function validateLegOdds(leg, liveMap, nowMs) {
 
   // Drift check (American points)
   const drift = Math.abs(outcome.price - parseInt(leg.odds,10));
-  if (drift > ODDS_TOLERANCE_PTS) {
+  if (drift > 0) {
     return { ok:false, code:'odds_changed', leg:leg.pick,
              oldOdds: parseInt(leg.odds,10), newOdds: outcome.price, drift };
   }
