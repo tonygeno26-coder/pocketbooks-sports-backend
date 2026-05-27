@@ -4119,7 +4119,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const cKey   = leg.canonicalGameKey||'';
   const market = (leg.market||'moneyline').toLowerCase();
   const pick   = (leg.pick||'').toLowerCase();
-  const bypassOk = !IS_PRODUCTION || DEV_AUTH_BYPASS;
+  // bypassOk is NEVER true in production — snapshot fallback to client odds
+  // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
+  const bypassOk = !IS_PRODUCTION;
   let snap = null;
 
   // ----- Canonical identity (priority #11) -----
@@ -8741,6 +8743,15 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('║  PocketBooks Sports Backend  sha='+_startSHA+'    ║');
   console.log('╠══════════════════════════════════════════════════╣');
   console.log('║  PORT='+PORT+'  NODE_ENV='+process.env.NODE_ENV+'  DEV_AUTH_BYPASS='+process.env.DEV_AUTH_BYPASS);
+  if (IS_PRODUCTION && DEV_AUTH_BYPASS) {
+    console.error('');
+    console.error('╔══════════════════════════════════════════════════════════════╗');
+    console.error('║  CRITICAL: DEV_AUTH_BYPASS=true in NODE_ENV=production       ║');
+    console.error('║  Snapshot odds bypass is DISABLED (bypassOk=false enforced)  ║');
+    console.error('║  Remove DEV_AUTH_BYPASS from Railway env immediately.        ║');
+    console.error('╚══════════════════════════════════════════════════════════════╝');
+    console.error('');
+  }
   console.log('║  SUPABASE_URL='+(process.env.SUPABASE_URL?'set':'MISSING'));
   console.log('║  SESSION_SECRET='+(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'dev-insecure-secret-change-in-prod' ? 'set':'MISSING/default'));
   if (!GRADING_SETTLEMENT_ENABLED)
