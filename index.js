@@ -8861,60 +8861,121 @@ app.post('/api/admin/run-migration-pl6', async (req, res) => {
   if (secret !== 'PL6_REVOKE_AUTHENTICATED_PLACE_BET_TX')
     return res.status(403).json({ ok:false, error:'missing_migration_secret' });
   try {
-    const fs = require('fs'), path2 = require('path');
-    const pool2 = new (require('pg').Pool)({ connectionString:process.env.DATABASE_URL, ssl:{rejectUnauthorized:false} });
-    const c = await pool2.connect();
-    let verifyResult, introspect;
-    try {
-      // First introspect actual function signatures on Railway PG
-      const iRes = await c.query(`
-        SELECT p.oid, pg_get_function_identity_arguments(p.oid) AS args
-        FROM pg_proc p WHERE p.proname = 'place_bet_tx'
-      `);
-      introspect = iRes.rows;
-      if (req.body.introspectOnly) {
-        c.release(); await pool2.end();
-        // Also check Supabase via rpc probe
-        var sbProbe = null;
-        try {
-          const sb2 = getSupabase();
-          if (sb2) {
-            const { data:sbData, error:sbErr } = await sb2.rpc('place_bet_tx', {
-              p_ticket_id:'INTROSPECT_PROBE', p_club_id:'PROBE', p_player_id:'PROBE',
-              p_player_username:null, p_bet_type:'Single', p_stake:0,
-              p_potential_profit:0, p_estimated_payout:0,
-              p_idempotency_key:'INTROSPECT_PROBE', p_created_by:'probe'
-            });
-            sbProbe = { data:sbData, error:sbErr ? sbErr.message : null };
+    const sb2 = getSupabase();
+    if (!sb2) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+
+    // Step 1: Create a helper function that runs the REVOKE (only way to execute DDL via Supabase RPC)
+    // We use a DO block wrapped in a function, call it once, then drop it.
+    const CREATE_HELPER = `
+      CREATE OR REPLACE FUNCTION public._pl6_revoke_place_bet_tx()
+      RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER AS $$
+      BEGIN
+        -- Introspect signature
+        PERFORM proname FROM pg_proc WHERE proname = 'place_bet_tx' LIMIT 1;
+        IF NOT FOUND THEN
+          RETURN jsonb_build_object('ok', false, 'error', 'place_bet_tx_not_found');
+        END IF;
+        -- Revoke from authenticated (use dynamic SQL to handle signature variance)
+        EXECUTE (
+          SELECT 'REVOKE EXECUTE ON FUNCTION public.place_bet_tx(' ||
+                 pg_get_function_identity_arguments(oid) || ') FROM authenticated'
+          FROM pg_proc WHERE proname = 'place_bet_tx' LIMIT 1
+        );
+        RETURN jsonb_build_object(
+          'ok', true,
+          'signature', (SELECT pg_get_function_identity_arguments(oid) FROM pg_proc WHERE proname='place_bet_tx' LIMIT 1)
+        );
+      END;
+      $$;
+      GRANT EXECUTE ON FUNCTION public._pl6_revoke_place_bet_tx() TO service_role;
+    `;
+
+    // Step 2: Apply the helper via Supabase RPC (using pg REST with service role)
+    // We can't run raw DDL via sb.rpc() directly, but we can use the Supabase pg endpoint
+    const fetch3 = require('node-fetch') || null;
+    const https = require('https');
+    const sbUrl = process.env.SUPABASE_URL;
+    const sbKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    // Execute DDL via Supabase pg endpoint
+    async function supabaseSql(sql) {
+      return new Promise(function(resolve) {
+        const body = JSON.stringify({ query: sql });
+        const u = new URL(sbUrl + '/rest/v1/');
+        // Use the postgres endpoint
+        const opts = {
+          hostname: u.hostname,
+          port: 443,
+          path: '/pg/query',
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + sbKey,
+            'apikey': sbKey,
+            'Content-Length': Buffer.byteLength(body)
           }
-        } catch(_pe){ sbProbe = { probeError:_pe.message }; }
-        return res.json({ ok:true, railwaySignatures: introspect, supabaseProbe: sbProbe });
-      }
-      const sql = fs.readFileSync(
-        path2.join(__dirname, 'migrations', '2026-05-27_place_bet_tx_revoke_authenticated.sql'), 'utf8');
-      await c.query(sql);
-      // Verify privileges
-      const v = await c.query(`
-        SELECT p.proname, r.rolname,
-          has_function_privilege(r.rolname, p.oid, 'EXECUTE') AS can_execute
-        FROM pg_proc p
-        CROSS JOIN pg_roles r
-        WHERE p.proname = 'place_bet_tx'
-          AND r.rolname IN ('authenticated','service_role')
-        ORDER BY r.rolname`);
-      verifyResult = v.rows;
-    } finally { c.release(); await pool2.end(); }
-    const authed = verifyResult.find(function(r){ return r.rolname==='authenticated'; });
-    const svc    = verifyResult.find(function(r){ return r.rolname==='service_role'; });
-    const ok = authed && !authed.can_execute && svc && svc.can_execute;
-    console.log('[migration-pl6] REVOKE authenticated result:', JSON.stringify(verifyResult));
-    res.json({ ok, migration:'pl6_revoke_authenticated', verifyResult,
+        };
+        const req2 = https.request(opts, function(r) {
+          let d = ''; r.on('data', function(c){ d+=c; }); r.on('end', function(){
+            try{ resolve({ status:r.statusCode, data:JSON.parse(d) }); }
+            catch(_){ resolve({ status:r.statusCode, raw:d }); }
+          });
+        });
+        req2.on('error', function(e){ resolve({ error:e.message }); });
+        req2.write(body); req2.end();
+      });
+    }
+
+    // Try the pg/query endpoint first, fallback to rpc approach
+    let revokeResult = null;
+    let signature = null;
+    
+    // Try: get signature, then build and run REVOKE directly via pg pool on Supabase
+    // Supabase exposes a direct postgres connection — but we only have the service role key
+    // The safest path: create helper fn, call via rpc, drop it
+    
+    // Create helper
+    const createRes = await supabaseSql(CREATE_HELPER);
+    if (createRes.status !== 200 && createRes.status !== 201 && !createRes.data) {
+      // pg/query endpoint not available — try alternate
+      return res.status(500).json({ ok:false, error:'supabase_sql_endpoint_unavailable',
+        hint:'Run manually in Supabase SQL editor: REVOKE EXECUTE ON FUNCTION public.place_bet_tx(...) FROM authenticated',
+        createRes });
+    }
+    
+    // Call the helper
+    const { data: rpcData, error: rpcErr } = await sb2.rpc('_pl6_revoke_place_bet_tx', {});
+    revokeResult = rpcErr ? { error: rpcErr.message } : rpcData;
+    signature = revokeResult && revokeResult.signature;
+    
+    // Drop helper
+    await supabaseSql('DROP FUNCTION IF EXISTS public._pl6_revoke_place_bet_tx()');
+    
+    // Verify privileges
+    const verifyRes = await supabaseSql(`
+      SELECT p.proname, r.rolname,
+        has_function_privilege(r.rolname, p.oid, 'EXECUTE') AS can_execute
+      FROM pg_proc p
+      CROSS JOIN pg_roles r
+      WHERE p.proname = 'place_bet_tx'
+        AND r.rolname IN ('authenticated','service_role')
+      ORDER BY r.rolname
+    `);
+    
+    const rows = verifyRes.data || [];
+    const authed = rows.find(function(r){ return r.rolname==='authenticated'; });
+    const svc    = rows.find(function(r){ return r.rolname==='service_role'; });
+    const ok = !!(authed && !authed.can_execute && svc && svc.can_execute);
+    
+    console.log('[migration-pl6] REVOKE result:', JSON.stringify(revokeResult));
+    console.log('[migration-pl6] verify rows:', JSON.stringify(rows));
+    
+    res.json({ ok, migration:'pl6_revoke_authenticated',
+      revokeResult, signature, verifyResult: rows,
       authenticated_can_execute: authed ? authed.can_execute : 'role_not_found',
-      service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found',
-      signatures: introspect });
+      service_role_can_execute:  svc    ? svc.can_execute    : 'role_not_found' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
-
 
 app.listen(PORT, '0.0.0.0', () => {
   const _startSHA = 'v6-decode-fallback'; // bumped for v6
