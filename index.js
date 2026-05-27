@@ -7765,6 +7765,38 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       // same atomic primitive /api/bets/cancel uses) with a derived
       // idempotency key so it cannot collide with the placement key.
       console.error('[bets/place] ticket_legs insert failed AFTER RPC ok — compensating:', legErr.message, 'ticketId='+ticketId);
+
+      // Helper: write a durable orphan-ticket event and emit Railway critical log.
+      // Fire-and-forget — must never throw or block the error response.
+      const _reportOrphanTicket = function(compensationError) {
+        const _orphanPayload = {
+          category:         'orphan_ticket_compensation_failed',
+          ticketId:         ticketId,
+          clubId:           clubId||null,
+          playerId:         playerId,
+          idempotencyKey:   idempotencyKey,
+          legInsertError:   legErr.message,
+          compensationError: compensationError,
+          timestamp:        new Date().toISOString()
+        };
+        // Railway-visible critical log — searchable by ops/alerting rules.
+        console.error('CRITICAL_ORPHAN_TICKET_COMPENSATION_FAILED', JSON.stringify(_orphanPayload));
+        // Durable write — fire-and-forget so this path can never itself throw.
+        try {
+          sb.from('audit_events').insert({
+            event_type: 'orphan_ticket_compensation_failed',
+            player_id:  playerId,
+            club_id:    clubId||null,
+            ticket_id:  ticketId,
+            payload:    _orphanPayload
+          }).then(function(){}, function(writeErr){
+            console.error('[bets/place] orphan audit write failed (secondary):', writeErr && writeErr.message);
+          });
+        } catch(_e) {
+          console.error('[bets/place] orphan audit write threw (secondary):', _e && _e.message);
+        }
+      };
+
       try {
         const cancelResult = await _callMoneyRpc('cancel_bet_tx', {
           p_ticket_id:       ticketId,
@@ -7775,10 +7807,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           p_created_by:      playerId
         });
         if (!cancelResult || (!cancelResult.ok && !cancelResult.idempotent)) {
-          console.error('[bets/place] CRITICAL: cancel_bet_tx compensation failed for orphan ticketId='+ticketId, cancelResult);
+          _reportOrphanTicket('cancel_bet_tx returned not-ok: '+(cancelResult&&cancelResult.error||'unknown'));
         }
+        // cancelResult.ok or idempotent → compensation succeeded, no orphan event needed.
       } catch(cancelErr) {
-        console.error('[bets/place] CRITICAL: cancel_bet_tx compensation threw for orphan ticketId='+ticketId, cancelErr.message);
+        _reportOrphanTicket('cancel_bet_tx threw: '+cancelErr.message);
       }
       return res.status(500).json({ ok:false, error:'ticket_legs_insert_failed',
         detail: legErr.message, ticketId });
