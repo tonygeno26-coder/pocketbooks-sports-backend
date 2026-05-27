@@ -371,17 +371,33 @@ async function _runGradeCore(fakeReq, sb) {
       const ticketLegs = (allLegs||[]).filter(function(l){ return l.ticket_id===ticket.id; });
       const outcome = _deriveTicketOutcome(ticket, ticketLegs, resultsByKey);
       if (outcome.outcome==='error'||outcome.outcome==='pending') { skipped++; continue; }
-      const profit = parseFloat(ticket.potential_profit)||0;
+      // GRD-2: recompute profit when pushed legs drop out of a parlay
+      let profit = parseFloat(ticket.potential_profit)||0;
+      let overrideProfit = null;
+      if (outcome.pushReduced && outcome.wonLegObjects) {
+        const risk = parseFloat(ticket.risk_amount)||0;
+        const allOddsValid = outcome.wonLegObjects.every(function(l){ return l.odds && l.odds !== 0; });
+        if (!allOddsValid) {
+          console.warn('[grading] push-reduced parlay has null/zero leg odds — skipping ticketId='+ticket.id);
+          skipped++;
+          continue;
+        }
+        const decProd = outcome.wonLegObjects.reduce(function(acc,l){ return acc*_sgAmToDecimal(l.odds); }, 1.0);
+        overrideProfit = Math.round((risk*(decProd-1))*100)/100;
+        profit = overrideProfit;
+      }
       if (!GRADING_SETTLEMENT_ENABLED || !WORKER_GRADE_SETTLEMENT_ENABLED) {
         console.warn('[grading] worker settlement blocked ticketId='+ticket.id+
-          ' outcome='+outcome.outcome+' reason='+GRADING_DISABLED_REASON);
+          ' outcome='+outcome.outcome+(overrideProfit!=null?' pushReduced overrideProfit='+overrideProfit:'')+
+          ' reason='+GRADING_DISABLED_REASON);
         skipped++;
         continue;
       }
       const gr = await _callMoneyRpc('grade_ticket_tx',{
         p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
         p_grade_result:outcome.outcome, p_profit:profit,
-        p_idempotency_key:'GR_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker'
+        p_idempotency_key:'GR_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker',
+        p_override_profit:overrideProfit  // null on normal path; non-null for push-reduced parlays
       });
       if (gr.ok||gr.idempotent) graded++; else skipped++;
     } catch(_e) { logEvent('error','grade_core_ticket_error',{ ticketId:ticket.id, err:_e.message }); skipped++; }
@@ -6183,12 +6199,21 @@ function _deriveTicketOutcome(ticket, legs, resultsByKey) {
   const pending = legOutcomes.find(function(l){ return l.outcome==='pending'||l.outcome==='error'; });
   if (pending) return { outcome:pending.outcome, reason:pending.reason, leg:pending.leg };
   if (type==='single'||type==='straight') return legOutcomes[0];
-  // Parlay
+  // Parlay / Teaser / RoundRobin — any lost leg loses the whole ticket
   const anyLost = legOutcomes.find(function(l){ return l.outcome==='lost'; });
   if (anyLost) return { outcome:'lost' };
-  const anyPush = legOutcomes.find(function(l){ return l.outcome==='push'; });
-  if (anyPush) return { outcome:'push' };
-  return legOutcomes.every(function(l){ return l.outcome==='won'; }) ? { outcome:'won' } : { outcome:'lost' };
+  // GRD-2: Separate won legs from pushed legs
+  const wonLegs  = legs.filter(function(_,i){ return legOutcomes[i].outcome==='won'; });
+  const pushLegs = legs.filter(function(_,i){ return legOutcomes[i].outcome==='push'; });
+  if (pushLegs.length > 0 && wonLegs.length > 0) {
+    // Partial push: some legs won, some pushed, none lost.
+    // Pushed legs drop out; remaining winning legs pay at reduced odds.
+    return { outcome:'won', pushReduced:true, wonLegObjects:wonLegs, pushLegCount:pushLegs.length };
+  }
+  if (pushLegs.length === legs.length) {
+    return { outcome:'push' };  // all legs pushed — full stake refund
+  }
+  return wonLegs.length === legs.length ? { outcome:'won' } : { outcome:'lost' };
 }
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -6456,7 +6481,23 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
         const combined = outcome.outcome; // 'won'|'lost'|'push'
 
         const risk   = parseFloat(ticket.risk_amount)||0;
-        const profit = parseFloat(ticket.potential_profit)||0;
+        // GRD-2: recompute profit when pushed legs drop out of a parlay
+        let profit = parseFloat(ticket.potential_profit)||0;
+        let overrideProfit = null;
+        if (outcome.pushReduced && outcome.wonLegObjects) {
+          const allOddsValid = outcome.wonLegObjects.every(function(l){ return l.odds && l.odds !== 0; });
+          if (!allOddsValid) {
+            row.reason='push_reduced_null_odds:cannot_recompute';
+            console.warn('[grade/run] push-reduced parlay has null/zero leg odds — skipping ticketId='+ticket.id);
+            skipped++;
+            results.push(row);
+            continue;
+          }
+          const decProd = outcome.wonLegObjects.reduce(function(acc,l){ return acc*_sgAmToDecimal(l.odds); }, 1.0);
+          overrideProfit = Math.round((risk*(decProd-1))*100)/100;
+          profit = overrideProfit;
+        }
+
         const payout = combined==='won'?Math.round((risk+profit)*100)/100:combined==='push'?risk:0;
         const delta  = combined==='won'?profit:combined==='push'?0:-risk;
 
@@ -6466,6 +6507,7 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
           row.statusAfter=ticket.status; row.result=combined; row.payoutDelta=delta;
           row.dryRun=true; row.settlementDisabled=true; row.reason='dry_run:'+GRADING_DISABLED_REASON;
           row.wouldPayout=payout; row.wouldCanonicalLedgerId='LE_GR_'+ticket.id+'_'+combined;
+          if (overrideProfit!=null) { row.pushReduced=true; row.overrideProfit=overrideProfit; }
           skipped++;
           results.push(row);
           continue;
@@ -6476,22 +6518,26 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
         const gradeResult = await _callMoneyRpc('grade_ticket_tx', {
           p_ticket_id:ticket.id, p_club_id:ticket.club_id||'', p_player_id:ticket.player_id,
           p_grade_result:combined, p_profit:profit,
-          p_idempotency_key:iKey, p_created_by:'server-grade-api'
+          p_idempotency_key:iKey, p_created_by:'server-grade-api',
+          p_override_profit:overrideProfit  // null on normal path; non-null for push-reduced parlays
         });
         if (!gradeResult.ok && !gradeResult.idempotent)
           throw new Error('grade_rpc_rejected:'+gradeResult.error);
 
         console.log('[grade/run] canonical settlement ok ticketId='+ticket.id+
-          ' result='+combined+' ledgerEntryId='+(gradeResult.ledger_entry_id||iKey));
+          ' result='+combined+(overrideProfit!=null?' pushReduced overrideProfit='+overrideProfit:'')+
+          ' ledgerEntryId='+(gradeResult.ledger_entry_id||iKey));
 
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type:'ticket_graded_server',
           ticket_id:ticket.id, player_id:ticket.player_id, club_id:ticket.club_id,
           payload:{ result:combined, source:'result_snapshot', legCount:ticketLegs.length,
-                    payout, delta, rpcOk:gradeResult.ok, balanceAfter:gradeResult.balance_after }
+                    payout, delta, pushReduced:overrideProfit!=null, overrideProfit,
+                    rpcOk:gradeResult.ok, balanceAfter:gradeResult.balance_after }
         }).select('id');
 
         row.statusAfter=combined; row.result=combined; row.payoutDelta=delta;
+        if (overrideProfit!=null) { row.pushReduced=true; row.overrideProfit=overrideProfit; }
         row.ledgerEntryId=gradeResult.ledger_entry_id||iKey;
         row.canonicalLedgerId=gradeResult.ledger_entry_id||iKey;
         row.auditEventId=auditData&&auditData[0]?auditData[0].id:null;
@@ -8803,6 +8849,45 @@ app.get('/api/grade/status', async (req, res) => {
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
 });
 // ════════════════════════════════════════════════════════════════════════════
+
+// POST /api/admin/run-migration-023 — one-shot GRD-2 migration endpoint
+// Requires: platform_admin role. Auto-removes itself after first successful run.
+app.post('/api/admin/run-migration-023', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  if (actor.platformRole !== 'platform_admin' && (ROLE_RANK[actor.role]||0) < ROLE_RANK.owner)
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
+  const { secret } = req.body||{};
+  if (secret !== 'GRD2_PUSH_REDUCED_MIGRATION_023')
+    return res.status(403).json({ ok:false, error:'missing_migration_secret' });
+  try {
+    const pool2 = require('pg').Pool ? new (require('pg').Pool)({
+      connectionString: process.env.DATABASE_URL, ssl:{ rejectUnauthorized:false } }) : null;
+    if (!pool2) return res.status(503).json({ ok:false, error:'pg_not_available' });
+    const sql = require('fs').readFileSync(
+      require('path').join(__dirname, 'migrations', '2026-05-27_grade_ticket_tx_push_reduced.sql'), 'utf8');
+    const c = await pool2.connect();
+    let result;
+    try {
+      await c.query(sql);
+      // Verify
+      const v = await c.query(`SELECT pg_get_functiondef(oid) AS def FROM pg_proc WHERE proname='grade_ticket_tx' AND pg_get_function_identity_arguments(oid) LIKE '%override%' LIMIT 1`);
+      const def = v.rows[0] ? v.rows[0].def : '';
+      result = {
+        hasOverrideParam:  def.includes('p_override_profit'),
+        hasOverrideLogic:  def.includes('p_override_profit IS NOT NULL'),
+        hasPushReducedFlag:def.includes('push_reduced'),
+        hasMismatchGuard:  def.includes('profit_mismatch'),
+        hasPotentialUpdate:def.includes('CASE') && def.includes('p_override_profit IS NOT NULL'),
+        defLength:         def.length
+      };
+    } finally { c.release(); await pool2.end(); }
+    const allPass = Object.values(result).every(function(v){ return v === true || typeof v === 'number'; });
+    if (!allPass) return res.status(500).json({ ok:false, error:'verification_failed', result });
+    console.log('[migration-023] GRD-2 applied and verified:', result);
+    res.json({ ok:true, migration:'023_grade_ticket_tx_push_reduced', verified:true, result });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   const _startSHA = 'v6-decode-fallback'; // bumped for v6
