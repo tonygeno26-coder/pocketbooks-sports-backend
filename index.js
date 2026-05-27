@@ -7189,6 +7189,20 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     if (!settleResult.ok && !settleResult.idempotent)
       return res.status(400).json({ ok:false, error:settleResult.error||'settlement_failed' });
 
+    // Register in settlement_payments so payment-confirm sees it as already done (R1_FIXED_double_settlement_guard)
+    // This prevents payment-confirm from writing a second SETTLEMENT_APPLIED for the same debt.
+    if (!settleResult.idempotent) {
+      const _payId = 'SETTLE_DIRECT_'+idempotencyKey;
+      sb.from('settlement_payments').upsert({
+        payment_id: _payId, period_id: 'DIRECT', revision: 0,
+        club_id: clubId, player_id: playerId, direction, amount: amt,
+        method: 'direct', status: 'confirmed', note: note||null,
+        created_at: new Date().toISOString(), created_by: (req._actor&&req._actor.actorId)||'host',
+        confirmed_at: new Date().toISOString(), confirmed_by: (req._actor&&req._actor.actorId)||'host',
+        ledger_written: true, ledger_settlement_id: idempotencyKey
+      }, { onConflict: 'payment_id' }).then(()=>{}, function(e){ console.warn('[settle-player] payment_row write error:', e.message); });
+    }
+
     // Legacy ledger_entries mirror (fire-and-forget)
     var executedAt = new Date().toISOString();
     sb.from('ledger_entries').upsert({
@@ -8182,6 +8196,48 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
     if (pay.status==='confirmed') return res.json({ ok:true, idempotent:true, paymentId });
     if (pay.status==='voided')    return res.status(409).json({ ok:false, error:'payment_voided' });
     const iKey = 'CONFIRM_PAY_'+paymentId;
+    // Guard: check canonical ledger for existing SETTLEMENT_APPLIED (R1_FIXED_double_settlement_guard)
+    // Prevents double-write if settle-player already executed the RPC for this debt.
+    // Check by settlement_id (settle_player_tx uses idempotencyKey as settlement_id in ledger)
+    // OR by idempotency_key = CONFIRM_PAY_<paymentId> (own prior write).
+    var _existingSettlement = null;
+    try {
+      // Check if a ledger row already exists with our own iKey (pure idempotency replay)
+      var _ownRow = await sb.from('ledger').select('ledger_id,settlement_id')
+        .eq('club_id',pay.club_id).eq('player_id',pay.player_id)
+        .eq('event_type','SETTLEMENT_APPLIED').eq('idempotency_key',iKey).limit(1);
+      if (_ownRow.data && _ownRow.data[0]) _existingSettlement = _ownRow.data[0];
+      // Also check if a DIRECT settlement row exists for same player+direction+amount
+      // (settle-player path stores ledger_settlement_id for cross-reference)
+      if (!_existingSettlement) {
+        var _directPay = await sb.from('settlement_payments').select('payment_id,ledger_settlement_id')
+          .eq('club_id',pay.club_id).eq('player_id',pay.player_id)
+          .eq('direction',pay.direction).eq('status','confirmed').eq('method','direct')
+          .eq('amount',pay.amount).limit(1);
+        if (_directPay.data && _directPay.data[0] && _directPay.data[0].ledger_settlement_id) {
+          // settle-player already wrote the ledger entry; this confirm is a no-ledger idempotent
+          console.log('[settlement/confirm] DOUBLE_SETTLEMENT_GUARD paymentId='+paymentId
+            +' — direct settlement already exists ledger_id='+_directPay.data[0].ledger_settlement_id
+            +' — skipping second SETTLEMENT_APPLIED write');
+          await sb.from('settlement_payments').update({
+            status:'confirmed', confirmed_at:new Date().toISOString(),
+            confirmed_by:(actor&&actor.actorId)||'host', ledger_written:false,
+            note:(pay.note?pay.note+' ':'')+'[no-ledger: covered by direct settlement]'
+          }).eq('payment_id',paymentId);
+          return res.json({ ok:true, paymentId, ledgerId:null, doubleSettlementPrevented:true });
+        }
+      }
+    } catch(_gsErr) { console.warn('[settlement/confirm] guard query error:', _gsErr.message); }
+    if (_existingSettlement) {
+      // Own prior write found — idempotent replay, update payment status if needed
+      if (pay.status !== 'confirmed') {
+        await sb.from('settlement_payments').update({
+          status:'confirmed', confirmed_at:new Date().toISOString(),
+          confirmed_by:(actor&&actor.actorId)||'host', ledger_written:true
+        }).eq('payment_id',paymentId);
+      }
+      return res.json({ ok:true, paymentId, idempotent:true, ledgerId:_existingSettlement.ledger_id });
+    }
     // Write canonical ledger
     const dir = pay.direction==='player_paid_host'?'debit':'credit';
     await _writeLedgerEntry({
