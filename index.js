@@ -3348,9 +3348,12 @@ function requireCanonicalClubId(req, res, next) {
     || '';
   // If no clubId present, let downstream guards handle missing-clubId
   if (!clubId) return next();
-  // Dev bypass: allow numeric IDs in dev/test environments
-  const bypassAllowed = process.env.NODE_ENV !== 'production' || process.env.DEV_AUTH_BYPASS === 'true';
-  if (bypassAllowed) return next();
+  // Dev bypass: allow numeric IDs only in non-production environments
+  // NOTE: DEV_AUTH_BYPASS does NOT bypass the club-ID format check —
+  // it only bypasses auth token verification. Club ID normalization
+  // is a data-integrity constraint, not an auth constraint.
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (!isProduction) return next();
   // Reject purely numeric club IDs on production Supabase routes
   if (_NUMERIC_CLUB_ID_RE.test(clubId)) {
     console.log('[club-id] NUMERIC_CLUB_ID_REJECTED clubId='+clubId+' path='+req.path);
