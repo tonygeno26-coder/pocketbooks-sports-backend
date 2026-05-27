@@ -7623,7 +7623,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     }
     if (!_conflictBypass) {
       const { data: activeTix } = await sb.from('tickets').select('id')
-        .eq('player_id', playerId).in('status',['active','open']);
+        .eq('player_id', playerId).eq('club_id', clubId).in('status',['active','open']);
       if (activeTix && activeTix.length) {
         const activeTicketIds = activeTix.map(function(t){ return t.id; });
         const { data: activeLegs } = await sb.from('ticket_legs')
