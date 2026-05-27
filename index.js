@@ -1732,8 +1732,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = 'v6-decode-fallback'; // updated for v6 jwt.decode unverified
-  const _BUILD_MARKER = 'legacy-auth-fix-v6-decode-fallback'; // unique string per meaningful change
+  const _BAKED_SHA = 'cancel-membership-fix-v1'; // cancel_bet membership verification
+  const _BUILD_MARKER = 'cancel-membership-fix-v1'; // unique string per meaningful change
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
