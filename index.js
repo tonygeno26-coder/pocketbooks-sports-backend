@@ -7795,12 +7795,20 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       created_at: now, created_by: playerId
     }, { onConflict:'id' }).then(()=>{},()=>{});
 
-    // 8. Audit event
-    await sb.from('audit_events').insert({
-      event_type: 'ticket_placed', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
-      payload: { betType, stake:stakeAmt, legs:legsArr.length, payout: parseFloat(payout)||0,
-                 txResult: rpcResult }
-    });
+    // 8. Audit event — fire-and-forget after RPC commit.
+    // Must NOT throw: a failed audit write must never fail the placement or
+    // cause the idempotency key to be marked 'failed', which would let a
+    // retry re-execute the RPC and double-debit the player.
+    try {
+      await sb.from('audit_events').insert({
+        event_type: 'ticket_placed', player_id: playerId, club_id: clubId||null, ticket_id: ticketId,
+        payload: { betType, stake:stakeAmt, legs:legsArr.length, payout: parseFloat(payout)||0,
+                   txResult: rpcResult }
+      });
+    } catch(_auditErr) {
+      console.warn('[bets/place] audit_events write failed (non-fatal):', _auditErr.message,
+        'ticketId='+ticketId);
+    }
 
     const ticketRow = { id:ticketId, club_id:clubId, player_id:playerId, type:betType,
       status:'active', risk_amount:rnd(stakeAmt), placed_at:now };
