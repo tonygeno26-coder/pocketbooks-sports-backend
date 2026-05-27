@@ -4188,7 +4188,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
         console.warn('[snapshot] DEV FALLBACK — using client odds (production would reject)');
         return { ok:true, devFallback:true, warn:'snapshot_db_error',
                  acceptedOddsAmerican:parseInt(leg.odds,10)||0,
-                 acceptedOddsDecimal:null };
+                 acceptedOddsDecimal:null, isLive:false };
       }
       return { ok:false, code:'odds_service_unavailable', reason:'db_error', leg:leg.pick };
     }
@@ -4203,7 +4203,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     if (bypassOk) {
       console.warn('[snapshot] MISSING — DEV FALLBACK for', leg.pick);
       return { ok:true, devFallback:true, warn:'odds_snapshot_missing',
-               acceptedOddsAmerican:parseInt(leg.odds,10)||0, acceptedOddsDecimal:null };
+               acceptedOddsAmerican:parseInt(leg.odds,10)||0, acceptedOddsDecimal:null, isLive:false };
     }
     return { ok:false, code:'odds_service_unavailable', reason:'snapshot_missing', leg:leg.pick };
   }
@@ -4214,7 +4214,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     if (bypassOk) {
       console.warn('[snapshot] STALE — DEV FALLBACK for', leg.pick);
       return { ok:true, devFallback:true, warn:'odds_stale',
-               acceptedOddsAmerican:snap.odds_american, acceptedOddsDecimal:parseFloat(snap.odds_decimal) };
+               acceptedOddsAmerican:snap.odds_american, acceptedOddsDecimal:parseFloat(snap.odds_decimal), isLive:false };
     }
     const ageMs = nowMs - new Date(snap.fetched_at).getTime();
     return { ok:false, code:'odds_stale', leg:leg.pick, ageMs };
@@ -4249,7 +4249,8 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     acceptedOddsAmerican: serverOdds,
     acceptedOddsDecimal:  parseFloat(snap.odds_decimal),
     acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
-    commenceTime:         snap.commence_time
+    commenceTime:         snap.commence_time,
+    isLive:               state === 'live'   // server-authoritative; never trust client leg.isLive
   };
 }
 
@@ -4304,7 +4305,8 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
       accepted_point_line:    vr.acceptedPointLine||null,
       odds_snapshot_id:       vr.snapshotId||null,
       accepted_at:            new Date(nowMs).toISOString(),
-      dev_fallback:           vr.devFallback||false
+      dev_fallback:           vr.devFallback||false,
+      server_is_live:         vr.isLive||false   // server-derived; used by RPC, not client leg.isLive
     }));
   }
   const payout = Math.round(stake*product*100)/100;
@@ -7697,7 +7699,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       p_sports:           legsArr.map(function(l){ return (l.sport||'').toLowerCase(); }),
       p_markets:          legsArr.map(function(l){ return (l.market||'moneyline').toLowerCase(); }),
       p_canonical_keys:   legsArr.map(function(l){ return l.canonicalGameKey||''; }),
-      p_is_live:          legsArr.some(function(l){ return !!l.isLive; })
+      p_is_live:          legsArr.some(function(l){ return !!l.server_is_live; })
     });
     if (!rpcResult.ok && !rpcResult.idempotent) {
       // RPC rejected — nothing inserted yet (legs come after). No cleanup needed.
