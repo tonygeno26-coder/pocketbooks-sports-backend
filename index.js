@@ -7499,8 +7499,10 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       .eq('club_id', clubId);
     var startBal = 1000;
     try {
-      const { data:mem } = await sb.from('club_members').select('balance_start')
-        .eq('player_id',playerId).limit(1);
+      // Use player_limits scoped by club_id — modern UUID-club source (CLUBMEMBERS_CLEANUP_player_limits_scope)
+      // club_members is legacy PostgreSQL; has no rows for UUID-club players and no club_id filter
+      const { data:mem } = await sb.from('player_limits').select('balance_start')
+        .eq('club_id',clubId).eq('player_id',playerId).limit(1);
       if (mem&&mem[0]) startBal = parseFloat(mem[0].balance_start)||1000;
     } catch(_e) {}
     var openRisk=0, settledGains=0, settledLosses=0;
@@ -7938,11 +7940,12 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Starting balance from club_members
+    // Starting balance from player_limits scoped by club_id (CLUBMEMBERS_CLEANUP_player_limits_scope)
+    // club_members is legacy PostgreSQL; has no rows for UUID-club players and no club_id filter
     var startingBalance = 1000;
     try {
-      const { data: mem } = await sb.from('club_members')
-        .select('balance_start').eq('player_id', playerId)
+      const { data: mem } = await sb.from('player_limits')
+        .select('balance_start').eq('club_id', clubId).eq('player_id', playerId)
         .limit(1);
       if (mem && mem[0] && mem[0].balance_start) startingBalance = parseFloat(mem[0].balance_start)||1000;
     } catch(_e) {}
