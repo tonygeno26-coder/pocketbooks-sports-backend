@@ -25,7 +25,8 @@ function assertEq(actual, expected, msg) {
   }
 }
 
-const SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+const LIVE_SNAPSHOT_TTL_MS = 10 * 1000;
+const PREGAME_SNAPSHOT_TTL_MS = 120 * 1000;
 const NOW_MS = new Date('2026-05-27T20:00:00Z').getTime();
 const FUTURE_CT = '2026-05-27T23:00:00Z';
 const PAST_CT = '2026-05-27T19:00:00Z';
@@ -33,8 +34,8 @@ const PAST_CT = '2026-05-27T19:00:00Z';
 function classifyMarket(snap, nowMs) {
   nowMs = nowMs || Date.now();
   if (!snap) return 'suspended';
-  const ageMs = nowMs - new Date(snap.fetched_at || snap.fetchedAt).getTime();
-  if (ageMs > SNAPSHOT_TTL_MS) return 'stale';
+  const fetchedMs = new Date(snap.fetched_at || snap.fetchedAt).getTime();
+  const ageMs = nowMs - fetchedMs;
 
   const evStatus = String(snap.event_status || snap.eventStatus || snap.gameStatus || '').toLowerCase();
   const mkStatus = String(snap.market_status || snap.marketStatus || '').toLowerCase();
@@ -44,13 +45,16 @@ function classifyMarket(snap, nowMs) {
   if (snap.eventCanceled === true || evStatus === 'canceled' || evStatus === 'cancelled' ||
       evStatus === 'postponed' || evStatus === 'abandoned') return 'canceled';
   if (snap.suspended === true || mkStatus === 'suspended' || mkStatus === 'paused') return 'suspended';
-  if (snap.eventLive === true || evStatus === 'live' || evStatus === 'in_play' || evStatus === 'in_progress') return 'live';
 
   const ct = snap.commence_time || snap.commenceTime;
+  let isLiveSnapshot = snap.eventLive === true || evStatus === 'live' || evStatus === 'in_play' || evStatus === 'in_progress';
   if (ct) {
     const ms = new Date(ct).getTime();
-    if (!isNaN(ms) && nowMs >= ms) return 'live';
+    if (!isNaN(ms) && nowMs >= ms) isLiveSnapshot = true;
   }
+  const ttlMs = isLiveSnapshot ? LIVE_SNAPSHOT_TTL_MS : PREGAME_SNAPSHOT_TTL_MS;
+  if (!Number.isFinite(fetchedMs) || ageMs > ttlMs) return 'stale';
+  if (isLiveSnapshot) return 'live';
   return 'active';
 }
 
@@ -87,7 +91,7 @@ function verifySnapshot(snap, leg, nowMs) {
 
 function snap(overrides) {
   return Object.assign({
-    fetched_at: new Date(NOW_MS - 60 * 1000).toISOString(),
+    fetched_at: new Date(NOW_MS - 5 * 1000).toISOString(),
     commence_time: FUTURE_CT,
     odds_american: -110,
     event_status: 'upcoming',
@@ -121,6 +125,25 @@ test('commence_time in past rejects', function() {
   const r = verifySnapshot(snap({ event_status:'upcoming', commence_time:PAST_CT }), leg(), NOW_MS);
   assert(!r.ok, 'expected rejection');
   assertEq(r.code, 'live_betting_disabled');
+});
+
+test('live snapshot older than 10 seconds rejects as stale', function() {
+  const r = verifySnapshot(snap({
+    event_status:'live',
+    fetched_at:new Date(NOW_MS - LIVE_SNAPSHOT_TTL_MS - 1).toISOString()
+  }), leg(), NOW_MS);
+  assert(!r.ok, 'expected rejection');
+  assertEq(r.code, 'odds_stale');
+});
+
+test('pregame snapshot older than 120 seconds rejects as stale', function() {
+  const r = verifySnapshot(snap({
+    event_status:'upcoming',
+    commence_time:FUTURE_CT,
+    fetched_at:new Date(NOW_MS - PREGAME_SNAPSHOT_TTL_MS - 1).toISOString()
+  }), leg(), NOW_MS);
+  assert(!r.ok, 'expected rejection');
+  assertEq(r.code, 'odds_stale');
 });
 
 test('client isLive:false cannot bypass server live state', function() {

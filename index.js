@@ -3535,7 +3535,13 @@ async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
 // ODDS SNAPSHOT ENGINE (Phase K)
 // ════════════════════════════════════════════════════════════════════════════
 
-const SNAPSHOT_TTL_MS  = 5 * 60 * 1000;  // 5 min
+function _envMs(name, fallback) {
+  const n = parseInt(process.env[name], 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const LIVE_SNAPSHOT_TTL_MS    = _envMs('LIVE_SNAPSHOT_TTL_MS',    10 * 1000);
+const PREGAME_SNAPSHOT_TTL_MS = _envMs('PREGAME_SNAPSHOT_TTL_MS', 120 * 1000);
+const SNAPSHOT_TTL_MS         = PREGAME_SNAPSHOT_TTL_MS; // backwards-compat alias
 // SNAPSHOT_TOLERANCE removed — RISK-9: exact-match odds required; no drift window allowed.
 
 function _snapKey(cKey, market, selection) {
@@ -4371,8 +4377,8 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
 function _classifyMarket(snap, nowMs) {
   nowMs = nowMs||Date.now();
   if (!snap) return 'suspended';
-  const ageMs = nowMs - new Date(snap.fetched_at||snap.fetchedAt).getTime();
-  if (ageMs > SNAPSHOT_TTL_MS) return 'stale';
+  const fetchedMs = new Date(snap.fetched_at||snap.fetchedAt).getTime();
+  const ageMs = nowMs - fetchedMs;
   // Hard blocks first — final/canceled/suspended come from provider, not from the clock.
   const evStatus = String(snap.event_status||snap.eventStatus||snap.gameStatus||'').toLowerCase();
   const mkStatus = String(snap.market_status||snap.marketStatus||'').toLowerCase();
@@ -4385,10 +4391,16 @@ function _classifyMarket(snap, nowMs) {
   if (snap.suspended === true || mkStatus === 'suspended' || mkStatus === 'paused')
     return 'suspended';
   // Live and pregame both allow placement.
-  if (snap.eventLive === true || evStatus === 'live' || evStatus === 'in_play' || evStatus === 'in_progress')
-    return 'live';
   const ct = snap.commence_time||snap.commenceTime;
-  if (ct) { const ms=new Date(ct).getTime(); if(!isNaN(ms)&&nowMs>=ms) return 'live'; }
+  let isLiveSnapshot = snap.eventLive === true || evStatus === 'live' || evStatus === 'in_play' || evStatus === 'in_progress';
+  if (!isLiveSnapshot && ct) {
+    const ms = new Date(ct).getTime();
+    if (!isNaN(ms) && nowMs >= ms) isLiveSnapshot = true;
+  }
+  const ttlMs = isLiveSnapshot ? LIVE_SNAPSHOT_TTL_MS : PREGAME_SNAPSHOT_TTL_MS;
+  if (!Number.isFinite(fetchedMs) || ageMs > ttlMs) return 'stale';
+  if (isLiveSnapshot)
+    return 'live';
   return 'active';
 }
 
@@ -4428,9 +4440,9 @@ const pollLiveOddsLoopWithSnapshots = async function() {
   _upsertOddsSnapshots().catch(()=>{});
 };
 // Re-register poller with snapshot write.
-// Live betting (DK-style) wants 15s refresh so price/score updates feel
+// Live betting (DK-style) wants 5s refresh so price/score updates feel
 // real-time. Allow env override via LIVE_ODDS_POLL_MS for ops tuning.
-const LIVE_CACHE_POLL_INTERVAL_MS = parseInt(process.env.LIVE_ODDS_POLL_MS,10) || 15 * 1000;
+const LIVE_CACHE_POLL_INTERVAL_MS = _envMs('LIVE_ODDS_POLL_MS', 5 * 1000);
 const CACHE_POLL_INTERVAL = LIVE_CACHE_POLL_INTERVAL_MS; // backwards-compat alias
 if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY))
   setInterval(pollLiveOddsLoopWithSnapshots, LIVE_CACHE_POLL_INTERVAL_MS);
@@ -7013,6 +7025,9 @@ app.get('/api/markets/status', async (req, res) => {
   const nowMs = Date.now();
   const cache = LIVE_MARKET_CACHE;
   const cacheAgeMs = cache.updatedAt ? nowMs - new Date(cache.updatedAt).getTime() : null;
+  const providerHealthy = cache.sourceStatus === 'healthy' &&
+    cache.gameCount > 0 &&
+    (cacheAgeMs === null || cacheAgeMs <= PREGAME_SNAPSHOT_TTL_MS);
   // Count markets by state from cache (fast, no DB hit)
   let active=0, live=0, suspended=0, stale=0, finalCount=0, canceled=0;
   Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
@@ -7037,12 +7052,25 @@ app.get('/api/markets/status', async (req, res) => {
   if (stale > 0)         warnings.push('stale_markets:'+stale);
   if (suspended > 0)     warnings.push('suspended_markets:'+suspended);
   if (cache.gameCount===0) warnings.push('no_markets_loaded');
-  if (cacheAgeMs && cacheAgeMs > SNAPSHOT_TTL_MS) warnings.push('cache_stale');
+  if (cacheAgeMs && cacheAgeMs > PREGAME_SNAPSHOT_TTL_MS) warnings.push('cache_stale');
   const serviceOk = IS_PRODUCTION
-    ? (cache.gameCount > 0 && (!cacheAgeMs || cacheAgeMs < SNAPSHOT_TTL_MS))
+    ? providerHealthy
     : true; // dev: always ok
   res.json({
     ok:true, serviceOk,
+    liveSnapshotTtlMs:LIVE_SNAPSHOT_TTL_MS,
+    pregameSnapshotTtlMs:PREGAME_SNAPSHOT_TTL_MS,
+    pollIntervalMs:LIVE_CACHE_POLL_INTERVAL_MS,
+    lastSuccessfulPollAt:cache.lastSuccessAt,
+    providerHealth:{
+      provider:ODDS_PROVIDER,
+      status:cache.sourceStatus,
+      healthy:providerHealthy,
+      gameCount:cache.gameCount,
+      marketCount:cache.marketCount,
+      cacheAgeMs,
+      lastSuccessfulPollAt:cache.lastSuccessAt
+    },
     sourceStatus:cache.sourceStatus, lastSuccessAt:cache.lastSuccessAt,
     cacheAgeMs, gameCount:cache.gameCount, marketCount:cache.marketCount,
     activeMarketCount:active,
