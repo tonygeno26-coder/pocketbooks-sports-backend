@@ -7582,19 +7582,6 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     if (stakeAmt > available + 0.005)
       return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
 
-    // 2b. Phase AA: active-bettor charge check
-    const _habResult = await _processActiveBettorCharge(sb, clubId, playerId, null, Date.now());
-    if (!_habResult.ok) {
-      if (_habResult.httpStatus === 402) {
-        return res.status(402).json({ ok:false, error:_habResult.error,
-          message:_habResult.message, balance:_habResult.balance, required:_habResult.required });
-      }
-      // Other unexpected errors: fail-closed (log + block)
-      console.error('[bets/place] active-bettor charge unexpected error:', _habResult.error);
-      return res.status(503).json({ ok:false, error:'active_bettor_charge_failed',
-        detail:_habResult.error });
-    }
-
     // 3. Phase K: snapshot-based odds verification + server payout recalculation
     const nowMs = Date.now();
     // Load club oddsChangePolicy
@@ -7899,7 +7886,49 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         detail: legErr.message, ticketId });
     }
 
-    // 7. Legacy ledger_entries mirror (Phase A compat — fire-and-forget)
+    // 7. Phase AA: active-bettor charge happens only after every pre-ticket
+    // rejection gate and after the canonical ticket + legs are durable. If the
+    // charge cannot be applied, compensate the just-created ticket so failed
+    // placement attempts never consume active-bettor capacity.
+    const _habResult = await _processActiveBettorCharge(sb, clubId, playerId, ticketId, Date.now());
+    if (!_habResult.ok) {
+      console.error('[bets/place] active-bettor charge failed AFTER placement — compensating ticketId='+ticketId+
+        ' error='+(_habResult.error||'unknown'));
+      try {
+        const habCancelResult = await _callMoneyRpc('cancel_bet_tx', {
+          p_ticket_id:       ticketId,
+          p_club_id:         clubId||'',
+          p_player_id:       playerId,
+          p_idempotency_key: idempotencyKey+':hab_compensate',
+          p_reason:          'active_bettor_charge_failed',
+          p_created_by:      playerId
+        });
+        if (!habCancelResult || (!habCancelResult.ok && !habCancelResult.idempotent)) {
+          console.error('CRITICAL_HAB_COMPENSATION_FAILED', JSON.stringify({
+            ticketId, clubId, playerId, idempotencyKey,
+            habError:_habResult.error||'unknown',
+            compensationError:habCancelResult&&habCancelResult.error||'unknown',
+            timestamp:new Date().toISOString()
+          }));
+        }
+      } catch(habCancelErr) {
+        console.error('CRITICAL_HAB_COMPENSATION_FAILED', JSON.stringify({
+          ticketId, clubId, playerId, idempotencyKey,
+          habError:_habResult.error||'unknown',
+          compensationError:habCancelErr.message,
+          timestamp:new Date().toISOString()
+        }));
+      }
+      if (_habResult.httpStatus === 402) {
+        return res.status(402).json({ ok:false, error:_habResult.error,
+          message:_habResult.message, balance:_habResult.balance, required:_habResult.required,
+          ticketId, compensated:true });
+      }
+      return res.status(503).json({ ok:false, error:'active_bettor_charge_failed',
+        detail:_habResult.error, ticketId, compensated:true });
+    }
+
+    // 8. Legacy ledger_entries mirror (Phase A compat — fire-and-forget)
     // NOTE: Supabase v2 query builders are thenables but not real Promises
     // until awaited or .then()'d — calling .catch() directly throws
     // "upsert(...).catch is not a function". Use .then(noop, noop) instead.
@@ -7910,7 +7939,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       created_at: now, created_by: playerId
     }, { onConflict:'id' }).then(()=>{},()=>{});
 
-    // 8. Audit event — fire-and-forget after RPC commit.
+    // 9. Audit event — fire-and-forget after RPC commit.
     // Must NOT throw: a failed audit write must never fail the placement or
     // cause the idempotency key to be marked 'failed', which would let a
     // retry re-execute the RPC and double-debit the player.
