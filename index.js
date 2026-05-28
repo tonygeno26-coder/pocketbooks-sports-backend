@@ -2601,6 +2601,14 @@ function _logInvalidSnapshotOdds(entry, outcome, provider, reason, rawOdds) {
   }
 }
 
+function _logOwlsUnavailableMarketSkip(payload) {
+  try {
+    console.warn('OWLS_MARKET_UNAVAILABLE_SKIPPED ' + JSON.stringify(payload));
+  } catch(_e) {
+    console.warn('OWLS_MARKET_UNAVAILABLE_SKIPPED reason=market_unavailable_skipped');
+  }
+}
+
 function _normalizeOwlsResponse(owlsData, sportKey) {
   if (!owlsData) return null;
   // Accept success:true OR no success field (some responses omit it)
@@ -2733,11 +2741,28 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
         // Capture market-level status from Owls (suspended/closed/active/live)
         var rawMktStatus = String(mkt.status || mkt.state || '').toLowerCase();
         var mktSuspended = mkt.suspended === true || mkt.is_suspended === true ||
-                           /^(suspended|paused|inactive)$/.test(rawMktStatus);
+                           /^(suspended|paused|inactive|removed|halted)$/.test(rawMktStatus);
         var mktClosed    = mkt.closed === true || mkt.is_closed === true ||
                            /^(closed|settled|final)$/.test(rawMktStatus);
         if (mktSuspended || mktClosed) {
           warnings.push((mktClosed?'closed:':'suspended:')+evId+':'+mktKey);
+          _logOwlsUnavailableMarketSkip({
+            provider: 'owls',
+            reason: 'market_unavailable_skipped',
+            unavailableType: mktClosed ? 'closed' : 'suspended',
+            rawStatus: rawMktStatus || null,
+            status: mkt.status || null,
+            state: mkt.state || null,
+            suspended: mkt.suspended === true || mkt.is_suspended === true,
+            closed: mkt.closed === true || mkt.is_closed === true,
+            providerGameId: evId || null,
+            canonicalGameKey: ck || null,
+            sport: sport || null,
+            marketKey: mktKey || null,
+            marketName: mkt.name || mkt.label || null,
+            homeTeam: home || null,
+            awayTeam: away || null
+          });
           return;
         }
 
