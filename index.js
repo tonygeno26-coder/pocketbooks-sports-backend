@@ -61,8 +61,21 @@ const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLE
 const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', false);
 const BROWSER_TICKET_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_TICKET_MIRROR_WRITES_ENABLED', false);
 const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRITES_ENABLED', false);
+const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', false);
 const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
 const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
+const LIVE_PLACEMENT_REJECTION_CODES = new Set([
+  'live_betting_disabled',
+  'line_changed',
+  'odds_changed',
+  'odds_stale',
+  'market_suspended',
+  'live_stake_above_max',
+  'live_payout_above_max',
+  'live_sport_disabled',
+  'live_parlays_disabled'
+]);
+const _livePlacementRejectCounts = {};
 
 function _gradingContainmentStatus() {
   return {
@@ -78,6 +91,22 @@ function _gradingContainmentStatus() {
 
 function _mirrorNoopPayload(reason, extra) {
   return Object.assign({ ok:true, queued:false, disabled:true, containment:true, reason }, extra||{});
+}
+
+function _normalizeLiveRejectionCode(code, reason) {
+  if (code === 'market_unavailable' && reason === 'suspended') return 'market_suspended';
+  return code || 'unknown';
+}
+
+function _recordLivePlacementRejection(code, ctx) {
+  const normalized = _normalizeLiveRejectionCode(code, ctx && ctx.reason);
+  if (!LIVE_PLACEMENT_REJECTION_CODES.has(normalized)) return;
+  _livePlacementRejectCounts[normalized] = (_livePlacementRejectCounts[normalized] || 0) + 1;
+  console.warn('LIVE_PLACEMENT_REJECTED', JSON.stringify(_sanitizeLog(Object.assign({
+    code:normalized,
+    count:_livePlacementRejectCounts[normalized],
+    liveBettingEnabled:LIVE_BETTING_ENABLED
+  }, ctx||{}))));
 }
 
 function rateLimitMiddleware(req, res, next) {
@@ -4321,13 +4350,15 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const commenceMs = commenceTime ? new Date(commenceTime).getTime() : NaN;
   const hasCommenced = !isNaN(commenceMs) && nowMs >= commenceMs;
   if (state === 'live' || hasCommenced) {
-    return {
-      ok:false,
-      code:'live_betting_disabled',
-      leg:leg.pick,
-      reason: state === 'live' ? 'server_live' : 'event_started',
-      commenceTime: commenceTime || null
-    };
+    if (!LIVE_BETTING_ENABLED) {
+      return {
+        ok:false,
+        code:'live_betting_disabled',
+        leg:leg.pick,
+        reason: state === 'live' ? 'server_live' : 'event_started',
+        commenceTime: commenceTime || null
+      };
+    }
   }
 
   // RISK-9: Zero-tolerance exact-match odds.
@@ -7828,6 +7859,14 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           ||payoutResult.code==='odds_stale')?409 : 422;
       console.log('[bets/place] snapshot validation failed:', payoutResult.code,
         payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
+      _recordLivePlacementRejection(payoutResult.code, {
+        phase:'initial_snapshot',
+        reason:payoutResult.reason||null,
+        clubId,
+        playerId,
+        leg:payoutResult.leg||null,
+        legIndex:payoutResult.legIndex
+      });
       // Surface a clean user-facing message for Live tab placement.
       // Only fire when the market is actually suspended or the game is final/canceled.
       if (!payoutResult.userMessage) {
@@ -7883,6 +7922,13 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (!riskCheck.ok) {
         const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
         console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
+        _recordLivePlacementRejection(riskCheck.code, {
+          phase:'risk_check',
+          clubId,
+          playerId,
+          legIndex:riskCheck.legIndex,
+          sport:riskCheck.sport||null
+        });
         // Emit risk alert based on rejection code
         var _raType = {
           payout_above_max:'large_payout_attempt', player_open_risk_exceeded:'over_limit_attempt',
@@ -7934,6 +7980,36 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           }
         }
       }
+    }
+
+    // 3d. Final just-in-time snapshot recheck. This intentionally runs after
+    // balance/risk/conflict gates and immediately before place_bet_tx so a
+    // live market move/suspension between the first check and the money RPC
+    // still rejects without ticket, ledger, or HAB mutation.
+    const finalPayoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, Date.now(), oddsChangePolicy);
+    if (finalPayoutResult && !finalPayoutResult.ok) {
+      const httpStatus = finalPayoutResult.code==='odds_service_unavailable'?503
+        : (finalPayoutResult.code==='odds_changed'
+          ||finalPayoutResult.code==='line_changed'
+          ||finalPayoutResult.code==='market_unavailable'
+          ||finalPayoutResult.code==='market_closed'
+          ||finalPayoutResult.code==='odds_stale')?409 : 422;
+      console.log('[bets/place] final snapshot recheck failed:', finalPayoutResult.code,
+        finalPayoutResult.reason||'-', finalPayoutResult.leg, '('+httpStatus+')');
+      _recordLivePlacementRejection(finalPayoutResult.code, {
+        phase:'final_snapshot',
+        reason:finalPayoutResult.reason||null,
+        clubId,
+        playerId,
+        leg:finalPayoutResult.leg||null,
+        legIndex:finalPayoutResult.legIndex
+      });
+      return res.status(httpStatus).json(Object.assign({ ok:false, finalRecheck:true }, finalPayoutResult));
+    }
+    if (finalPayoutResult && finalPayoutResult.ok) {
+      legsArr = finalPayoutResult.legs;
+      serverPayout = finalPayoutResult.payout;
+      serverProfit = rnd(serverPayout - stakeAmt);
     }
 
     // 4. Generate ticket ID
