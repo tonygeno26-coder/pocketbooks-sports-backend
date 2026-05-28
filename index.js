@@ -5030,10 +5030,15 @@ function _checkPermission(actor, action, targetPlayerId) {
   const rank = _getRoleRank(actor.role);
   if (minRank === -1) {
     const isSelf       = targetPlayerId && String(actor.actorId) === String(targetPlayerId);
-    // owner/host can place bets as themselves (same club) — playerCapable = rank >= owner
+    if (action === 'place_bet') {
+      if (!isSelf) return { allowed:false, reason:'not_own_account', status:403 };
+      if (actor.role !== 'player') {
+        return { allowed:false, reason:'host_betting_disabled', status:403 };
+      }
+      return { allowed:true };
+    }
     const isPrivileged = rank >= ROLE_RANK.full_admin;
-    const isPlayerCapable = rank >= ROLE_RANK.owner; // owner can place test bets
-    if (!isSelf && !isPrivileged && !isPlayerCapable) {
+    if (!isSelf && !isPrivileged) {
       return { allowed:false, reason:'not_own_account', status:403 };
     }
     return { allowed:true };
@@ -6951,10 +6956,11 @@ app.post('/api/auth/token', requireCanonicalClubId, async (req, res) => {
     return res.status(403).json({ ok:false, error:resolved.error, status:resolved.status });
   }
   const finalRole   = resolved.role;
+  const finalStatus = (resolved.membership && resolved.membership.status) || 'active';
   const platRole    = PLATFORM_ADMIN_ALLOWLIST.includes(actorId) ? 'platform_admin' : null;
   const { token, jti } = await issueSessionToken(actorId, finalRole, clubId, 86400, platRole);
   console.log('[auth/token] issued role='+finalRole+(platRole?' [platform_admin]':''));
-  res.json({ ok:true, token, jti, actorId, role:finalRole, clubId, expiresIn:86400 });
+  res.json({ ok:true, token, jti, actorId, role:finalRole, status:finalStatus, clubId, club_id:clubId, expiresIn:86400 });
 });
 
 // POST /api/auth/refresh — rotate token (revoke old jti, issue new)
