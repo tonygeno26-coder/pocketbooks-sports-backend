@@ -7971,6 +7971,19 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   });
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
+  // GRD-2/RR Containment: Round Robin combo math is not yet implemented correctly.
+  // Reject all RR placements unconditionally until schema + grading are upgraded.
+  // This guard fires before any financial operation: HAB charge, snapshot verification,
+  // ticket insert, and ledger insert are all bypassed on RR rejection.
+  if (betType === 'RoundRobin') {
+    return res.status(422).json({
+      ok:      false,
+      error:   'rr_temporarily_disabled',
+      code:    'rr_temporarily_disabled',
+      message: 'Round Robin betting is temporarily disabled while combo settlement is being upgraded.'
+    });
+  }
+
   try {
     // Idempotency is handled entirely by requireIdempotency middleware above.
     // The middleware checks idempotency_keys, marks requests pending/completed,
