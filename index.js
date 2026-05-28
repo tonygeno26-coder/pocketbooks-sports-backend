@@ -2577,6 +2577,30 @@ function _toAmericanOdds(price) {
   return price; // already American
 }
 
+function _americanToDecimalOdds(americanOdds) {
+  const n = Number(americanOdds);
+  if (!Number.isFinite(n) || n === 0) return null;
+  return n > 0
+    ? Math.round((n / 100 + 1) * 10000) / 10000
+    : Math.round((100 / Math.abs(n) + 1) * 10000) / 10000;
+}
+
+function _logInvalidSnapshotOdds(entry, outcome, provider, reason, rawOdds) {
+  try {
+    console.warn('SNAPSHOT_ROW_SKIPPED_INVALID_ODDS ' + JSON.stringify({
+      provider: provider || entry && (entry.sportsbook || entry.bookmaker) || 'unknown',
+      reason,
+      rawOdds,
+      canonicalGameKey: entry && (entry.cKey || entry.canonicalKey) || null,
+      providerGameId: entry && (entry.providerGameId || entry.gameId) || null,
+      market: entry && (entry.marketType || entry.market) || null,
+      selection: outcome && outcome.name || entry && (entry.teamOrSide || entry.playerName) || null
+    }));
+  } catch(_e) {
+    console.warn('SNAPSHOT_ROW_SKIPPED_INVALID_ODDS provider='+(provider||'unknown')+' reason='+reason);
+  }
+}
+
 function _normalizeOwlsResponse(owlsData, sportKey) {
   if (!owlsData) return null;
   // Accept success:true OR no success field (some responses omit it)
@@ -3833,7 +3857,7 @@ function _buildSnapshotRow(entry, outcome, opts) {
   }
 
   // ----- Selection key for the LEGACY column (kept for grading/back-compat) -----
-  let legacySelectionKey, legacyMarketKey, oddsAmerican, line;
+  let legacySelectionKey, legacyMarketKey, rawOdds, oddsAmerican, line;
   if (isOwlsShape) {
     // For Owls props, the legacy selection_key carries the player+side+line
     // so old grading paths that haven't been migrated yet can still locate
@@ -3846,18 +3870,32 @@ function _buildSnapshotRow(entry, outcome, opts) {
       legacySelectionKey = String(entry.teamOrSide || '').toLowerCase();
     }
     legacyMarketKey = String(entry.marketType || '').toLowerCase();
-    oddsAmerican    = Math.round(entry.odds || 0);
+    rawOdds         = entry.odds;
     line            = entry.line != null ? entry.line : null;
   } else {
     legacySelectionKey = String(outcome.name || '').toLowerCase();
     legacyMarketKey    = String(entry.market || '').toLowerCase();
-    oddsAmerican       = Math.round(outcome.price || 0);
+    rawOdds            = outcome.price;
     line               = outcome.point != null ? outcome.point : null;
   }
 
-  const oddsDecimal = oddsAmerican > 0
-    ? Math.round((oddsAmerican / 100 + 1) * 10000) / 10000
-    : Math.round((100 / Math.abs(oddsAmerican || 1) + 1) * 10000) / 10000;
+  const rawOddsNum = Number(rawOdds);
+  if (!Number.isFinite(rawOddsNum)) {
+    _logInvalidSnapshotOdds(entry, outcome, provider, 'non_finite_american_odds', rawOdds);
+    return null;
+  }
+
+  oddsAmerican = Math.round(_toAmericanOdds(rawOddsNum));
+  if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) {
+    _logInvalidSnapshotOdds(entry, outcome, provider, 'invalid_american_odds', rawOdds);
+    return null;
+  }
+
+  const oddsDecimal = _americanToDecimalOdds(oddsAmerican);
+  if (!Number.isFinite(oddsDecimal) || oddsDecimal <= 1) {
+    _logInvalidSnapshotOdds(entry, outcome, provider, 'invalid_decimal_odds', oddsAmerican);
+    return null;
+  }
 
   const row = {
     snapshot_id:              cKey + '|' + legacyMarketKey + '|' + legacySelectionKey + '|' + Date.now(),
