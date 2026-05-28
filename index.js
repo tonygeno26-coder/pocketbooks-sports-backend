@@ -4356,6 +4356,23 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     };
   }
 
+  if (_marketRequiresPointLineExact(ident.marketType || market, market)) {
+    const submittedLine = _extractSubmittedPointLine(leg);
+    const serverLineRaw = snap.point_line!=null ? snap.point_line : snap.pointLine;
+    const serverLine = Number(serverLineRaw);
+    if (!Number.isFinite(submittedLine) || !Number.isFinite(serverLine) ||
+        Math.abs(submittedLine - serverLine) > 0.000001) {
+      return {
+        ok:false,
+        code:'line_changed',
+        leg:leg.pick,
+        submittedPointLine:Number.isFinite(submittedLine) ? submittedLine : null,
+        serverPointLine:Number.isFinite(serverLine) ? serverLine : null,
+        reason:'exact_line_required'
+      };
+    }
+  }
+
   return {
     ok:true,
     snapshotId:           snap.snapshot_id,
@@ -4365,6 +4382,29 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     commenceTime:         commenceTime,
     isLive:               state === 'live'   // server-authoritative; never trust client leg.isLive
   };
+}
+
+function _marketRequiresPointLineExact(marketType, market) {
+  const m = String(marketType||market||'').toLowerCase();
+  return m === MARKET_TYPES.SPREAD || m === MARKET_TYPES.TOTAL ||
+    m === MARKET_TYPES.PERIOD_SPREAD || m === MARKET_TYPES.PERIOD_TOTAL ||
+    m.includes('spread') || m.includes('total') ||
+    m.includes('run line') || m.includes('puck line') ||
+    m.includes('alternate spread') || m.includes('alternate total') ||
+    m.includes('alt spread') || m.includes('alt total');
+}
+
+function _extractSubmittedPointLine(leg) {
+  if (!leg) return NaN;
+  const direct = leg.pointLine!=null ? leg.pointLine
+    : leg.point_line!=null ? leg.point_line
+    : leg.line!=null ? leg.line
+    : leg.accepted_point_line!=null ? leg.accepted_point_line
+    : null;
+  if (direct != null && direct !== '') return Number(direct);
+  const text = String(leg.pick||leg.selectionLabel||'');
+  const m = text.match(/(?:^|\s)([+-]?\d+(?:\.\d+)?)(?:\s|$)/);
+  return m ? Number(m[1]) : NaN;
 }
 
 // Classify a snapshot into a market state.
@@ -4466,7 +4506,11 @@ const RISK_CODE_STATUS = {
   player_open_risk_exceeded:422,
   club_open_risk_exceeded:  422,
   event_risk_exceeded:      422,
-  market_risk_exceeded:     422
+  market_risk_exceeded:     422,
+  live_stake_above_max:     422,
+  live_payout_above_max:    422,
+  live_sport_disabled:      422,
+  live_parlays_disabled:    422
 };
 
 // JS-side risk check (runs before RPC, using cached limits + live exposure query)
@@ -4520,6 +4564,32 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
   if ((type==='parlay'||type==='roundrobin') && cs.max_parlay_legs && legsArr.length > cs.max_parlay_legs)
     return { ok:false, code:'too_many_parlay_legs', max:cs.max_parlay_legs, legs:legsArr.length };
 
+  const liveLegs = legsArr.filter(function(l){ return !!l.server_is_live; });
+  if (liveLegs.length > 0) {
+    if (cs.allow_live_betting !== true)
+      return { ok:false, code:'live_betting_disabled' };
+    if (liveLegs.length > 1 && cs.allow_live_parlays !== true)
+      return { ok:false, code:'live_parlays_disabled' };
+    if ((type==='parlay'||type==='roundrobin') && cs.allow_live_parlays !== true)
+      return { ok:false, code:'live_parlays_disabled' };
+    if (cs.max_live_stake && s > parseFloat(cs.max_live_stake))
+      return { ok:false, code:'live_stake_above_max', max:cs.max_live_stake, stake:s };
+    if (cs.max_live_payout && pay > parseFloat(cs.max_live_payout))
+      return { ok:false, code:'live_payout_above_max', max:cs.max_live_payout, payout:pay };
+    const enabledLiveSports = Array.isArray(cs.live_enabled_sports)
+      ? cs.live_enabled_sports.map(function(v){ return String(v||'').toLowerCase(); }).filter(Boolean)
+      : [];
+    if (enabledLiveSports.length === 0)
+      return { ok:false, code:'live_sport_disabled', sport:null };
+    for (let i=0; i<liveLegs.length; i++) {
+      const sport = (liveLegs[i].sport||'').toLowerCase();
+      if (!enabledLiveSports.includes(sport)) {
+        const originalIndex = legsArr.indexOf(liveLegs[i]);
+        return { ok:false, code:'live_sport_disabled', sport, legIndex:originalIndex };
+      }
+    }
+  }
+
   // Per-leg sport/market/live checks
   for (let i=0; i<legsArr.length; i++) {
     const leg = legsArr[i];
@@ -4549,6 +4619,45 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
         return { ok:false, code:'player_open_risk_exceeded',
                  max:pl.max_open_risk, current:cur, stake:s };
     } catch(_e){}
+  }
+
+  if (liveLegs.length > 0 && (cs.max_live_event_exposure || cs.max_live_market_exposure)) {
+    try {
+      const { data:activeTix } = await sb.from('tickets').select('id,risk_amount')
+        .eq('club_id',clubId).in('status',['active','open']);
+      const ticketRisk = {};
+      const ticketIds = (activeTix||[]).map(function(t){
+        ticketRisk[t.id] = parseFloat(t.risk_amount||0);
+        return t.id;
+      });
+      let activeLegs = [];
+      if (ticketIds.length) {
+        const { data } = await sb.from('ticket_legs')
+          .select('ticket_id,canonical_game_key,market')
+          .in('ticket_id', ticketIds);
+        activeLegs = data || [];
+      }
+      for (let i=0; i<liveLegs.length; i++) {
+        const leg = liveLegs[i];
+        const gameKey = leg.canonicalGameKey || leg.canonical_game_key || '';
+        const marketKey = (leg.market||'moneyline').toLowerCase();
+        const eventExposure = activeLegs.reduce(function(sum,l){
+          return l.canonical_game_key === gameKey ? sum + (ticketRisk[l.ticket_id]||0) : sum;
+        }, 0);
+        if (cs.max_live_event_exposure && eventExposure + s > parseFloat(cs.max_live_event_exposure)) {
+          return { ok:false, code:'event_risk_exceeded',
+            max:cs.max_live_event_exposure, current:eventExposure, stake:s, legIndex:i };
+        }
+        const marketExposure = activeLegs.reduce(function(sum,l){
+          return l.canonical_game_key === gameKey && String(l.market||'').toLowerCase() === marketKey
+            ? sum + (ticketRisk[l.ticket_id]||0) : sum;
+        }, 0);
+        if (cs.max_live_market_exposure && marketExposure + s > parseFloat(cs.max_live_market_exposure)) {
+          return { ok:false, code:'market_risk_exceeded',
+            max:cs.max_live_market_exposure, current:marketExposure, stake:s, legIndex:i };
+        }
+      }
+    } catch(_e){ throw _e; }
   }
 
   return { ok:true };
@@ -7713,6 +7822,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     if (payoutResult && !payoutResult.ok) {
       const httpStatus = payoutResult.code==='odds_service_unavailable'?503
         : (payoutResult.code==='odds_changed'
+          ||payoutResult.code==='line_changed'
           ||payoutResult.code==='market_unavailable'
           ||payoutResult.code==='market_closed'
           ||payoutResult.code==='odds_stale')?409 : 422;
@@ -7729,6 +7839,8 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
                                                       'Market unavailable.';
         } else if (payoutResult.code === 'odds_changed') {
           payoutResult.userMessage = 'Odds changed — please review and confirm.';
+        } else if (payoutResult.code === 'line_changed') {
+          payoutResult.userMessage = 'Line changed — please review and confirm.';
         } else if (payoutResult.code === 'odds_stale') {
           payoutResult.userMessage = 'Odds refreshing — please try again.';
         } else if (payoutResult.code === 'odds_service_unavailable') {
@@ -7737,6 +7849,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       }
       // Emit risk alert for snapshot rejection
       var _snapRaType = { odds_changed:'odds_change_rejections',
+        line_changed:'odds_change_rejections',
         odds_stale:'stale_line_attempts',
         market_unavailable:'stale_line_attempts',
         market_closed:'stale_line_attempts',
@@ -7764,7 +7877,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     //     early JS-side rejection before the atomic write.
     try {
       const riskCheck = await _checkRiskLimitsJs(sb, clubId, playerId, {
-        stake: stakeAmt, potentialPayout: parseFloat(payout)||0,
+        stake: stakeAmt, potentialPayout: serverPayout != null ? serverPayout : (parseFloat(payout)||0),
         betType, legs: legsArr
       });
       if (!riskCheck.ok) {
@@ -7777,7 +7890,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           market_risk_exceeded:'over_limit_attempt', stake_above_max:'over_limit_attempt'
         }[riskCheck.code];
         if (_raType) emitRiskAlert(_raType, clubId, playerId,
-          { code:riskCheck.code, stake:stakeAmt, payout:parseFloat(payout)||0 });
+          { code:riskCheck.code, stake:stakeAmt, payout:serverPayout != null ? serverPayout : (parseFloat(payout)||0) });
         return res.status(httpStatus).json({ ok:false, code:riskCheck.code, ...riskCheck });
       }
     } catch(riskErr) {

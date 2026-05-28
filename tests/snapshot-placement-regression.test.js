@@ -109,6 +109,22 @@ function verifySnapshot(snap, leg, nowMs) {
     };
   }
 
+  if (marketRequiresPointLineExact(leg.market)) {
+    const submittedLine = extractSubmittedPointLine(leg);
+    const serverLine = Number(snap.point_line);
+    if (!Number.isFinite(submittedLine) || !Number.isFinite(serverLine) ||
+        Math.abs(submittedLine - serverLine) > 0.000001) {
+      return {
+        ok:false,
+        code:'line_changed',
+        leg:leg.pick,
+        submittedPointLine:Number.isFinite(submittedLine) ? submittedLine : null,
+        serverPointLine:Number.isFinite(serverLine) ? serverLine : null,
+        reason:'exact_line_required'
+      };
+    }
+  }
+
   return {
     ok:true,
     snapshotId:snap.snapshot_id,
@@ -118,6 +134,25 @@ function verifySnapshot(snap, leg, nowMs) {
     commenceTime,
     isLive:state === 'live'
   };
+}
+
+function marketRequiresPointLineExact(market) {
+  const m = String(market||'').toLowerCase();
+  return m.includes('spread') || m.includes('total') ||
+    m.includes('run line') || m.includes('puck line') ||
+    m.includes('alternate spread') || m.includes('alternate total') ||
+    m.includes('alt spread') || m.includes('alt total');
+}
+
+function extractSubmittedPointLine(leg) {
+  const direct = leg.pointLine != null ? leg.pointLine
+    : leg.point_line != null ? leg.point_line
+    : leg.line != null ? leg.line
+    : leg.accepted_point_line != null ? leg.accepted_point_line
+    : null;
+  if (direct != null && direct !== '') return Number(direct);
+  const m = String(leg.pick||'').match(/(?:^|\s)([+-]?\d+(?:\.\d+)?)(?:\s|$)/);
+  return m ? Number(m[1]) : NaN;
 }
 
 function recalcPayoutFromSnapshots(legs, snapshots, nowMs) {
@@ -198,10 +233,10 @@ function leg(overrides) {
   }, overrides || {});
 }
 
-function assertRejectNoHab(name, snapshot, expectedCode, expectedReason) {
+function assertRejectNoHab(name, snapshot, expectedCode, expectedReason, legOverride) {
   test(name, function() {
     const h = makePlacementHarness();
-    const r = h.placeBet({ legs:[leg()], snapshots:[snapshot] });
+    const r = h.placeBet({ legs:[leg(legOverride)], snapshots:[snapshot] });
     assert(!r.ok, 'expected placement rejection');
     assertEq(r.error, expectedCode, 'error code');
     if (expectedReason) assertEq(r.reason, expectedReason, 'reason');
@@ -230,6 +265,9 @@ assertRejectNoHab('final snapshot rejects', snap({ event_status:'final' }), 'mar
 assertRejectNoHab('canceled snapshot rejects', snap({ event_status:'canceled' }), 'market_unavailable', 'game_canceled');
 assertRejectNoHab('invalid odds snapshot rejects', snap({ odds_american:null }), 'invalid_snapshot_odds');
 assertRejectNoHab('odds mismatch rejects', snap({ odds_american:-120 }), 'odds_changed');
+assertRejectNoHab('point-line mismatch rejects even when odds match', snap({
+  point_line:-2.5
+}), 'line_changed', null, { market:'spread', pick:'Guardians -1.5', line:-1.5 });
 assertRejectNoHab('server-live snapshot rejects', snap({ event_status:'live' }), 'live_betting_disabled', 'server_live');
 assertRejectNoHab('post-commence snapshot rejects', snap({ commence_time:PAST_CT }), 'live_betting_disabled', 'server_live');
 
@@ -250,6 +288,16 @@ test('pregame snapshot is fresh inside 120 second TTL', function() {
     snapshots:[snap({ fetched_at:new Date(NOW_MS - PREGAME_SNAPSHOT_TTL_MS + 1).toISOString() })]
   });
   assert(r.ok, 'expected pregame snapshot inside TTL to pass: ' + JSON.stringify(r));
+});
+
+test('exact line and odds passes validation stage for spread', function() {
+  const r = verifySnapshot(
+    snap({ point_line:-1.5 }),
+    leg({ market:'spread', pick:'Guardians -1.5', line:-1.5, odds:-110 }),
+    NOW_MS
+  );
+  assert(r.ok, 'expected exact line + odds to pass: ' + JSON.stringify(r));
+  assertEq(r.acceptedPointLine, -1.5);
 });
 
 test('one bad leg rejects whole parlay before ticket or HAB mutation', function() {
