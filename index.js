@@ -66,16 +66,22 @@ const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ti
 const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
 const LIVE_PLACEMENT_REJECTION_CODES = new Set([
   'live_betting_disabled',
-  'line_changed',
   'odds_changed',
+  'line_changed',
   'odds_stale',
-  'market_suspended',
+  'market_unavailable',
   'live_stake_above_max',
   'live_payout_above_max',
   'live_sport_disabled',
-  'live_parlays_disabled'
+  'live_parlays_disabled',
+  'snapshot_missing',
+  'provider_unhealthy',
+  'final_recheck_failed'
 ]);
-const _livePlacementRejectCounts = {};
+const _liveDiagnostics = {
+  counters:Object.create(null),
+  recent:[]
+};
 
 function _gradingContainmentStatus() {
   return {
@@ -94,19 +100,92 @@ function _mirrorNoopPayload(reason, extra) {
 }
 
 function _normalizeLiveRejectionCode(code, reason) {
-  if (code === 'market_unavailable' && reason === 'suspended') return 'market_suspended';
+  if (code === 'odds_service_unavailable' && reason === 'snapshot_missing') return 'snapshot_missing';
   return code || 'unknown';
+}
+
+function _recordLiveDiagnosticEvent(code, ctx) {
+  if (!LIVE_PLACEMENT_REJECTION_CODES.has(code)) return;
+  const now = new Date().toISOString();
+  const prev = _liveDiagnostics.counters[code] || { count:0, lastAt:null };
+  const entry = {
+    code,
+    at:now,
+    phase:ctx&&ctx.phase || null,
+    reason:ctx&&ctx.reason || null,
+    sport:ctx&&ctx.sport || null,
+    clubId:ctx&&ctx.clubId || null,
+    canonicalGameKey:ctx&&ctx.canonicalGameKey || null,
+    leg:ctx&&ctx.leg || null,
+    legIndex:ctx&&ctx.legIndex,
+    liveBettingEnabled:LIVE_BETTING_ENABLED
+  };
+  _liveDiagnostics.counters[code] = {
+    count:prev.count + 1,
+    lastAt:now,
+    sport:entry.sport,
+    clubId:entry.clubId,
+    canonicalGameKey:entry.canonicalGameKey
+  };
+  _liveDiagnostics.recent.push(entry);
+  if (_liveDiagnostics.recent.length > 50) {
+    _liveDiagnostics.recent.splice(0, _liveDiagnostics.recent.length - 50);
+  }
 }
 
 function _recordLivePlacementRejection(code, ctx) {
   const normalized = _normalizeLiveRejectionCode(code, ctx && ctx.reason);
-  if (!LIVE_PLACEMENT_REJECTION_CODES.has(normalized)) return;
-  _livePlacementRejectCounts[normalized] = (_livePlacementRejectCounts[normalized] || 0) + 1;
+  _recordLiveDiagnosticEvent(normalized, ctx || {});
+  if (ctx && ctx.phase === 'final_snapshot') {
+    _recordLiveDiagnosticEvent('final_recheck_failed', Object.assign({}, ctx, { reason:normalized }));
+  }
+  const count = _liveDiagnostics.counters[normalized] && _liveDiagnostics.counters[normalized].count || 0;
   console.warn('LIVE_PLACEMENT_REJECTED', JSON.stringify(_sanitizeLog(Object.assign({
     code:normalized,
-    count:_livePlacementRejectCounts[normalized],
+    count,
     liveBettingEnabled:LIVE_BETTING_ENABLED
   }, ctx||{}))));
+}
+
+function _liveRejectionContextFromLegs(legs, result, extra) {
+  const idx = result && Number.isInteger(result.legIndex) ? result.legIndex : -1;
+  const leg = idx >= 0 && Array.isArray(legs) ? legs[idx] : null;
+  return Object.assign({
+    reason:result&&result.reason||null,
+    leg:result&&result.leg||leg&&leg.pick||null,
+    legIndex:idx >= 0 ? idx : undefined,
+    sport:result&&result.sport || leg&&leg.sport || null,
+    canonicalGameKey:leg&&(leg.canonicalGameKey||leg.canonical_game_key) || null
+  }, extra||{});
+}
+
+function _getLiveProviderDiagnostics(nowMs) {
+  nowMs = nowMs || Date.now();
+  const cache = typeof LIVE_MARKET_CACHE !== 'undefined' ? LIVE_MARKET_CACHE : null;
+  const updatedAt = cache && cache.updatedAt ? new Date(cache.updatedAt).getTime() : NaN;
+  const lastSuccessAt = cache && cache.lastSuccessAt ? new Date(cache.lastSuccessAt).getTime() : NaN;
+  const cacheAgeMs = !isNaN(updatedAt) ? nowMs - updatedAt : null;
+  const lastSuccessAgeMs = !isNaN(lastSuccessAt) ? nowMs - lastSuccessAt : null;
+  const staleForLive = cacheAgeMs == null || cacheAgeMs > LIVE_SNAPSHOT_TTL_MS;
+  const noRecentSuccess = lastSuccessAgeMs == null ||
+    lastSuccessAgeMs > Math.max(LIVE_SNAPSHOT_TTL_MS, LIVE_CACHE_POLL_INTERVAL_MS * 3);
+  const healthy = !!cache &&
+    cache.sourceStatus === 'healthy' &&
+    cache.gameCount > 0 &&
+    !staleForLive &&
+    !noRecentSuccess;
+  return {
+    provider:ODDS_PROVIDER,
+    healthy,
+    status:cache&&cache.sourceStatus || 'uninitialized',
+    gameCount:cache&&cache.gameCount || 0,
+    marketCount:cache&&cache.marketCount || 0,
+    cacheAgeMs,
+    lastSuccessfulPollAt:cache&&cache.lastSuccessAt || null,
+    lastSuccessAgeMs,
+    staleForLive,
+    noRecentSuccess
+  };
 }
 
 function rateLimitMiddleware(req, res, next) {
@@ -5300,6 +5379,11 @@ async function pollLiveOddsLoop() {
           result.games.forEach(function(g){ allGames.push(g); });
         } else if (result && !result.ok) {
           console.warn('[owls] fetch error sport='+sport+': '+(result.error||'unknown'));
+          _recordLiveDiagnosticEvent('provider_unhealthy', {
+            phase:'provider_poll',
+            sport,
+            reason:result.error||'owls_fetch_error'
+          });
         }
       }));
       const fetchDurationMs = Date.now()-start;
@@ -5379,8 +5463,18 @@ async function pollLiveOddsLoop() {
         console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+' fetch='+fetchDurationMs+'ms');
       } else {
         console.warn('[owls] fetch returned empty — preserving previous cache');
+        _recordLiveDiagnosticEvent('provider_unhealthy', {
+          phase:'provider_poll',
+          reason:'owls_empty_or_unhealthy'
+        });
       }
-    } catch(e) { console.error('[owls] poll error:', e.message); }
+    } catch(e) {
+      console.error('[owls] poll error:', e.message);
+      _recordLiveDiagnosticEvent('provider_unhealthy', {
+        phase:'provider_poll',
+        reason:'owls_poll_error'
+      });
+    }
     return;
   }
   // Default: The Odds API
@@ -5399,9 +5493,17 @@ async function pollLiveOddsLoop() {
       console.log('[live cache] updated games='+newCache.gameCount+' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
     } else {
       console.warn('[live cache] fetch returned empty — preserving previous cache ('+LIVE_MARKET_CACHE.gameCount+' games)');
+      _recordLiveDiagnosticEvent('provider_unhealthy', {
+        phase:'provider_poll',
+        reason:'odds_api_empty_or_unhealthy'
+      });
     }
   } catch(e) {
     console.error('[live cache] poll error — preserving previous cache:', e.message);
+    _recordLiveDiagnosticEvent('provider_unhealthy', {
+      phase:'provider_poll',
+      reason:'odds_api_poll_error'
+    });
   }
 }
 
@@ -7229,6 +7331,95 @@ app.get('/api/markets/status', async (req, res) => {
   });
 });
 
+async function _buildLiveExposureSummary(sb, clubId) {
+  const empty = { clubId:clubId||null, liveTicketCount:0, liveLegCount:0, totalOpenRisk:0, bySport:{} };
+  if (!sb || !clubId) return empty;
+  try {
+    const { data:tickets } = await sb.from('tickets')
+      .select('id,risk_amount')
+      .eq('club_id',clubId)
+      .in('status',['active','open']);
+    const active = tickets || [];
+    if (!active.length) return empty;
+    const riskByTicket = {};
+    const ids = active.map(function(t) {
+      riskByTicket[t.id] = parseFloat(t.risk_amount||0);
+      return t.id;
+    });
+    const { data:legs } = await sb.from('ticket_legs')
+      .select('ticket_id,canonical_game_key,market,sport,scheduled_start')
+      .in('ticket_id', ids);
+    const nowMs = Date.now();
+    const liveTicketIds = new Set();
+    const bySport = {};
+    let liveLegCount = 0;
+    (legs||[]).forEach(function(l) {
+      const startMs = l.scheduled_start ? new Date(l.scheduled_start).getTime() : NaN;
+      if (isNaN(startMs) || startMs > nowMs) return;
+      liveLegCount++;
+      liveTicketIds.add(l.ticket_id);
+      const sport = String(l.sport||'unknown').toLowerCase();
+      bySport[sport] = bySport[sport] || { liveLegCount:0, openRisk:0 };
+      bySport[sport].liveLegCount++;
+    });
+    let totalOpenRisk = 0;
+    liveTicketIds.forEach(function(tid){ totalOpenRisk += riskByTicket[tid] || 0; });
+    Object.keys(bySport).forEach(function(sport) {
+      const ticketIdsForSport = new Set((legs||[]).filter(function(l) {
+        const startMs = l.scheduled_start ? new Date(l.scheduled_start).getTime() : NaN;
+        return !isNaN(startMs) && startMs <= nowMs && String(l.sport||'unknown').toLowerCase() === sport;
+      }).map(function(l){ return l.ticket_id; }));
+      let risk = 0;
+      ticketIdsForSport.forEach(function(tid){ risk += riskByTicket[tid] || 0; });
+      bySport[sport].openRisk = Math.round(risk * 100) / 100;
+    });
+    return {
+      clubId,
+      liveTicketCount:liveTicketIds.size,
+      liveLegCount,
+      totalOpenRisk:Math.round(totalOpenRisk * 100) / 100,
+      bySport
+    };
+  } catch(e) {
+    return Object.assign({}, empty, { error:e.message });
+  }
+}
+
+// GET /api/live/diagnostics — lightweight internal live beta visibility.
+app.get('/api/live/diagnostics', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  const sb = getSupabase();
+  const actor = req._actor || {};
+  const clubId = req._clubId || actor.clubId || (req.query && req.query.clubId) || null;
+  const providerHealth = _getLiveProviderDiagnostics(Date.now());
+  let currentLiveEnabledClubs = [];
+  if (sb) {
+    try {
+      let q = sb.from('club_risk_settings')
+        .select('club_id,allow_live_betting,allow_live_parlays,live_enabled_sports,max_live_stake,max_live_payout,max_live_event_exposure,max_live_market_exposure')
+        .eq('allow_live_betting', true)
+        .limit(50);
+      if (actor.platformRole !== 'platform_admin' && clubId) q = q.eq('club_id', clubId);
+      const { data } = await q;
+      currentLiveEnabledClubs = data || [];
+    } catch(e) {
+      currentLiveEnabledClubs = [{ error:e.message }];
+    }
+  }
+  const liveExposureSummary = await _buildLiveExposureSummary(sb, clubId);
+  res.json({
+    ok:true,
+    liveBettingEnabled:LIVE_BETTING_ENABLED,
+    providerHealth,
+    cacheAgeMs:providerHealth.cacheAgeMs,
+    pollIntervalMs:LIVE_CACHE_POLL_INTERVAL_MS,
+    liveSnapshotTtlMs:LIVE_SNAPSHOT_TTL_MS,
+    rejectionCounters:_liveDiagnostics.counters,
+    recentRejections:_liveDiagnostics.recent.slice(-50).reverse(),
+    liveExposureSummary,
+    currentLiveEnabledClubs
+  });
+});
+
 // POST /api/markets/refresh — force cache refresh (dev/admin)
 app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh'), requireIdempotency({required:false}), async (req, res) => {
   try {
@@ -7865,14 +8056,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           ||payoutResult.code==='odds_stale')?409 : 422;
       console.log('[bets/place] snapshot validation failed:', payoutResult.code,
         payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
-      _recordLivePlacementRejection(payoutResult.code, {
+      _recordLivePlacementRejection(payoutResult.code, _liveRejectionContextFromLegs(legsArr, payoutResult, {
         phase:'initial_snapshot',
-        reason:payoutResult.reason||null,
         clubId,
-        playerId,
-        leg:payoutResult.leg||null,
-        legIndex:payoutResult.legIndex
-      });
+        playerId
+      }));
       // Surface a clean user-facing message for Live tab placement.
       // Only fire when the market is actually suspended or the game is final/canceled.
       if (!payoutResult.userMessage) {
@@ -7928,13 +8116,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (!riskCheck.ok) {
         const httpStatus = RISK_CODE_STATUS[riskCheck.code] || 422;
         console.log('[bets/place] risk limit rejected:', riskCheck.code, 'actor='+playerId);
-        _recordLivePlacementRejection(riskCheck.code, {
+        _recordLivePlacementRejection(riskCheck.code, _liveRejectionContextFromLegs(legsArr, riskCheck, {
           phase:'risk_check',
           clubId,
-          playerId,
-          legIndex:riskCheck.legIndex,
-          sport:riskCheck.sport||null
-        });
+          playerId
+        }));
         // Emit risk alert based on rejection code
         var _raType = {
           payout_above_max:'large_payout_attempt', player_open_risk_exceeded:'over_limit_attempt',
@@ -8002,14 +8188,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           ||finalPayoutResult.code==='odds_stale')?409 : 422;
       console.log('[bets/place] final snapshot recheck failed:', finalPayoutResult.code,
         finalPayoutResult.reason||'-', finalPayoutResult.leg, '('+httpStatus+')');
-      _recordLivePlacementRejection(finalPayoutResult.code, {
+      _recordLivePlacementRejection(finalPayoutResult.code, _liveRejectionContextFromLegs(legsArr, finalPayoutResult, {
         phase:'final_snapshot',
-        reason:finalPayoutResult.reason||null,
         clubId,
-        playerId,
-        leg:finalPayoutResult.leg||null,
-        legIndex:finalPayoutResult.legIndex
-      });
+        playerId
+      }));
       return res.status(httpStatus).json(Object.assign({ ok:false, finalRecheck:true }, finalPayoutResult));
     }
     if (finalPayoutResult && finalPayoutResult.ok) {
