@@ -4327,10 +4327,15 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   // RISK-9: Zero-tolerance exact-match odds.
   // No drift window, no accept_better, no accept_any_with_confirm.
   // submitted odds must equal server snapshot odds exactly (integer comparison).
-  const submittedOdds = Number(leg.odds);
-  const serverOdds    = Number(snap.odds_american);
+  const rawSubmittedOdds = leg.odds;
+  const rawServerOdds    = snap.odds_american;
+  const submittedOdds = Number(rawSubmittedOdds);
+  const serverOdds    = Number(rawServerOdds);
 
-  if (!Number.isFinite(submittedOdds) || !Number.isFinite(serverOdds)) {
+  if (rawSubmittedOdds == null || rawSubmittedOdds === '' ||
+      rawServerOdds == null || rawServerOdds === '' ||
+      !Number.isFinite(submittedOdds) || !Number.isFinite(serverOdds) ||
+      submittedOdds === 0 || serverOdds === 0) {
     return { ok:false, code:'invalid_snapshot_odds', leg:leg.pick };
   }
 
