@@ -4244,7 +4244,22 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
   if (state === 'suspended')
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
-  // 'active' and 'live' both allow placement — fall through to odds drift check below.
+
+  // Live betting is structurally disabled for now. This is server-derived:
+  // never trust client leg.isLive. A fresh live snapshot or a snapshot whose
+  // commence_time has passed is rejected before payout/risk/placement.
+  const commenceTime = snap.commence_time||snap.commenceTime;
+  const commenceMs = commenceTime ? new Date(commenceTime).getTime() : NaN;
+  const hasCommenced = !isNaN(commenceMs) && nowMs >= commenceMs;
+  if (state === 'live' || hasCommenced) {
+    return {
+      ok:false,
+      code:'live_betting_disabled',
+      leg:leg.pick,
+      reason: state === 'live' ? 'server_live' : 'event_started',
+      commenceTime: commenceTime || null
+    };
+  }
 
   // RISK-9: Zero-tolerance exact-match odds.
   // No drift window, no accept_better, no accept_any_with_confirm.
@@ -4273,7 +4288,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     acceptedOddsAmerican: serverOdds,
     acceptedOddsDecimal:  parseFloat(snap.odds_decimal),
     acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
-    commenceTime:         snap.commence_time,
+    commenceTime:         commenceTime,
     isLive:               state === 'live'   // server-authoritative; never trust client leg.isLive
   };
 }
