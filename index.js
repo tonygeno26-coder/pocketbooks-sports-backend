@@ -6585,6 +6585,19 @@ function _sgAmToDecimal(o) {
   return n > 0 ? n/100+1 : 100/Math.abs(n)+1;
 }
 
+// Generate all C(arr.length, size) combinations of arr.
+// Used by the RR placement path to expand leg subsets per combo.
+// Pure function — no side effects.
+function _getRrCombos(arr, size) {
+  if (!Array.isArray(arr) || size < 1 || size > arr.length) return [];
+  if (size === 1) return arr.map(function(x){ return [x]; });
+  var out = [];
+  arr.forEach(function(x, i) {
+    _getRrCombos(arr.slice(i+1), size-1).forEach(function(rest){ out.push([x].concat(rest)); });
+  });
+  return out;
+}
+
 function _sgFindGame(leg, games) {
   var selMs  = leg.scheduled_start ? new Date(leg.scheduled_start).getTime() : 0;
   var provId = leg.provider_game_id || null;
@@ -7944,7 +7957,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   const _actor = requireActor(req);
   const _resolvedPlayerId = _bodyRaw.playerId || (_actor && _actor.actorId) || null;
   const { clubId, betType, stake, legs, payout, potentialProfit,
-          idempotencyKey, playerUsername } = _bodyRaw;
+          idempotencyKey, playerUsername, rrStakes } = _bodyRaw;
   const playerId = _resolvedPlayerId;
   if (_actor && !_bodyRaw.playerId && _actor.actorId) {
     console.log('TOKEN_SCOPE role='+(_actor.role||'?')+' playerCapable=true (resolved from token)');
@@ -8213,6 +8226,255 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       serverPayout = finalPayoutResult.payout;
       serverProfit = rnd(serverPayout - stakeAmt);
     }
+
+    // ── RR placement path ─────────────────────────────────────────────────────
+    // Reached only after the containment block is removed (Phase 3).
+    // By this point: all legs validated twice, enriched with accepted_odds_*,
+    // risk limits checked, conflict check done.
+    // This block generates N Parlay combo tickets under a shared rr_group_id,
+    // calls place_rr_tx for atomic balance debit + ticket inserts, then inserts
+    // ticket_legs for all combos. HAB is charged once.
+    if (betType === 'RoundRobin') {
+      // Validate rrStakes — must be a non-empty object with at least one active size.
+      // Note: serverPayout is the product of ALL legs × totalStake (wrong for RR);
+      // it was used for risk limit checks above with the client payout as fallback.
+      // We compute correct per-combo payouts from server-accepted odds below.
+      const rrStakesMap = (typeof rrStakes === 'object' && rrStakes !== null) ? rrStakes : {};
+      const activeSizes = Object.keys(rrStakesMap).filter(function(k) {
+        return (parseFloat(rrStakesMap[k]) || 0) > 0;
+      });
+      if (!activeSizes.length) {
+        return res.status(400).json({ ok:false, error:'missing_rrStakes',
+          message:'rrStakes must contain at least one active combo size with a positive stake.' });
+      }
+
+      // Generate group ID — shared across all combo tickets in this slip.
+      const groupId = 'RRG_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+
+      // Build combo payloads using server-accepted odds (authoritative).
+      // legsArr at this point is enriched with accepted_odds_american / accepted_odds_decimal
+      // from both snapshot validation passes.
+      const rrCombos = [];
+      let rrTotalVerifiedPayout = 0;
+
+      for (const _sz of activeSizes) {
+        const sz = parseInt(_sz);
+        if (isNaN(sz) || sz < 2) continue;
+        const stakePerCombo = rnd(parseFloat(rrStakesMap[_sz]) || 0);
+        if (!stakePerCombo) continue;
+
+        const combos = _getRrCombos(legsArr, sz);
+        for (let ci = 0; ci < combos.length; ci++) {
+          const comboLegs = combos[ci];
+          // Product of per-leg decimal odds using server-accepted values.
+          // Falls back to submitted odds if accepted_odds_american is missing.
+          const decProduct = comboLegs.reduce(function(acc, leg) {
+            return acc * _sgAmToDecimal(leg.accepted_odds_american || leg.odds || 0);
+          }, 1.0);
+          const comboPayout = rnd(stakePerCombo * decProduct);
+          const comboProfit = rnd(comboPayout - stakePerCombo);
+
+          const comboId = groupId + '_c' + rrCombos.length;
+          rrCombos.push({
+            id:               comboId,
+            stake:            stakePerCombo,
+            potential_profit: comboProfit,
+            estimated_payout: comboPayout,
+            legs:             comboLegs   // enriched legs for this combo (leg insert step below)
+          });
+          rrTotalVerifiedPayout += comboPayout;
+        }
+      }
+
+      if (!rrCombos.length) {
+        return res.status(400).json({ ok:false, error:'rr_no_combos_generated',
+          message:'No valid combo sizes found in rrStakes.' });
+      }
+
+      // Sanity: sum of combo stakes must match total stakeAmt (within $0.01).
+      const rrVerifiedStake = rnd(rrCombos.reduce(function(s,c){ return s+c.stake; }, 0));
+      if (Math.abs(rrVerifiedStake - stakeAmt) > 0.01) {
+        console.error('[bets/place] RR stake mismatch groupId='+groupId+
+          ' verifiedStake='+rrVerifiedStake+' submitted='+stakeAmt);
+        return res.status(400).json({ ok:false, error:'rr_stake_mismatch',
+          computed:rrVerifiedStake, submitted:stakeAmt });
+      }
+
+      // Call place_rr_tx: atomic balance debit + N ticket row inserts.
+      // Ticket legs are inserted AFTER the RPC succeeds (same pattern as place_bet_tx).
+      const rpcCombos = rrCombos.map(function(c) {
+        return { id:c.id, stake:c.stake,
+                 potential_profit:c.potential_profit,
+                 estimated_payout:c.estimated_payout };
+      });
+      const rrRpcResult = await _callMoneyRpc('place_rr_tx', {
+        p_group_id:        groupId,
+        p_club_id:         clubId||'',
+        p_player_id:       playerId,
+        p_player_username: playerUsername||null,
+        p_total_stake:     rnd(stakeAmt),
+        p_idempotency_key: idempotencyKey,
+        p_created_by:      playerId,
+        p_combos:          rpcCombos
+      });
+
+      if (!rrRpcResult.ok && !rrRpcResult.idempotent) {
+        if (rrRpcResult.error === 'insufficient_balance') {
+          return res.status(400).json({ ok:false, error:'insufficient_balance',
+            available:rrRpcResult.available, stake:stakeAmt });
+        }
+        return res.status(400).json({ ok:false, error:rrRpcResult.error||'rr_placement_failed' });
+      }
+
+      // Insert ticket_legs for all combo tickets.
+      // Each combo's legs are a subset of legsArr — enriched with accepted odds.
+      // Same column set and fallback-strip logic as the standard path.
+      const rrAllLegRows = [];
+      rrCombos.forEach(function(combo) {
+        combo.legs.forEach(function(leg, legIdx) {
+          const ident = _normalizeLegIdentity(leg) || {};
+          rrAllLegRows.push({
+            id:                    combo.id + '_leg' + legIdx,
+            ticket_id:             combo.id,
+            leg_index:             legIdx,
+            provider_name:         leg.providerName||'odds-api',
+            provider_game_id:      leg.providerGameId||null,
+            canonical_game_key:    leg.canonicalGameKey,
+            sport:                 leg.sport||null,
+            home_team:             leg.homeTeam||null,
+            away_team:             leg.awayTeam||null,
+            scheduled_start:       leg.scheduledStart||leg.commenceTime||null,
+            market:                leg.market,
+            pick:                  leg.pick,
+            odds:                  leg.accepted_odds_american || leg.odds,
+            line:                  leg.accepted_point_line != null ? leg.accepted_point_line
+                                    : (leg.line != null ? parseFloat(leg.line) : null),
+            side:                  leg.side||null,
+            accepted_odds_american: leg.accepted_odds_american||null,
+            accepted_odds_decimal:  leg.accepted_odds_decimal||null,
+            accepted_point_line:    leg.accepted_point_line||null,
+            odds_snapshot_id:       leg.odds_snapshot_id||null,
+            accepted_at:            leg.accepted_at||null,
+            market_type:              ident.marketType || _coerceMarketType(leg.market) || leg.market,
+            canonical_market_key:     ident.canonicalMarketKey || null,
+            canonical_selection_key:  ident.canonicalSelectionKey || null,
+            player_name_normalized:   ident.playerName ? _normalizePlayerName(ident.playerName) : null,
+            prop_type_normalized:     ident.propType ? _normalizePropType(ident.propType) : null,
+            prop_side:                ident.marketType === MARKET_TYPES.PLAYER_PROP ? (ident.side||null) : null
+          });
+        });
+      });
+
+      try {
+        try {
+          const rrLegIns = await sb.from('ticket_legs').insert(rrAllLegRows);
+          if (rrLegIns.error) throw rrLegIns.error;
+        } catch(e1) {
+          const _msg = (e1 && e1.message) || '';
+          const _missingCanon = /market_type|canonical_market_key|canonical_selection_key|player_name_normalized|prop_type_normalized|prop_side/.test(_msg);
+          const _missingPhK   = /accepted_at|accepted_odds_american|accepted_odds_decimal|accepted_point_line|odds_snapshot_id/.test(_msg);
+          if (_missingCanon || _missingPhK) {
+            console.warn('[bets/place] RR ticket_legs: missing columns ('+
+              [_missingCanon?'canonical':'',_missingPhK?'phaseK':''].filter(Boolean).join('+')+
+              '), stripping — run migration in Supabase');
+            const legacyRows = rrAllLegRows.map(function(r) {
+              const copy = Object.assign({}, r);
+              if (_missingCanon) {
+                delete copy.market_type; delete copy.canonical_market_key;
+                delete copy.canonical_selection_key; delete copy.player_name_normalized;
+                delete copy.prop_type_normalized; delete copy.prop_side;
+              }
+              if (_missingPhK) {
+                delete copy.accepted_odds_american; delete copy.accepted_odds_decimal;
+                delete copy.accepted_point_line; delete copy.odds_snapshot_id;
+                delete copy.accepted_at;
+              }
+              return copy;
+            });
+            const rrLegIns2 = await sb.from('ticket_legs').insert(legacyRows);
+            if (rrLegIns2.error) throw rrLegIns2.error;
+          } else { throw e1; }
+        }
+      } catch(rrLegErr) {
+        // Compensation: cancel every combo ticket so balance reservation is freed.
+        console.error('[bets/place] RR ticket_legs insert failed — compensating '
+          +rrCombos.length+' combos:', rrLegErr.message, 'groupId='+groupId);
+        const _rrOrphanPayload = { category:'rr_leg_insert_failed', groupId, clubId:clubId||null,
+          playerId, idempotencyKey, legInsertError:rrLegErr.message,
+          timestamp:new Date().toISOString() };
+        console.error('CRITICAL_RR_LEG_INSERT_FAILED', JSON.stringify(_rrOrphanPayload));
+        for (let ci = 0; ci < rrCombos.length; ci++) {
+          try {
+            await _callMoneyRpc('cancel_bet_tx', {
+              p_ticket_id:       rrCombos[ci].id,
+              p_club_id:         clubId||'',
+              p_player_id:       playerId,
+              p_idempotency_key: idempotencyKey+':rr_compensate:'+ci,
+              p_reason:          'rr_ticket_legs_insert_failed',
+              p_created_by:      playerId
+            });
+          } catch(cErr) {
+            console.error('CRITICAL_RR_COMPENSATION_FAILED comboId='+rrCombos[ci].id, cErr.message);
+          }
+        }
+        return res.status(500).json({ ok:false, error:'rr_ticket_legs_insert_failed',
+          detail:rrLegErr.message, groupId });
+      }
+
+      // HAB charge — once for the whole RR slip, not per combo.
+      // groupId passed as the ticket reference (HAB uses it for logging only).
+      const _rrHabResult = await _processActiveBettorCharge(sb, clubId, playerId, groupId, Date.now());
+      if (!_rrHabResult.ok) {
+        console.error('[bets/place] RR HAB charge failed — compensating groupId='+groupId+
+          ' error='+(_rrHabResult.error||'unknown'));
+        for (let ci = 0; ci < rrCombos.length; ci++) {
+          try {
+            await _callMoneyRpc('cancel_bet_tx', {
+              p_ticket_id:       rrCombos[ci].id,
+              p_club_id:         clubId||'',
+              p_player_id:       playerId,
+              p_idempotency_key: idempotencyKey+':rr_hab_compensate:'+ci,
+              p_reason:          'rr_active_bettor_charge_failed',
+              p_created_by:      playerId
+            });
+          } catch(cErr) {
+            console.error('CRITICAL_RR_HAB_COMPENSATION_FAILED comboId='+rrCombos[ci].id, cErr.message);
+          }
+        }
+        if (_rrHabResult.httpStatus === 402) {
+          return res.status(402).json({ ok:false, error:_rrHabResult.error,
+            message:_rrHabResult.message, balance:_rrHabResult.balance,
+            required:_rrHabResult.required, groupId, compensated:true });
+        }
+        return res.status(503).json({ ok:false, error:'rr_active_bettor_charge_failed',
+          detail:_rrHabResult.error, groupId, compensated:true });
+      }
+
+      // Audit event (fire-and-forget)
+      try {
+        await sb.from('audit_events').insert({
+          event_type: 'rr_placed', player_id:playerId, club_id:clubId||null, ticket_id:null,
+          payload: { betType:'RoundRobin', groupId, comboCount:rrCombos.length,
+                     totalStake:stakeAmt, activeSizes, txResult:rrRpcResult }
+        });
+      } catch(_auditErr) {
+        console.warn('[bets/place] RR audit_events write failed (non-fatal):', _auditErr.message,
+          'groupId='+groupId);
+      }
+
+      console.log('[bets/place] RR ok groupId='+groupId+' combos='+rrCombos.length+
+        ' stake='+stakeAmt+' balanceAfter='+(rrRpcResult.balance_after||'?'));
+      emitEvent('ticket_placed', { groupId, comboCount:rrCombos.length, stake:stakeAmt,
+        betType:'RoundRobin', balanceAfter:rrRpcResult.balance_after },
+        { clubId, actorId:playerId, playerId }, req.requestId);
+      emitEvent('balance_changed', { playerId, balanceAfter:rrRpcResult.balance_after },
+        { clubId, playerId }, req.requestId);
+      emitRiskAlert('rapid_bet_velocity', clubId, playerId, { groupId, stake:stakeAmt });
+
+      return res.json({ ok:true, groupId, comboCount:rrCombos.length,
+        balanceAfter:rrRpcResult.balance_after, ledgerEntryId:idempotencyKey });
+    }
+    // ── End RR placement path ─────────────────────────────────────────────────
 
     // 4. Generate ticket ID
     const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
