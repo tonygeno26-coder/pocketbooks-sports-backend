@@ -6475,7 +6475,13 @@ async function _upsertResultSnapshots(scoresData, sport) {
         }
       }
     }
-    const status = game.completed?'final':game.scores?'live':'scheduled';
+    const rawStatus = String(game.status || game.state || '').toLowerCase();
+    const isCanceled = game.canceled === true || game.cancelled === true ||
+      /^(canceled|cancelled|abandoned|postponed)$/.test(rawStatus);
+    const status = game.completed ? 'final'
+                 : isCanceled     ? 'canceled'
+                 : (game.scores && game.scores.length) ? 'live'
+                 : 'scheduled';
     return {
       result_snapshot_id: 'RS_'+sport+'_'+game.id,
       sport: sp, event_id:game.id, canonical_game_key:cKey,
@@ -6496,6 +6502,13 @@ async function _upsertResultSnapshots(scoresData, sport) {
 // Derive leg outcome from result snapshot
 function _deriveLegOutcome(leg, result) {
   if (!result) return { outcome:'error', reason:'result_missing' };
+  // GRD-7: canceled/postponed/abandoned games grade as push so the player's
+  // stake is returned.  For parlays this triggers the GRD-2 push-reduction
+  // path (canceled leg drops out; remaining winning legs pay at reduced odds).
+  const canceledStatuses = new Set(['canceled','cancelled','postponed','abandoned','suspended','forfeit']);
+  if (canceledStatuses.has(result.status)) {
+    return { outcome: 'push', reason: 'event_' + result.status };
+  }
   if (result.status !== 'final') return { outcome:'pending', reason:'result_not_final', status:result.status };
   const market   = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
   const pick     = (leg.pick||'').toLowerCase();
