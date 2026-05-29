@@ -8832,7 +8832,7 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
   try {
     // Tickets for this player
     let tq = sb.from('tickets').select(
-      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds'
+      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id'
     ).eq('player_id', playerId);
     if (clubId) tq = tq.eq('club_id', clubId);
     tq = tq.order('placed_at', { ascending:false });
