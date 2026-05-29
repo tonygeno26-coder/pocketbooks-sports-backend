@@ -1,12 +1,16 @@
 'use strict';
 
-// Regression tests for GRD-2/RR containment block.
+// Historical regression tests for the GRD-2/RR containment block.
 //
-// The handler's early-exit guard fires AFTER basic param validation but
-// BEFORE every financial operation: HAB charge, snapshot verification,
-// ticket insert, and ledger insert.
+// NOTE (Phase 3): The rr_temporarily_disabled containment block was removed
+// from index.js in Phase 3.  Round Robin placements now flow through the full
+// placement path (place_rr_tx RPC).  These tests document the ordering
+// properties that held during containment and use a self-contained harness —
+// they do NOT import index.js, so they remain green regardless of the live code.
 //
-// Test coverage:
+// Kept as historical documentation of the Phase 1 guard ordering contract.
+//
+// Original test coverage:
 //   1. RoundRobin → rejects with rr_temporarily_disabled
 //   2. Single     → passes the RR gate, reaches normal validation path
 //   3. Parlay     → passes the RR gate, reaches normal validation path
