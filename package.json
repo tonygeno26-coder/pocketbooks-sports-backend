@@ -4,7 +4,9 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node index.js"
+    "dev": "node index.js",
+    "test": "jest --runInBand --testTimeout=15000",
+    "test:watch": "jest --watch"
   },
   "dependencies": {
     "express": "^4.18.2",
@@ -15,5 +17,13 @@
     "dotenv": "^16.0.0",
     "stripe": "^14.0.0",
     "@supabase/supabase-js": "^2.39.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"]
   }
 }
