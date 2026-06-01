@@ -3697,7 +3697,8 @@ function _coerceMarketType(raw) {
   const k = String(raw).toLowerCase().trim();
   if (k === 'moneyline' || k === 'h2h')           return MARKET_TYPES.MONEYLINE;
   if (k === 'spread'    || k === 'spreads'
-   || k === 'run_line'  || k === 'runline'
+   || k === 'run_line'  || k === 'runline'  || k === 'run line'
+   || k === 'puck_line' || k === 'puckline' || k === 'puck line'
    || k === 'alt_spread' || k === 'alternate_spread' || k === 'alternate_spreads') return MARKET_TYPES.SPREAD;
   if (k === 'total'     || k === 'totals'
    || k === 'alt_total' || k === 'alternate_total' || k === 'alternate_totals') return MARKET_TYPES.TOTAL;
@@ -4330,6 +4331,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const cKey   = leg.canonicalGameKey||'';
   const market = (leg.market||'moneyline').toLowerCase();
   const pick   = (leg.pick||'').toLowerCase();
+  // DIAG: log the exact values received so we can verify the fix is running
+  // and confirm what the frontend is sending.
+  console.log('[snapshot-diag] cKey='+JSON.stringify(cKey)+' market='+JSON.stringify(market)+' pick='+JSON.stringify(pick));
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
   const bypassOk = !IS_PRODUCTION;
@@ -4382,6 +4386,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   //   e.g. "toronto blue jays"  (NOT "toronto blue jays +1.5")
   // Strip any trailing point-spread suffix from pick before matching.
   const pickForLookup = pick.replace(/\s[+-]?\d+\.?\d*$/, '').trim();
+  console.log('[snapshot-diag] tier2 pickForLookup='+JSON.stringify(pickForLookup)+' (was: '+JSON.stringify(pick)+')');
   if (!snap) {
     try {
       const { data, error } = await sb.from('odds_snapshots').select('*')
