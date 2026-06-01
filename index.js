@@ -6144,10 +6144,18 @@ app.get('/api/odds/:sport', async (req, res) => {
     console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+
       ' live='+flat.filter(function(g){return g.status==='live';}).length+
       ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
-    // Empty is a valid, non-error response — the frontend renders "No games available right now."
-    return res.json(flat.slice(0, 50));
+    // If Owls cache has no games for this sport but Odds API is configured,
+    // fall back to the Odds API so the lobby never shows "No games available"
+    // when the Owls poller is stale or not covering this sport.
+    if (flat.length === 0 && ODDS_KEY) {
+      console.log('[odds] owls-cache empty for sport='+sportShort+' — falling back to odds-api');
+      res.setHeader('X-Provider', 'odds_api_fallback');
+      // fall through to legacy Odds API path below
+    } else {
+      return res.json(flat.slice(0, 50));
+    }
   }
-  // ── Legacy Odds API path (untouched) ────────────────────────────────────
+  // ── Legacy Odds API path (also serves as Owls fallback when cache is empty) ─
   console.log('[odds] source=backend-proxy sport='+req.params.sport+' key_fingerprint='+(ODDS_KEY?ODDS_KEY.slice(0,4)+'...'+ODDS_KEY.slice(-4):'MISSING'));
   try {
     const games = await fetchOdds(sport);
