@@ -5508,10 +5508,15 @@ async function pollLiveOddsLoop() {
         reason:'owls_poll_error'
       });
     }
-    // Owls failed or returned empty. If LIVE_MARKET_CACHE is still empty (e.g. fresh
-    // deploy) AND the Odds API key is available, fall through to the Odds API path
-    // below to populate the cache. Rate-limited to 1 poll/min so quota is protected.
-    if (!ODDS_KEY || LIVE_MARKET_CACHE.gameCount > 0) return;
+    // Owls failed or returned empty. Fall through to the Odds API path when:
+    //   (a) the cache is empty (fresh deploy / first poll), OR
+    //   (b) the cache is populated but stale (older than PREGAME_SNAPSHOT_TTL_MS)
+    // Rate-limited to 1 poll/min so Odds API quota is protected.
+    // With rate-limit=60s and TTL=120s the cache is always refreshed within the window.
+    const _cacheAgeForFb = LIVE_MARKET_CACHE.updatedAt
+        ? Date.now() - new Date(LIVE_MARKET_CACHE.updatedAt).getTime()
+        : Infinity;
+    if (!ODDS_KEY || (LIVE_MARKET_CACHE.gameCount > 0 && _cacheAgeForFb < PREGAME_SNAPSHOT_TTL_MS)) return;
     const _fbNow = Date.now();
     if (_fbNow - _oddsApiFallbackLastRun < _ODDS_API_FALLBACK_INTERVAL_MS) return;
     _oddsApiFallbackLastRun = _fbNow;
