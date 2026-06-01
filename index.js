@@ -5354,6 +5354,9 @@ function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
 
 // Single shared cache instance — replaced atomically
 let LIVE_MARKET_CACHE = _makeEmptyCache();
+// Rate-limit for Odds API fallback when Owls is unavailable: max 1 poll/min
+let _oddsApiFallbackLastRun = 0;
+const _ODDS_API_FALLBACK_INTERVAL_MS = 60 * 1000;
 
 // Normalize a cache market entry to a placement-relevant state.
 // Live games are 'open' — we want bets on them. Only block on real market
@@ -5490,6 +5493,7 @@ async function pollLiveOddsLoop() {
       if (newCache.sourceStatus==='healthy') {
         LIVE_MARKET_CACHE = newCache;
         console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+' fetch='+fetchDurationMs+'ms');
+        return; // Owls healthy — no fallback needed
       } else {
         console.warn('[owls] fetch returned empty — preserving previous cache');
         _recordLiveDiagnosticEvent('provider_unhealthy', {
@@ -5504,7 +5508,15 @@ async function pollLiveOddsLoop() {
         reason:'owls_poll_error'
       });
     }
-    return;
+    // Owls failed or returned empty. If LIVE_MARKET_CACHE is still empty (e.g. fresh
+    // deploy) AND the Odds API key is available, fall through to the Odds API path
+    // below to populate the cache. Rate-limited to 1 poll/min so quota is protected.
+    if (!ODDS_KEY || LIVE_MARKET_CACHE.gameCount > 0) return;
+    const _fbNow = Date.now();
+    if (_fbNow - _oddsApiFallbackLastRun < _ODDS_API_FALLBACK_INTERVAL_MS) return;
+    _oddsApiFallbackLastRun = _fbNow;
+    console.log('[owls-fallback] Owls unavailable + cache empty — running Odds API fallback poll (rate-limited 1/min)');
+    // fall through to Odds API path
   }
   // Default: The Odds API
   if (!ODDS_KEY) { console.log('[live cache] ODDS_API_KEY not set — skipping poll'); return; }
@@ -5925,6 +5937,8 @@ function _isMatchingSport(gameSportKey, requestedShort, requestedFull) {
 
 function _projectOwlsGameToFlat(g, sportLabel) {
   if (!g || typeof g !== 'object') return null;
+  var canonicalGameKey = g.canonicalKey || g.canonicalGameKey || null;
+  var providerGameId   = g.id || g.providerGameId || null;
   var moneyline = [];
   var spreads   = [];
   var totals    = [];
@@ -5951,14 +5965,26 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     if (mt === 'moneyline') {
       if (_pick(key, m.sportsbook)) {
         var existing = moneyline.findIndex(function(x){ return x.team === side; });
-        var row = { team: side, odds: price };
+        var row = {
+          team: side, odds: price,
+          market: 'moneyline',
+          canonicalGameKey: m.canonicalGameKey || canonicalGameKey,
+          providerGameId:   m.providerGameId   || providerGameId,
+          scheduledStart:   g.commence_time || null
+        };
         if (existing >= 0) moneyline[existing] = row; else moneyline.push(row);
       }
     } else if (mt === 'spread') {
       if (typeof m.line !== 'number') continue;
       if (_pick(key, m.sportsbook)) {
         var ex = spreads.findIndex(function(x){ return x.team === side; });
-        var rr = { team: side, line: m.line, odds: price };
+        var rr = {
+          team: side, line: m.line, odds: price,
+          market: 'spread',
+          canonicalGameKey: m.canonicalGameKey || canonicalGameKey,
+          providerGameId:   m.providerGameId   || providerGameId,
+          scheduledStart:   g.commence_time || null
+        };
         if (ex >= 0) spreads[ex] = rr; else spreads.push(rr);
       }
     } else if (mt === 'total') {
@@ -5966,7 +5992,13 @@ function _projectOwlsGameToFlat(g, sportLabel) {
       // Owls Over/Under outcomes share a line; key by name only.
       if (_pick(key, m.sportsbook)) {
         var et = totals.findIndex(function(x){ return x.name === side; });
-        var rt = { name: side, line: m.line, odds: price };
+        var rt = {
+          name: side, line: m.line, odds: price,
+          market: 'total',
+          canonicalGameKey: m.canonicalGameKey || canonicalGameKey,
+          providerGameId:   m.providerGameId   || providerGameId,
+          scheduledStart:   g.commence_time || null
+        };
         if (et >= 0) totals[et] = rt; else totals.push(rt);
       }
     } else if (mt === 'player_prop') {
@@ -5989,6 +6021,8 @@ function _projectOwlsGameToFlat(g, sportLabel) {
           underOdds:      null,
           marketKey:      m.marketKey || null,
           providerGameId: m.providerGameId || null,
+          canonicalGameKey: m.canonicalGameKey || canonicalGameKey,
+          scheduledStart: g.commence_time || null,
         };
         propsByKey[propKey] = p;
       }
@@ -6016,10 +6050,13 @@ function _projectOwlsGameToFlat(g, sportLabel) {
   });
   return {
     id:    g.id || g.providerGameId || ((g.away_team||'')+'@'+(g.home_team||'')+'@'+(g.commence_time||'')),
+    canonicalGameKey: canonicalGameKey,
+    providerGameId: providerGameId,
     sport: sportLabel || g.sport_key || '',
     home:  g.home_team || '',
     away:  g.away_team || '',
     time:  g.commence_time || null,
+    scheduledStart: g.commence_time || null,
     status: status,                   // 'upcoming' | 'live' | 'final' | 'canceled'
     isLive: status === 'live',
     isFinal: status === 'final',
@@ -6163,16 +6200,25 @@ app.get('/api/odds/:sport', async (req, res) => {
     if (games && games._error) { return res.status(402).json({ error: games._message, error_code: games._error }); }
     const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => {
       const status = _deriveGameStatus(g);
+      const canonicalGameKey = _buildCKeyFromGame(g);
+      const baseMeta = {
+        canonicalGameKey,
+        providerGameId: g.id || null,
+        scheduledStart: g.commence_time || null
+      };
       return {
         id: g.id, sport: g.sport_title||req.params.sport.toUpperCase(),
+        canonicalGameKey,
+        providerGameId: g.id || null,
         home: g.home_team, away: g.away_team, time: g.commence_time,
+        scheduledStart: g.commence_time || null,
         status, isLive: status==='live', isFinal: status==='final', isCanceled: status==='canceled',
         // Odds API /odds doesn't include live scores — hydrate from /scores cache when present
         homeScore: null, awayScore: null, period:null, clock:null, inning:null,
         outs:null, basesOccupied:null, possession:null, gameStateText: status==='final'?'Final':'',
-        spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>({team:o.name,line:o.point,odds:o.price})),
-        totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>({name:o.name,line:o.point,odds:o.price})),
-        moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>({team:o.name,odds:o.price})),
+        spreads: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='spreads')?.outcomes||[]).map(o=>Object.assign({team:o.name,line:o.point,odds:o.price,market:'spread'}, baseMeta)),
+        totals: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='totals')?.outcomes||[]).map(o=>Object.assign({name:o.name,line:o.point,odds:o.price,market:'total'}, baseMeta)),
+        moneyline: (g.bookmakers?.[0]?.markets?.find(m=>m.key==='h2h')?.outcomes||[]).map(o=>Object.assign({team:o.name,odds:o.price,market:'moneyline'}, baseMeta)),
         // Legacy Odds API path doesn't currently surface props; the Owls
         // path is the source of player props. Empty array keeps the UI
         // contract uniform.
@@ -7998,7 +8044,10 @@ app.get('/api/host/week-snapshot', async (req, res) => {
 
 // ── DB-AUTHORITATIVE BET PLACEMENT (Phase C) ───────────────────────────────────────────────────
 // POST /api/bets/place
-app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('place_bet'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('place_bet', function(req) {
+  const actor = requireActor(req);
+  return (req.body && req.body.playerId) || (actor && actor.actorId) || null;
+}), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -8023,7 +8072,22 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   if (!VALID_TYPES.has(betType)) errors.push('invalid_betType:'+betType);
   const stakeAmt = parseFloat(stake);
   if (isNaN(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
-  let legsArr = Array.isArray(legs) ? legs : [];
+  let legsArr = Array.isArray(legs) ? legs.map(function(leg) {
+    const out = Object.assign({}, leg || {});
+    out.canonicalGameKey = out.canonicalGameKey || out.canonical_game_key || out.gameKey || null;
+    out.scheduledStart   = out.scheduledStart || out.scheduled_start || out.commenceTime || out.commence_time || null;
+    out.providerGameId   = out.providerGameId || out.provider_game_id || out.gameId || null;
+    if (!out.market && out.marketType) out.market = out.marketType;
+    if (out.odds != null && typeof out.odds !== 'number') {
+      const parsedOdds = Number(out.odds);
+      if (Number.isFinite(parsedOdds)) out.odds = parsedOdds;
+    }
+    if (out.line != null && typeof out.line !== 'number') {
+      const parsedLine = Number(out.line);
+      if (Number.isFinite(parsedLine)) out.line = parsedLine;
+    }
+    return out;
+  }) : [];
   if (!legsArr.length) errors.push('no_legs');
   legsArr.forEach(function(leg,i) {
     if (!leg.pick) errors.push('leg'+i+'_missing_pick');
