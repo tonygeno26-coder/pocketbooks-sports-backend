@@ -3887,12 +3887,30 @@ function _normalizeLegIdentity(leg) {
     marketType === MARKET_TYPES.TOTAL      ||
     marketType === MARKET_TYPES.TEAM_TOTAL ||
     marketType === MARKET_TYPES.PERIOD_TOTAL;
+
+  // For team markets (spread/run-line) the frontend embeds the point spread
+  // directly in leg.pick: "Toronto Blue Jays +1.5". Separate the team name
+  // and extract the line so _buildCanonicalSelectionKey can produce a valid
+  // spread key ("team_slug:1.5"). Without this, leg.line is null and the
+  // canonical key is null → Tier 1 is skipped entirely.
+  let _teamForKey = leg.team || leg.teamOrSide || null;
+  let _lineForKey = line;
+  if (isTeamMarket && !_teamForKey && leg.pick) {
+    const _m = leg.pick.match(/^(.*?)\s+([+-]?\d+\.?\d*)\s*$/);
+    if (_m) {
+      _teamForKey = _m[1].trim();
+      if (_lineForKey == null) _lineForKey = parseFloat(_m[2]);
+    } else {
+      _teamForKey = leg.pick.trim();
+    }
+  }
+
   const canonicalSelectionKey = _buildCanonicalSelectionKey({
     marketType,
-    team:   leg.team || leg.teamOrSide || (isTeamMarket ? leg.pick : null),
+    team:   _teamForKey || (isTeamMarket ? leg.pick : null),
     player: playerName,
     side:   side || (isSideMarket ? leg.pick : null),
-    line,
+    line:   _lineForKey,
   });
 
   return {
@@ -4359,10 +4377,15 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   // Tier 2: legacy lookup by (canonical_game_key, market_key, selection_key).
   // This is the original code path — keeps existing snapshots discoverable
   // until the canonical columns are populated everywhere.
+  //
+  // selection_key in the DB stores only the team/side name with no spread:
+  //   e.g. "toronto blue jays"  (NOT "toronto blue jays +1.5")
+  // Strip any trailing point-spread suffix from pick before matching.
+  const pickForLookup = pick.replace(/\s[+-]?\d+\.?\d*$/, '').trim();
   if (!snap) {
     try {
       const { data, error } = await sb.from('odds_snapshots').select('*')
-        .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pick)
+        .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pickForLookup)
         .limit(1);
       if (error) throw error;
       snap = data&&data[0]||null;
