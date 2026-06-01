@@ -3695,7 +3695,7 @@ const MARKET_TYPES = Object.freeze({
 function _coerceMarketType(raw) {
   if (!raw) return null;
   const k = String(raw).toLowerCase().trim();
-  if (k === 'moneyline' || k === 'h2h')           return MARKET_TYPES.MONEYLINE;
+  if (k === 'moneyline' || k === 'h2h' || k === 'to win' || k === 'win') return MARKET_TYPES.MONEYLINE;
   if (k === 'spread'    || k === 'spreads'
    || k === 'run_line'  || k === 'runline'  || k === 'run line'
    || k === 'puck_line' || k === 'puckline' || k === 'puck line'
@@ -4330,10 +4330,11 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   nowMs = nowMs||Date.now();
   const cKey   = leg.canonicalGameKey||'';
   const market = (leg.market||'moneyline').toLowerCase();
+  // Normalize display-label market names to the DB-stored keys for Tier 2 lookup.
+  // e.g. "to win" → "moneyline", "run line" / "puck line" → "spread"
+  const marketForLookup = _coerceMarketType(market) || market;
   const pick   = (leg.pick||'').toLowerCase();
-  // DIAG: log the exact values received so we can verify the fix is running
-  // and confirm what the frontend is sending.
-  console.log('[snapshot-diag] cKey='+JSON.stringify(cKey)+' market='+JSON.stringify(market)+' pick='+JSON.stringify(pick));
+  console.log('[snapshot-diag] cKey='+JSON.stringify(cKey)+' market='+JSON.stringify(market)+' marketForLookup='+JSON.stringify(marketForLookup)+' pick='+JSON.stringify(pick));
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
   const bypassOk = !IS_PRODUCTION;
@@ -4390,7 +4391,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   if (!snap) {
     try {
       const { data, error } = await sb.from('odds_snapshots').select('*')
-        .eq('canonical_game_key',cKey).eq('market_key',market).eq('selection_key',pickForLookup)
+        .eq('canonical_game_key',cKey).eq('market_key',marketForLookup).eq('selection_key',pickForLookup)
         .limit(1);
       if (error) throw error;
       snap = data&&data[0]||null;
