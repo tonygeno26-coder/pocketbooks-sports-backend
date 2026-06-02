@@ -5961,7 +5961,26 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     if (sportsbook === 'pinnacle' && cur !== 'pinnacle') { seen[key] = 'pinnacle'; return true; }
     return false;
   }
+  // Primary: Owls flat g.markets = [{marketType, teamOrSide, odds, line, sportsbook}]
+  // Fallback: Odds API g.bookmakers = [{key, markets:[{key, outcomes:[{name, price, point}]}]}]
   var mkts = Array.isArray(g.markets) ? g.markets : [];
+  if (!mkts.length && Array.isArray(g.bookmakers)) {
+    g.bookmakers.forEach(function(bm) {
+      var bmKey = (bm && (bm.key || bm.id)) || 'odds-api';
+      (bm && bm.markets || []).forEach(function(mkt) {
+        var mt = mkt.key === 'h2h' ? 'moneyline'
+               : mkt.key === 'spreads' ? 'spread'
+               : mkt.key === 'totals'  ? 'total'
+               : null;
+        if (!mt) return;
+        (mkt.outcomes || []).forEach(function(oc) {
+          mkts.push({ marketType: mt, teamOrSide: oc.name, odds: oc.price,
+                      line: oc.point != null ? oc.point : undefined,
+                      sportsbook: bmKey });
+        });
+      });
+    });
+  }
   for (var i = 0; i < mkts.length; i++) {
     var m = mkts[i]; if (!m) continue;
     var mt = m.marketType; var side = m.teamOrSide; var price = m.odds;
