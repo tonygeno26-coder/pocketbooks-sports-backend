@@ -418,7 +418,10 @@ async function _failJob(jobId, errorMsg) {
 const _jobHandlers = {
   odds_refresh: async function(job) {
     await pollLiveOddsLoop();
-    _upsertOddsSnapshots().catch(()=>{});
+    try {
+      const r = await _upsertOddsSnapshots();
+      if (r && !r.ok) console.error('[jobs] snapshot upsert failed:', r.error);
+    } catch(e) { console.error('[jobs] snapshot upsert threw:', e.message); }
     logEvent('info','job:odds_refresh',{ jobId:job.job_id });
   },
   result_refresh: async function(job) {
@@ -3650,6 +3653,8 @@ function _envMs(name, fallback) {
 const LIVE_SNAPSHOT_TTL_MS    = _envMs('LIVE_SNAPSHOT_TTL_MS',    10 * 1000);
 const PREGAME_SNAPSHOT_TTL_MS = _envMs('PREGAME_SNAPSHOT_TTL_MS', 120 * 1000);
 const SNAPSHOT_TTL_MS         = PREGAME_SNAPSHOT_TTL_MS; // backwards-compat alias
+const CACHE_STALE_RECOVERY_MS = _envMs('CACHE_STALE_RECOVERY_MS', 5 * 60 * 1000);
+const SNAPSHOT_UPSERT_BATCH_SIZE = Math.max(50, parseInt(process.env.SNAPSHOT_UPSERT_BATCH_SIZE || '200', 10) || 200);
 // SNAPSHOT_TOLERANCE removed — RISK-9: exact-match odds required; no drift window allowed.
 
 function _snapKey(cKey, market, selection) {
@@ -4149,6 +4154,130 @@ function _fmtSnapshotErr(label, e, rows) {
     ' sample='+samplePreview;
 }
 
+function _getLiveCacheAgeMs() {
+  const cache = typeof LIVE_MARKET_CACHE !== 'undefined' ? LIVE_MARKET_CACHE : null;
+  if (!cache || !cache.updatedAt) return Infinity;
+  return Date.now() - new Date(cache.updatedAt).getTime();
+}
+
+// When DB snapshots are stale/missing but the in-memory poll cache is fresh,
+// derive a snapshot-shaped object for placement verification (fail-closed on
+// stale cache — never falls back to client odds).
+function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
+  const cache = typeof LIVE_MARKET_CACHE !== 'undefined' ? LIVE_MARKET_CACHE : null;
+  if (!cache || !cache.updatedAt || !cache.gameCount) return null;
+  const cacheAgeMs = _getLiveCacheAgeMs();
+  if (!Number.isFinite(cacheAgeMs) || cacheAgeMs > PREGAME_SNAPSHOT_TTL_MS) return null;
+
+  const pickNorm = (pickForLookup || '').toLowerCase().trim();
+  const marketNorm = (marketForLookup || 'moneyline').toLowerCase();
+  const mapKey = cKey + '|' + marketNorm;
+  const byKey = cache.marketsByCanonicalKey || {};
+
+  function snapFromEntry(entry, outcome) {
+    if (!entry) return null;
+    const isOwls = !!entry.marketType;
+    let legacySelectionKey, rawOdds;
+    if (isOwls) {
+      if (entry.marketType === 'player_prop' && entry.playerName) {
+        const side = (entry.overUnder || '').toLowerCase();
+        const ln   = entry.line != null ? entry.line : '';
+        legacySelectionKey = `${entry.playerName} ${side} ${ln}`.trim().toLowerCase();
+      } else {
+        legacySelectionKey = String(entry.teamOrSide || '').toLowerCase();
+      }
+      if (String(entry.marketType || '').toLowerCase() !== marketNorm) return null;
+      rawOdds = entry.odds;
+    } else if (outcome) {
+      legacySelectionKey = String(outcome.name || '').toLowerCase();
+      rawOdds = outcome.price;
+    } else {
+      return null;
+    }
+    if (legacySelectionKey !== pickNorm) return null;
+    const oddsAmerican = Math.round(_toAmericanOdds(Number(rawOdds)));
+    if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) return null;
+    const oddsDecimal = _americanToDecimalOdds(oddsAmerican);
+    return {
+      odds_american: oddsAmerican,
+      odds_decimal: oddsDecimal,
+      fetched_at: cache.updatedAt,
+      commence_time: entry.commenceTime || null,
+      event_status: entry.gameStatus || null,
+      market_status: entry.marketStatus || null,
+      suspended: !!entry.suspended,
+      event_completed: !!entry.eventCompleted,
+      event_canceled: !!entry.eventCanceled,
+      event_live: !!entry.eventLive,
+      _source: 'live_cache'
+    };
+  }
+
+  // Bookmaker-style cache entry (Odds API path)
+  const direct = byKey[mapKey];
+  if (direct && !Array.isArray(direct) && Array.isArray(direct.outcomes)) {
+    for (const o of direct.outcomes) {
+      const s = snapFromEntry(direct, o);
+      if (s) return s;
+    }
+  }
+
+  // Owls overlay: array of per-outcome entries keyed by canonical game key
+  const owlsList = byKey[cKey];
+  if (Array.isArray(owlsList)) {
+    for (const entry of owlsList) {
+      const s = snapFromEntry(entry, null);
+      if (s) return s;
+    }
+  }
+
+  return null;
+}
+
+async function _upsertSnapshotRowsChunked(sb, rows) {
+  if (!rows || !rows.length) return { ok:true, rowsUpserted:0 };
+  let rowsUpserted = 0;
+  for (let i = 0; i < rows.length; i += SNAPSHOT_UPSERT_BATCH_SIZE) {
+    const batch = rows.slice(i, i + SNAPSHOT_UPSERT_BATCH_SIZE);
+    try {
+      const { error: upsertErr } = await sb.from('odds_snapshots').upsert(batch,
+        { onConflict:'canonical_game_key,market_key,selection_key' });
+      if (upsertErr) throw upsertErr;
+      rowsUpserted += batch.length;
+    } catch(e) {
+      const msg = (e && e.message) || '';
+      if (/canonical_market_key|canonical_selection_key|market_type|player_name|prop_type|prop_side|player_team|provider_game_id/.test(msg)) {
+        console.warn('[snapshot] upsert: optional columns missing on DB, falling back to legacy projection');
+        const legacyRows = batch.map(function(r) {
+          const copy = Object.assign({}, r);
+          delete copy.canonical_market_key;
+          delete copy.canonical_selection_key;
+          delete copy.market_type;
+          delete copy.player_name;
+          delete copy.player_name_normalized;
+          delete copy.prop_type;
+          delete copy.prop_type_normalized;
+          delete copy.prop_side;
+          delete copy.player_team;
+          delete copy.provider_game_id;
+          return copy;
+        });
+        const { error: legacyErr } = await sb.from('odds_snapshots').upsert(legacyRows,
+          { onConflict:'canonical_game_key,market_key,selection_key' });
+        if (legacyErr) {
+          console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR legacy', legacyErr, legacyRows));
+          return { ok:false, error:legacyErr.message, rowsUpserted };
+        }
+        rowsUpserted += legacyRows.length;
+        continue;
+      }
+      console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR primary', e, batch));
+      return { ok:false, error:msg || String(e), rowsUpserted };
+    }
+  }
+  return { ok:true, rowsUpserted };
+}
+
 async function _upsertOddsSnapshots() {
   const sb  = getSupabase();
   const now = new Date().toISOString();
@@ -4156,11 +4285,11 @@ async function _upsertOddsSnapshots() {
   const cache = LIVE_MARKET_CACHE;
   if (!sb) {
     console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_supabase');
-    return;
+    return { ok:false, reason:'no_supabase', rowsUpserted:0 };
   }
   if (!cache.gameCount) {
     console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_games_in_cache');
-    return;
+    return { ok:false, reason:'no_games_in_cache', rowsUpserted:0 };
   }
 
   const provider = ODDS_PROVIDER === 'owls_insight' ? 'owls_insight' : 'odds-api';
@@ -4262,65 +4391,20 @@ async function _upsertOddsSnapshots() {
       ' seenEntries='+seenEntries+
       ' skipReasons='+JSON.stringify(skipReasons)+
       ' sampleSkips='+JSON.stringify(sampleSkips));
-    return;
+    return { ok:false, reason:'no_rows', rowsUpserted:0 };
   }
 
   console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length+
     ' seenEntries='+seenEntries+
     ' skipReasons='+JSON.stringify(skipReasons));
-  // One-shot schema introspection. Logs what columns the code is trying
-  // to write so a schema mismatch is visible in 30 seconds, not a week.
   await _logSnapshotSchemaOnce(sb, rows[0]);
-  try {
-    const { error: upsertErr } = await sb.from('odds_snapshots').upsert(rows,
-      { onConflict:'canonical_game_key,market_key,selection_key' });
-    if (upsertErr) throw upsertErr;
-    console.log('[snapshot] upserted '+rows.length+' odds snapshots');
-  } catch(e) {
-    // If the DB hasn't been migrated with the new canonical columns the
-    // upsert above fails with `column "canonical_market_key" does not exist`
-    // (PG code 42703). Retry once with the legacy projection so the system
-    // keeps working until the migration runs.
-    const msg = (e && e.message) || '';
-    const code = (e && (e.code||e.statusCode)) || '?';
-    // Surface the full error envelope BEFORE any retry decisions so we see
-    // what the DB actually returned even when the strip-fallback path runs.
-    console.warn(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR primary', e, rows));
-    // Drop any column the migration hasn't applied yet. We strip the
-    // priority-#11 canonical columns AND the priority-#12 player-prop +
-    // provider columns in one pass so a single retry covers either state.
-    if (/canonical_market_key|canonical_selection_key|market_type|player_name|prop_type|prop_side|player_team|provider_game_id/.test(msg)) {
-      console.warn('[snapshot] upsert: optional columns missing on DB, falling back to legacy projection (run the migration to enable structured identity)');
-      const legacyRows = rows.map(function(r) {
-        const copy = Object.assign({}, r);
-        delete copy.canonical_market_key;
-        delete copy.canonical_selection_key;
-        delete copy.market_type;
-        delete copy.player_name;
-        delete copy.player_name_normalized;
-        delete copy.prop_type;
-        delete copy.prop_type_normalized;
-        delete copy.prop_side;
-        delete copy.player_team;
-        delete copy.provider_game_id;
-        return copy;
-      });
-      try {
-        const { error: legacyErr } = await sb.from('odds_snapshots').upsert(legacyRows,
-          { onConflict:'canonical_game_key,market_key,selection_key' });
-        if (legacyErr) throw legacyErr;
-        console.log('[snapshot] upserted '+legacyRows.length+' odds snapshots (legacy projection)');
-        return;
-      } catch(e2) {
-        console.warn(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR legacy', e2, legacyRows));
-        return;
-      }
-    }
-    // Non-canonical error path (e.g. PGRST204 schema cache, 23505 unique
-    // violation, 42P10 conflict-target mismatch). Already logged above via
-    // _fmtSnapshotErr; nothing else to retry without code change.
-    void code;
+  const result = await _upsertSnapshotRowsChunked(sb, rows);
+  if (result.ok) {
+    console.log('[snapshot] upserted '+result.rowsUpserted+' odds snapshots in batches of '+SNAPSHOT_UPSERT_BATCH_SIZE);
+  } else {
+    console.error('[snapshot] upsert failed after '+result.rowsUpserted+' rows:', result.error);
   }
+  return result;
 }
 
 // Phase L: fail-closed odds verification
@@ -4415,6 +4499,15 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
                  acceptedOddsDecimal:null, isLive:false };
       }
       return { ok:false, code:'odds_service_unavailable', reason:'db_error', leg:leg.pick };
+    }
+  }
+
+  // Tier 3: fresh in-memory poll cache when DB row is missing or stale.
+  if (!snap || _classifyMarket(snap, nowMs) === 'stale') {
+    const cacheSnap = _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup);
+    if (cacheSnap) {
+      console.log('[snapshot] LIVE_CACHE_FALLBACK cKey='+cKey+' market='+marketForLookup+' pick='+pickForLookup);
+      snap = cacheSnap;
     }
   }
 
@@ -4615,8 +4708,17 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
 // Wire snapshot upsert into live cache poll
 const _origPoll = pollLiveOddsLoop;
 const pollLiveOddsLoopWithSnapshots = async function() {
-  await _origPoll();
-  _upsertOddsSnapshots().catch(()=>{});
+  try {
+    await _origPoll();
+  } catch (pollErr) {
+    console.error('[poll] pollLiveOddsLoop error:', pollErr.message);
+  }
+  try {
+    const r = await _upsertOddsSnapshots();
+    if (r && !r.ok) console.error('[poll] snapshot upsert failed:', r.reason || r.error);
+  } catch (upsertErr) {
+    console.error('[poll] snapshot upsert threw:', upsertErr.message);
+  }
 };
 // Re-register poller with snapshot write.
 // Live betting (DK-style) wants 5s refresh so price/score updates feel
@@ -5387,10 +5489,58 @@ function _getSuspendedMarkets(cache, nowMs) {
     }).filter(Boolean);
 }
 
+// Poll The Odds API directly and atomically replace LIVE_MARKET_CACHE.
+async function _runOddsApiPoll(trigger) {
+  if (!ODDS_KEY) {
+    console.log('[live cache] ODDS_API_KEY not set — skipping poll trigger='+trigger);
+    return false;
+  }
+  const start = Date.now();
+  const allGames = [];
+  try {
+    await Promise.all(CACHE_SPORTS.map(async function(sport) {
+      const games = await fetchOdds(sport);
+      if (Array.isArray(games)) allGames.push(...games);
+    }));
+    const fetchDurationMs = Date.now() - start;
+    const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+    if (newCache.sourceStatus === 'healthy') {
+      LIVE_MARKET_CACHE = newCache;
+      console.log('[live cache] updated trigger='+trigger+' games='+newCache.gameCount+
+        ' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
+      return true;
+    }
+    console.warn('[live cache] fetch returned empty trigger='+trigger+
+      ' — preserving previous cache ('+LIVE_MARKET_CACHE.gameCount+' games)');
+    _recordLiveDiagnosticEvent('provider_unhealthy', {
+      phase:'provider_poll', reason:'odds_api_empty_or_unhealthy', trigger
+    });
+  } catch(e) {
+    console.error('[live cache] poll error trigger='+trigger+' — preserving previous cache:', e.message);
+    _recordLiveDiagnosticEvent('provider_unhealthy', {
+      phase:'provider_poll', reason:'odds_api_poll_error', trigger
+    });
+  }
+  return false;
+}
+
 // Poll live odds and atomically replace cache
 async function pollLiveOddsLoop() {
+  const cacheAgeMs = _getLiveCacheAgeMs();
+  const criticallyStale = cacheAgeMs > CACHE_STALE_RECOVERY_MS;
+
   // Provider switch: Owls Insight vs The Odds API
-  console.log('[odds-provider] selected='+ODDS_PROVIDER+' hasOwlsKey='+(!!OWLS_KEY)+' hasOddsKey='+(!!ODDS_KEY));
+  console.log('[odds-provider] selected='+ODDS_PROVIDER+' hasOwlsKey='+(!!OWLS_KEY)+' hasOddsKey='+(!!ODDS_KEY)+
+    ' cacheAgeMs='+cacheAgeMs);
+
+  // When cache is critically stale, prefer Odds API refresh (bypasses Owls).
+  if (criticallyStale && ODDS_KEY) {
+    console.warn('[poll] cache critically stale ageMs='+cacheAgeMs+' — forcing Odds API refresh');
+    _oddsApiFallbackLastRun = Date.now();
+    await _runOddsApiPoll('cache_stale_recovery');
+    return;
+  }
+
   if (ODDS_PROVIDER === 'owls_insight') {
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
     const start = Date.now();
@@ -5511,46 +5661,22 @@ async function pollLiveOddsLoop() {
     // Owls failed or returned empty. Fall through to the Odds API path when:
     //   (a) the cache is empty (fresh deploy / first poll), OR
     //   (b) the cache is populated but stale (older than PREGAME_SNAPSHOT_TTL_MS)
-    // Rate-limited to 1 poll/min so Odds API quota is protected.
-    // With rate-limit=60s and TTL=120s the cache is always refreshed within the window.
-    const _cacheAgeForFb = LIVE_MARKET_CACHE.updatedAt
-        ? Date.now() - new Date(LIVE_MARKET_CACHE.updatedAt).getTime()
-        : Infinity;
-    if (!ODDS_KEY || (LIVE_MARKET_CACHE.gameCount > 0 && _cacheAgeForFb < PREGAME_SNAPSHOT_TTL_MS)) return;
+    // Rate-limited to 1 poll/min so Odds API quota is protected — unless critically stale.
+    const _cacheAgeForFb = _getLiveCacheAgeMs();
+    const _needsFallback = !LIVE_MARKET_CACHE.gameCount || _cacheAgeForFb >= PREGAME_SNAPSHOT_TTL_MS;
+    if (!ODDS_KEY || !_needsFallback) return;
     const _fbNow = Date.now();
-    if (_fbNow - _oddsApiFallbackLastRun < _ODDS_API_FALLBACK_INTERVAL_MS) return;
+    const _rateLimitOk = criticallyStale ||
+      (_fbNow - _oddsApiFallbackLastRun >= _ODDS_API_FALLBACK_INTERVAL_MS);
+    if (!_rateLimitOk) return;
     _oddsApiFallbackLastRun = _fbNow;
-    console.log('[owls-fallback] Owls unavailable + cache empty — running Odds API fallback poll (rate-limited 1/min)');
-    // fall through to Odds API path
+    console.log('[owls-fallback] Owls unavailable + cache stale ageMs='+_cacheAgeForFb+
+      ' — running Odds API fallback poll');
+    await _runOddsApiPoll('owls_fallback');
+    return;
   }
-  // Default: The Odds API
-  if (!ODDS_KEY) { console.log('[live cache] ODDS_API_KEY not set — skipping poll'); return; }
-  const start = Date.now();
-  const allGames = [];
-  try {
-    await Promise.all(CACHE_SPORTS.map(async function(sport) {
-      const games = await fetchOdds(sport);
-      if (Array.isArray(games)) allGames.push(...games);
-    }));
-    const fetchDurationMs = Date.now() - start;
-    const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
-    if (newCache.sourceStatus === 'healthy') {
-      LIVE_MARKET_CACHE = newCache; // atomic replace
-      console.log('[live cache] updated games='+newCache.gameCount+' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
-    } else {
-      console.warn('[live cache] fetch returned empty — preserving previous cache ('+LIVE_MARKET_CACHE.gameCount+' games)');
-      _recordLiveDiagnosticEvent('provider_unhealthy', {
-        phase:'provider_poll',
-        reason:'odds_api_empty_or_unhealthy'
-      });
-    }
-  } catch(e) {
-    console.error('[live cache] poll error — preserving previous cache:', e.message);
-    _recordLiveDiagnosticEvent('provider_unhealthy', {
-      phase:'provider_poll',
-      reason:'odds_api_poll_error'
-    });
-  }
+  // Default provider: The Odds API
+  await _runOddsApiPoll('primary');
 }
 
 // Start poller on boot
