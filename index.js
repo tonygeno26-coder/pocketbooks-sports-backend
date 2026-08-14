@@ -10051,6 +10051,30 @@ async function _loadSurvivorPool(sb, poolId) {
   return data || null;
 }
 
+function _survivorEntryLabel(username, n) {
+  return (username || 'Entry') + ' #' + n;
+}
+
+function _survivorEntryNum(row) {
+  const n = parseInt(row && (row.entry_number != null ? row.entry_number : row.entryNumber), 10);
+  return n > 0 ? n : 1;
+}
+
+function _survivorPublicEntry(e) {
+  if (!e) return null;
+  const num = _survivorEntryNum(e);
+  return {
+    id: e.id,
+    playerId: e.player_id,
+    playerUsername: e.player_username,
+    entryNumber: num,
+    entryLabel: e.entry_label || _survivorEntryLabel(e.player_username, num),
+    status: e.status,
+    eliminatedWeek: e.eliminated_week,
+    joinedAt: e.joined_at
+  };
+}
+
 // POST /api/survivor/create
 app.post('/api/survivor/create', async (req, res) => {
   const actor = requireActor(req);
@@ -10073,17 +10097,19 @@ app.post('/api/survivor/create', async (req, res) => {
       pool = ins.data;
     }
     if (!pool) return res.status(500).json({ ok:false, error:(lastErr&&lastErr.message)||'create_failed' });
+    const now = new Date().toISOString();
     const entry = await sb.from('survivor_entries').insert({
       pool_id: pool.id, player_id: String(actor.actorId),
-      player_username: username, status: 'alive'
+      player_username: username, status: 'alive',
+      entry_number: 1, entry_label: _survivorEntryLabel(username, 1),
+      approved_by: String(actor.actorId), approved_at: now
     });
     if (entry.error) console.warn('[survivor/create] auto-join failed', entry.error.message);
     res.json({ ok:true, poolId: pool.id, joinCode: pool.join_code });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// POST /api/survivor/join
-app.post('/api/survivor/join', async (req, res) => {
+async function _survivorRequestJoin(req, res) {
   const actor = requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
   const sb = getSupabase();
@@ -10096,18 +10122,47 @@ app.post('/api/survivor/join', async (req, res) => {
     if (pErr) throw pErr;
     if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
     if (pool.status !== 'active') return res.status(409).json({ ok:false, error:'pool_not_active' });
-    const username = await _survivorUsername(actor.actorId);
-    const { error: eErr } = await sb.from('survivor_entries').insert({
-      pool_id: pool.id, player_id: String(actor.actorId),
-      player_username: username, status: 'alive'
-    });
-    if (eErr) {
-      if (eErr.code === '23505') return res.status(409).json({ ok:false, error:'already_joined', poolId:pool.id, poolName:pool.name });
-      throw eErr;
+    const playerId = String(actor.actorId);
+    const { data: existingEntries, error: memErr } = await sb.from('survivor_entries')
+      .select('id').eq('pool_id', pool.id).eq('player_id', playerId).limit(1);
+    if (memErr) throw memErr;
+    if (existingEntries && existingEntries.length) {
+      return res.status(409).json({ ok:false, error:'already_member', poolId:pool.id, poolName:pool.name });
     }
-    res.json({ ok:true, poolId: pool.id, poolName: pool.name });
+    const username = await _survivorUsername(actor.actorId);
+    const { data: existingReq, error: rErr } = await sb.from('survivor_join_requests')
+      .select('*').eq('pool_id', pool.id).eq('player_id', playerId).maybeSingle();
+    if (rErr) throw rErr;
+    if (existingReq && existingReq.status === 'pending') {
+      return res.status(409).json({ ok:false, error:'already_requested', poolId:pool.id, poolName:pool.name });
+    }
+    if (existingReq && existingReq.status === 'approved') {
+      return res.status(409).json({ ok:false, error:'already_member', poolId:pool.id, poolName:pool.name });
+    }
+    if (existingReq && existingReq.status === 'denied') {
+      const { error: upErr } = await sb.from('survivor_join_requests').update({
+        status: 'pending', player_username: username, entries_granted: null,
+        requested_at: new Date().toISOString(), reviewed_at: null, reviewed_by: null
+      }).eq('id', existingReq.id);
+      if (upErr) throw upErr;
+    } else {
+      const { error: insErr } = await sb.from('survivor_join_requests').insert({
+        pool_id: pool.id, player_id: playerId, player_username: username, status: 'pending'
+      });
+      if (insErr) {
+        if (insErr.code === '23505') return res.status(409).json({ ok:false, error:'already_requested', poolId:pool.id, poolName:pool.name });
+        throw insErr;
+      }
+    }
+    res.json({
+      ok: true, poolId: pool.id, poolName: pool.name,
+      message: 'Request sent — waiting for pool runner approval'
+    });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
+}
+
+app.post('/api/survivor/request-join', _survivorRequestJoin);
+app.post('/api/survivor/join', _survivorRequestJoin);
 
 // GET /api/survivor/my-pools  (must be registered before /:poolId)
 app.get('/api/survivor/my-pools', async (req, res) => {
@@ -10116,31 +10171,66 @@ app.get('/api/survivor/my-pools', async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   try {
+    const playerId = String(actor.actorId);
     const { data: entries, error: eErr } = await sb.from('survivor_entries')
-      .select('*').eq('player_id', String(actor.actorId));
+      .select('*').eq('player_id', playerId);
     if (eErr) throw eErr;
+    const { data: pendingReqs, error: rErr } = await sb.from('survivor_join_requests')
+      .select('*').eq('player_id', playerId).eq('status', 'pending');
+    if (rErr) throw rErr;
     const list = entries || [];
-    if (!list.length) return res.json({ ok:true, pools:[] });
-    const ids = list.map(function(e){ return e.pool_id; });
-    const { data: pools, error: pErr } = await sb.from('survivor_pools').select('*').in('id', ids);
+    const pending = pendingReqs || [];
+    const ids = {};
+    list.forEach(function(e){ ids[e.pool_id] = true; });
+    pending.forEach(function(r){ ids[r.pool_id] = true; });
+    const poolIds = Object.keys(ids);
+    if (!poolIds.length) return res.json({ ok:true, pools:[] });
+    const { data: pools, error: pErr } = await sb.from('survivor_pools').select('*').in('id', poolIds);
     if (pErr) throw pErr;
     const byId = {};
     (pools||[]).forEach(function(p){ byId[p.id]=p; });
+    const hostPoolIds = (pools||[]).filter(function(p){ return String(p.created_by)===playerId; }).map(function(p){ return p.id; });
+    let pendingCounts = {};
+    if (hostPoolIds.length) {
+      const { data: hostReqs } = await sb.from('survivor_join_requests')
+        .select('pool_id').in('pool_id', hostPoolIds).eq('status', 'pending');
+      (hostReqs||[]).forEach(function(r){ pendingCounts[r.pool_id] = (pendingCounts[r.pool_id]||0)+1; });
+    }
+    const grouped = {};
+    list.forEach(function(e) {
+      if (!grouped[e.pool_id]) grouped[e.pool_id] = [];
+      grouped[e.pool_id].push(_survivorPublicEntry(e));
+    });
+    const pendingByPool = {};
+    pending.forEach(function(r){ pendingByPool[r.pool_id] = r; });
     res.json({
       ok: true,
-      pools: list.map(function(e) {
-        const p = byId[e.pool_id] || {};
+      pools: poolIds.map(function(id) {
+        const p = byId[id] || {};
+        const myEntries = (grouped[id]||[]).sort(function(a,b){ return a.entryNumber - b.entryNumber; });
+        const aliveN = myEntries.filter(function(e){ return e.status==='alive'; }).length;
+        const elimN = myEntries.filter(function(e){ return e.status==='eliminated'; }).length;
+        let myStatus = 'pending';
+        if (myEntries.length) {
+          if (aliveN && elimN) myStatus = 'mixed';
+          else if (aliveN) myStatus = 'alive';
+          else myStatus = 'eliminated';
+        }
+        const req = pendingByPool[id];
         return {
-          poolId: e.pool_id,
+          poolId: id,
           name: p.name || null,
           season: p.season,
           joinCode: p.join_code,
           status: p.status,
           currentWeek: p.current_week,
-          myStatus: e.status,
-          eliminatedWeek: e.eliminated_week,
-          isHost: String(p.created_by) === String(actor.actorId),
-          createdAt: p.created_at
+          myStatus: myStatus,
+          eliminatedWeek: myEntries.filter(function(e){ return e.status==='eliminated'; }).map(function(e){ return e.eliminatedWeek; })[0] || null,
+          isHost: String(p.created_by) === playerId,
+          createdAt: p.created_at,
+          entries: myEntries,
+          pendingRequest: !!req,
+          pendingRequestCount: pendingCounts[id] || 0
         };
       })
     });
@@ -10157,20 +10247,38 @@ app.get('/api/survivor/:poolId', async (req, res) => {
   try {
     const pool = await _loadSurvivorPool(sb, poolId);
     if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    const playerId = String(actor.actorId);
     const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
     if (eErr) throw eErr;
     const { data: weekPicks, error: wErr } = await sb.from('survivor_picks')
       .select('*').eq('pool_id', poolId).eq('week', pool.current_week);
     if (wErr) throw wErr;
     const { data: myPicks, error: mErr } = await sb.from('survivor_picks')
-      .select('week,team,result').eq('pool_id', poolId).eq('player_id', String(actor.actorId));
+      .select('week,team,result,entry_number,game_id').eq('pool_id', poolId).eq('player_id', playerId);
     if (mErr) throw mErr;
+    const { data: myReq } = await sb.from('survivor_join_requests')
+      .select('*').eq('pool_id', poolId).eq('player_id', playerId).maybeSingle();
     const phase = _survivorPhase(pool.current_week);
-    const usedTeams = (myPicks||[]).filter(function(p){
-      return _survivorPhase(p.week) === phase;
-    }).map(function(p){ return p.team; });
-    const myEntry = (entries||[]).find(function(e){ return String(e.player_id)===String(actor.actorId); }) || null;
+    const myEntries = (entries||[]).filter(function(e){ return String(e.player_id)===playerId; })
+      .sort(function(a,b){ return _survivorEntryNum(a)-_survivorEntryNum(b); });
+    const usedTeamsByEntry = {};
+    (myPicks||[]).forEach(function(p){
+      if (_survivorPhase(p.week) !== phase) return;
+      const n = _survivorEntryNum(p);
+      if (!usedTeamsByEntry[n]) usedTeamsByEntry[n] = [];
+      usedTeamsByEntry[n].push(p.team);
+    });
+    const usedTeams = usedTeamsByEntry[1] || [];
+    const myEntry = myEntries[0] || null;
     const deadlinePassed = _survivorDeadlinePassed(pool);
+    const isHost = _survivorIsHost(actor, pool);
+    let pendingRequestCount = 0;
+    if (isHost) {
+      const { data: pend, error: pendErr } = await sb.from('survivor_join_requests')
+        .select('id').eq('pool_id', poolId).eq('status', 'pending');
+      if (pendErr) throw pendErr;
+      pendingRequestCount = (pend||[]).length;
+    }
     res.json({
       ok: true,
       pool: {
@@ -10180,15 +10288,123 @@ app.get('/api/survivor/:poolId', async (req, res) => {
         pickDeadlineDay: pool.pick_deadline_day, pickDeadlineTime: pool.pick_deadline_time,
         createdBy: pool.created_by, createdAt: pool.created_at
       },
-      entries: entries||[],
+      entries: (entries||[]).map(_survivorPublicEntry),
       currentWeekPicks: weekPicks||[],
       usedTeams: usedTeams,
-      myPicks: myPicks||[],
-      myEntry: myEntry,
-      isHost: _survivorIsHost(actor, pool),
+      usedTeamsByEntry: usedTeamsByEntry,
+      myPicks: (myPicks||[]).map(function(p){
+        return { week:p.week, team:p.team, result:p.result, entryNumber:_survivorEntryNum(p), gameId:p.game_id };
+      }),
+      myEntry: _survivorPublicEntry(myEntry),
+      myEntries: myEntries.map(_survivorPublicEntry),
+      myJoinRequest: myReq ? {
+        status: myReq.status, requestedAt: myReq.requested_at,
+        entriesGranted: myReq.entries_granted
+      } : null,
+      pendingRequestCount: pendingRequestCount,
+      isHost: isHost,
       deadlinePassed: deadlinePassed,
       teams: NFL_SURVIVOR_TEAMS
     });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/survivor/:poolId/requests — pool runner only
+app.get('/api/survivor/:poolId/requests', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (!_survivorIsHost(actor, pool)) return res.status(403).json({ ok:false, error:'host_or_admin_only' });
+    const { data: rows, error } = await sb.from('survivor_join_requests')
+      .select('*').eq('pool_id', poolId).eq('status', 'pending').order('requested_at', { ascending:true });
+    if (error) throw error;
+    res.json({
+      ok: true,
+      requests: (rows||[]).map(function(r){
+        return {
+          playerId: r.player_id,
+          playerUsername: r.player_username,
+          requestedAt: r.requested_at,
+          status: r.status
+        };
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/survivor/:poolId/approve
+app.post('/api/survivor/:poolId/approve', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  const playerId = String((req.body&&req.body.playerId)||'').trim();
+  const entriesGranted = parseInt(req.body&&req.body.entriesGranted, 10);
+  if (!playerId) return res.status(400).json({ ok:false, error:'playerId_required' });
+  if ([1,2,3].indexOf(entriesGranted) < 0) return res.status(400).json({ ok:false, error:'entriesGranted_must_be_1_2_or_3' });
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (!_survivorIsHost(actor, pool)) return res.status(403).json({ ok:false, error:'host_or_admin_only' });
+    const { data: reqRow, error: rErr } = await sb.from('survivor_join_requests')
+      .select('*').eq('pool_id', poolId).eq('player_id', playerId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!reqRow) return res.status(404).json({ ok:false, error:'request_not_found' });
+    if (reqRow.status === 'approved') return res.status(409).json({ ok:false, error:'already_approved' });
+    const username = reqRow.player_username || await _survivorUsername(playerId);
+    const now = new Date().toISOString();
+    const { error: upErr } = await sb.from('survivor_join_requests').update({
+      status: 'approved', entries_granted: entriesGranted,
+      reviewed_at: now, reviewed_by: String(actor.actorId)
+    }).eq('id', reqRow.id);
+    if (upErr) throw upErr;
+    const rows = [];
+    for (let n=1; n<=entriesGranted; n++) {
+      rows.push({
+        pool_id: poolId,
+        player_id: playerId,
+        player_username: username,
+        status: 'alive',
+        entry_number: n,
+        entry_label: _survivorEntryLabel(username, n),
+        approved_by: String(actor.actorId),
+        approved_at: now
+      });
+    }
+    const { error: insErr } = await sb.from('survivor_entries').insert(rows);
+    if (insErr && insErr.code !== '23505') throw insErr;
+    res.json({ ok:true, entriesCreated: entriesGranted });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/survivor/:poolId/deny
+app.post('/api/survivor/:poolId/deny', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  const playerId = String((req.body&&req.body.playerId)||'').trim();
+  if (!playerId) return res.status(400).json({ ok:false, error:'playerId_required' });
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (!_survivorIsHost(actor, pool)) return res.status(403).json({ ok:false, error:'host_or_admin_only' });
+    const { data: reqRow, error: rErr } = await sb.from('survivor_join_requests')
+      .select('*').eq('pool_id', poolId).eq('player_id', playerId).maybeSingle();
+    if (rErr) throw rErr;
+    if (!reqRow) return res.status(404).json({ ok:false, error:'request_not_found' });
+    const { error: upErr } = await sb.from('survivor_join_requests').update({
+      status: 'denied', reviewed_at: new Date().toISOString(), reviewed_by: String(actor.actorId)
+    }).eq('id', reqRow.id);
+    if (upErr) throw upErr;
+    res.json({ ok:true });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -10202,7 +10418,9 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
   const week = parseInt(req.body&&req.body.week, 10);
   const team = String((req.body&&req.body.team)||'').trim();
   const gameId = (req.body&&req.body.gameId) ? String(req.body.gameId) : null;
+  const entryNumber = parseInt(req.body&&(req.body.entryNumber!=null?req.body.entryNumber:req.body.entry_number), 10) || 1;
   if (!week || !team) return res.status(400).json({ ok:false, error:'week_and_team_required' });
+  if ([1,2,3].indexOf(entryNumber) < 0) return res.status(400).json({ ok:false, error:'invalid_entryNumber' });
   const known = NFL_SURVIVOR_TEAMS.some(function(t){ return _survivorTeamMatches(t, team); });
   if (!known) return res.status(400).json({ ok:false, error:'unknown_team' });
   const canonical = NFL_SURVIVOR_TEAMS.find(function(t){ return _survivorTeamMatches(t, team); }) || team;
@@ -10212,12 +10430,12 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
     if (pool.status !== 'active') return res.status(409).json({ ok:false, error:'pool_not_active' });
     if (week !== pool.current_week) return res.status(400).json({ ok:false, error:'week_mismatch', currentWeek: pool.current_week });
     const { data: entry } = await sb.from('survivor_entries').select('*')
-      .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).maybeSingle();
+      .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).eq('entry_number', entryNumber).maybeSingle();
     if (!entry) return res.status(403).json({ ok:false, error:'not_in_pool' });
     if (entry.status !== 'alive') return res.status(403).json({ ok:false, error:'eliminated' });
     // Deadline is recorded for clients; strict lockout is not enforced yet.
     const { data: prior } = await sb.from('survivor_picks').select('*')
-      .eq('pool_id', poolId).eq('player_id', String(actor.actorId));
+      .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).eq('entry_number', entryNumber);
     const phase = _survivorPhase(week);
     const reused = (prior||[]).some(function(p){
       return p.week !== week
@@ -10235,7 +10453,7 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
       pick = upd.data; error = upd.error;
     } else {
       const ins = await sb.from('survivor_picks').insert({
-        pool_id: poolId, player_id: String(actor.actorId),
+        pool_id: poolId, player_id: String(actor.actorId), entry_number: entryNumber,
         week: week, team: canonical, game_id: gameId, result: 'pending', picked_at: now
       }).select().single();
       pick = ins.data; error = ins.error;
@@ -10244,8 +10462,8 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
       if (error.code === '23505') return res.status(409).json({ ok:false, error:'team_already_used' });
       throw error;
     }
-    if (pick) pick.phase = phase;
-    res.json({ ok:true, pick: pick, phase: phase });
+    if (pick) { pick.phase = phase; pick.entryNumber = _survivorEntryNum(pick); }
+    res.json({ ok:true, pick: pick, phase: phase, entryNumber: entryNumber });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -10273,8 +10491,10 @@ app.post('/api/survivor/:poolId/grade', async (req, res) => {
     const { data: picks, error: pErr } = await sb.from('survivor_picks')
       .select('*').eq('pool_id', poolId).eq('week', week);
     if (pErr) throw pErr;
-    const pickByPlayer = {};
-    (picks||[]).forEach(function(p){ pickByPlayer[String(p.player_id)] = p; });
+    const pickByEntry = {};
+    (picks||[]).forEach(function(p){
+      pickByEntry[String(p.player_id)+':'+_survivorEntryNum(p)] = p;
+    });
 
     const results = [];
     const eliminated = [];
@@ -10283,26 +10503,28 @@ app.post('/api/survivor/:poolId/grade', async (req, res) => {
 
     for (let i=0;i<(entries||[]).length;i++) {
       const entry = entries[i];
+      const entryNumber = _survivorEntryNum(entry);
+      const label = entry.entry_label || _survivorEntryLabel(entry.player_username, entryNumber);
       if (entry.status !== 'alive') continue;
-      const pick = pickByPlayer[String(entry.player_id)];
+      const pick = pickByEntry[String(entry.player_id)+':'+entryNumber];
       if (!pick) {
         await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
           .eq('id', entry.id);
-        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'no_pick' });
-        results.push({ playerId: entry.player_id, team: null, result:'lost', reason:'no_pick' });
+        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'no_pick' });
+        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: null, result:'lost', reason:'no_pick' });
         continue;
       }
       if (pick.result === 'won' || pick.result === 'lost') {
-        if (pick.result === 'lost') eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'already_lost' });
-        else survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
-        results.push({ playerId: entry.player_id, team: pick.team, result: pick.result, reason:'already_graded' });
+        if (pick.result === 'lost') eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'already_lost' });
+        else survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
+        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: pick.result, reason:'already_graded' });
         continue;
       }
       const game = _survivorGameForTeam(pick.team, games);
       if (!game || !game.completed) {
         pendingRemain++;
-        results.push({ playerId: entry.player_id, team: pick.team, result:'pending', reason: game ? 'game_not_final' : 'game_not_found' });
-        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
+        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result:'pending', reason: game ? 'game_not_final' : 'game_not_found' });
+        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
         continue;
       }
       const won = _survivorTeamWon(pick.team, game);
@@ -10311,21 +10533,23 @@ app.post('/api/survivor/:poolId/grade', async (req, res) => {
         result: result, graded_at: now, game_id: pick.game_id || game.id
       }).eq('id', pick.id);
       if (won) {
-        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
+        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
       } else {
         await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
           .eq('id', entry.id);
-        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'lost' });
+        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'lost' });
       }
-      results.push({ playerId: entry.player_id, team: pick.team, result: result, reason:'graded', gameId: game.id });
+      results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: result, reason:'graded', gameId: game.id });
     }
 
     let weekAdvanced = false;
     let currentWeek = pool.current_week;
     let status = pool.status;
     if (pendingRemain === 0) {
+      const elimIds = {};
+      eliminated.forEach(function(x){ elimIds[x.playerId+':'+x.entryNumber] = true; });
       const stillAlive = (entries||[]).filter(function(e){
-        return e.status === 'alive' && !eliminated.some(function(x){ return String(x.playerId)===String(e.player_id); });
+        return e.status === 'alive' && !elimIds[e.player_id+':'+_survivorEntryNum(e)];
       });
       if (stillAlive.length <= 1) {
         status = 'completed';
@@ -10358,26 +10582,38 @@ app.get('/api/survivor/:poolId/standings', async (req, res) => {
     const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
     if (eErr) throw eErr;
     const { data: weekPicks, error: wErr } = await sb.from('survivor_picks')
-      .select('player_id,team,result,week').eq('pool_id', poolId).eq('week', pool.current_week);
+      .select('player_id,team,result,week,entry_number').eq('pool_id', poolId).eq('week', pool.current_week);
     if (wErr) throw wErr;
     const anyGraded = (weekPicks||[]).some(function(p){ return p.result === 'won' || p.result === 'lost'; });
     const picksRevealed = anyGraded || _survivorDeadlinePassed(pool);
-    const nameById = {};
-    (entries||[]).forEach(function(e){ nameById[String(e.player_id)] = e.player_username; });
+    const nameByKey = {};
+    (entries||[]).forEach(function(e){
+      const n = _survivorEntryNum(e);
+      nameByKey[String(e.player_id)+':'+n] = e.entry_label || _survivorEntryLabel(e.player_username, n);
+    });
+    const publicEntries = (entries||[]).map(_survivorPublicEntry)
+      .sort(function(a,b){
+        const an = (a.playerUsername||'').toLowerCase();
+        const bn = (b.playerUsername||'').toLowerCase();
+        if (an < bn) return -1;
+        if (an > bn) return 1;
+        return a.entryNumber - b.entryNumber;
+      });
     res.json({
       ok: true,
       pool: {
         id: pool.id, name: pool.name, season: pool.season,
         status: pool.status, currentWeek: pool.current_week
       },
-      alive: (entries||[]).filter(function(e){ return e.status==='alive'; })
-        .map(function(e){ return { playerId:e.player_id, playerUsername:e.player_username }; }),
-      eliminated: (entries||[]).filter(function(e){ return e.status==='eliminated'; })
-        .map(function(e){ return { playerId:e.player_id, playerUsername:e.player_username, eliminatedWeek:e.eliminated_week }; }),
+      alive: publicEntries.filter(function(e){ return e.status==='alive'; }),
+      eliminated: publicEntries.filter(function(e){ return e.status==='eliminated'; }),
       thisWeekPicks: (weekPicks||[]).map(function(p){
+        const n = _survivorEntryNum(p);
         return {
           playerId: p.player_id,
-          playerUsername: nameById[String(p.player_id)] || null,
+          playerUsername: nameByKey[String(p.player_id)+':'+n] || null,
+          entryNumber: n,
+          entryLabel: nameByKey[String(p.player_id)+':'+n] || null,
           team: picksRevealed ? p.team : null,
           hasPick: true,
           result: picksRevealed ? p.result : 'hidden'
