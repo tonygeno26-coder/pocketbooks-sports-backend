@@ -2334,9 +2334,24 @@ app.post('/api/auth/signup', async (req, res) => {
 });
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const raw = String((req.body && (req.body.email || req.body.identifier)) || '').trim();
+  const password = req.body && req.body.password;
+  if (!raw || !password) return res.status(400).json({ error: 'Missing fields' });
+  const lower = raw.toLowerCase();
+  const alnum = raw.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  const candidates = [lower];
+  if (alnum) {
+    candidates.push('telegram+' + alnum + '@pocketbooks.local');
+    candidates.push('signal+' + alnum + '@pocketbooks.local');
+  }
   try {
-    const r = await query('SELECT * FROM users WHERE email=$1', [email.toLowerCase()]);
+    const r = await query(
+      `SELECT * FROM users
+       WHERE lower(email)=ANY($1::text[]) OR lower(name)=$2
+       ORDER BY CASE WHEN lower(email)=ANY($1::text[]) THEN 0 ELSE 1 END
+       LIMIT 1`,
+      [candidates, lower]
+    );
     const user = r.rows[0];
     if (!user) return res.status(400).json({ error: 'Invalid credentials' });
     if (!await bcrypt.compare(password, user.password)) return res.status(400).json({ error: 'Invalid credentials' });
@@ -2356,6 +2371,7 @@ app.get('/api/auth/me', auth, async (req, res) => {
 function genCode() { return Math.random().toString(36).substring(2,8).toUpperCase(); }
 
 app.post('/api/clubs', auth, async (req, res) => {
+  return res.status(403).json({ error: 'clubs_locked', message: 'Club creation is paused. Use Survivor Pool.' });
   const { name, description, max_bet, max_parlay } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   let code = genCode();
@@ -2382,6 +2398,7 @@ app.get('/api/clubs/search/:code', async (req, res) => {
 });
 
 app.post('/api/clubs/request', auth, async (req, res) => {
+  return res.status(403).json({ error: 'clubs_locked', message: 'Club join is paused. Use Survivor Pool.' });
   const { code } = req.body;
   try {
     const club = await query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
