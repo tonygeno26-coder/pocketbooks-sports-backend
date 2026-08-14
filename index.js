@@ -9901,8 +9901,463 @@ app.get('/api/grade/status', async (req, res) => {
 });
 // ════════════════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════════════════
+// SURVIVOR POOL MVP
+// ════════════════════════════════════════════════════════════════════════════
 
+const NFL_SURVIVOR_TEAMS = [
+  'Arizona Cardinals','Atlanta Falcons','Baltimore Ravens','Buffalo Bills',
+  'Carolina Panthers','Chicago Bears','Cincinnati Bengals','Cleveland Browns',
+  'Dallas Cowboys','Denver Broncos','Detroit Lions','Green Bay Packers',
+  'Houston Texans','Indianapolis Colts','Jacksonville Jaguars','Kansas City Chiefs',
+  'Las Vegas Raiders','Los Angeles Chargers','Los Angeles Rams','Miami Dolphins',
+  'Minnesota Vikings','New England Patriots','New Orleans Saints','New York Giants',
+  'New York Jets','Philadelphia Eagles','Pittsburgh Steelers','San Francisco 49ers',
+  'Seattle Seahawks','Tampa Bay Buccaneers','Tennessee Titans','Washington Commanders'
+];
 
+function _survivorNorm(s) {
+  return String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+
+function _survivorTeamMatches(a, b) {
+  const na = _survivorNorm(a), nb = _survivorNorm(b);
+  if (!na || !nb) return false;
+  return na === nb || na.indexOf(nb) >= 0 || nb.indexOf(na) >= 0;
+}
+
+async function _survivorUsername(actorId) {
+  try {
+    const r = await query('SELECT name FROM users WHERE id::text=$1 LIMIT 1', [String(actorId)]);
+    if (r.rows[0] && r.rows[0].name) return r.rows[0].name;
+  } catch(_e) {}
+  return null;
+}
+
+function _etParts(ms) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  });
+  const parts = dtf.formatToParts(new Date(ms||Date.now()));
+  const get = function(t){ return (parts.find(function(p){ return p.type===t; })||{}).value; };
+  const wd = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  return {
+    dow: wd[get('weekday')],
+    hour: parseInt(get('hour'),10)||0,
+    minute: parseInt(get('minute'),10)||0
+  };
+}
+
+// Best-effort Sunday 1pm ET reveal window. Strict kickoff/bye enforcement is not wired.
+function _survivorDeadlinePassed(pool, nowMs) {
+  const DAY_IDX = { sunday:0, monday:1, tuesday:2, wednesday:3, thursday:4, friday:5, saturday:6 };
+  const targetDow = DAY_IDX[String((pool&&pool.pick_deadline_day)||'Sunday').toLowerCase()];
+  if (targetDow == null) return false;
+  const timeParts = String((pool&&pool.pick_deadline_time)||'13:00').split(':');
+  const hh = isNaN(parseInt(timeParts[0],10)) ? 13 : parseInt(timeParts[0],10);
+  const mm = parseInt(timeParts[1],10)||0;
+  const et = _etParts(nowMs || Date.now());
+  let delta = et.dow - targetDow;
+  if (delta > 3) delta -= 7; // Thu–Sat sit before this week's Sunday
+  if (delta < 0) return false;
+  if (delta > 0) return true;
+  return et.hour > hh || (et.hour === hh && et.minute >= mm);
+}
+
+function _survivorIsHost(actor, pool) {
+  if (!actor || !pool) return false;
+  if (String(pool.created_by) === String(actor.actorId)) return true;
+  if (actor.platformRole === 'platform_admin') return true;
+  if ((ROLE_RANK[actor.role]||0) >= ROLE_RANK.full_admin) return true;
+  if (actor.role === 'owner') return true;
+  return false;
+}
+
+function _fetchNflScores(daysFrom) {
+  return new Promise(function(resolve) {
+    if (!ODDS_KEY) return resolve({ error:'ODDS_API_KEY not configured', games:[] });
+    const url = 'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey='+ODDS_KEY+'&daysFrom='+(daysFrom||7);
+    const req2 = require('https').get(url, function(r) {
+      let d = '';
+      r.on('data', function(c){ d += c; });
+      r.on('end', function() {
+        try {
+          const parsed = JSON.parse(d);
+          if (parsed && parsed.error_code) return resolve({ error: parsed.message||'odds_api_error', games:[] });
+          const games = (Array.isArray(parsed) ? parsed : []).map(function(g) {
+            const scores = g.scores || [];
+            const hs = parseInt((scores.find(function(s){ return s.name===g.home_team; })||{}).score||0, 10);
+            const as = parseInt((scores.find(function(s){ return s.name===g.away_team; })||{}).score||0, 10);
+            return {
+              id: g.id, home: g.home_team, away: g.away_team,
+              completed: !!g.completed, home_score: hs, away_score: as,
+              commence_time: g.commence_time
+            };
+          });
+          resolve({ games: games });
+        } catch(_e) { resolve({ error:'parse_error', games:[] }); }
+      });
+    });
+    req2.on('error', function(e){ resolve({ error:e.message, games:[] }); });
+    req2.setTimeout(8000, function(){ req2.destroy(); resolve({ error:'timeout', games:[] }); });
+  });
+}
+
+function _survivorGameForTeam(team, games) {
+  const list = games || [];
+  for (let i=0;i<list.length;i++) {
+    const g = list[i];
+    if (_survivorTeamMatches(team, g.home) || _survivorTeamMatches(team, g.away)) return g;
+  }
+  return null;
+}
+
+function _survivorTeamWon(team, game) {
+  if (!game || !game.completed) return null;
+  const homeWon = game.home_score > game.away_score;
+  const awayWon = game.away_score > game.home_score;
+  if (!homeWon && !awayWon) return false; // tie counts as a loss
+  if (_survivorTeamMatches(team, game.home)) return homeWon;
+  if (_survivorTeamMatches(team, game.away)) return awayWon;
+  return null;
+}
+
+async function _loadSurvivorPool(sb, poolId) {
+  const { data, error } = await sb.from('survivor_pools').select('*').eq('id', poolId).maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+// POST /api/survivor/create
+app.post('/api/survivor/create', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const name = String((req.body&&req.body.name)||'').trim();
+  const season = parseInt((req.body&&req.body.season)||2026, 10) || 2026;
+  if (!name) return res.status(400).json({ ok:false, error:'name_required' });
+  try {
+    const username = await _survivorUsername(actor.actorId);
+    let pool = null, lastErr = null;
+    for (let i=0;i<6 && !pool;i++) {
+      const joinCode = (typeof genCode==='function' ? genCode() : Math.random().toString(36).substring(2,8).toUpperCase());
+      const ins = await sb.from('survivor_pools').insert({
+        name, season, join_code: joinCode, created_by: String(actor.actorId),
+        status: 'active', current_week: 1
+      }).select().single();
+      if (ins.error) { lastErr = ins.error; continue; }
+      pool = ins.data;
+    }
+    if (!pool) return res.status(500).json({ ok:false, error:(lastErr&&lastErr.message)||'create_failed' });
+    const entry = await sb.from('survivor_entries').insert({
+      pool_id: pool.id, player_id: String(actor.actorId),
+      player_username: username, status: 'alive'
+    });
+    if (entry.error) console.warn('[survivor/create] auto-join failed', entry.error.message);
+    res.json({ ok:true, poolId: pool.id, joinCode: pool.join_code });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/survivor/join
+app.post('/api/survivor/join', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const joinCode = String((req.body&&req.body.joinCode)||'').trim().toUpperCase();
+  if (!joinCode) return res.status(400).json({ ok:false, error:'joinCode_required' });
+  try {
+    const { data: pool, error: pErr } = await sb.from('survivor_pools')
+      .select('*').eq('join_code', joinCode).maybeSingle();
+    if (pErr) throw pErr;
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (pool.status !== 'active') return res.status(409).json({ ok:false, error:'pool_not_active' });
+    const username = await _survivorUsername(actor.actorId);
+    const { error: eErr } = await sb.from('survivor_entries').insert({
+      pool_id: pool.id, player_id: String(actor.actorId),
+      player_username: username, status: 'alive'
+    });
+    if (eErr) {
+      if (eErr.code === '23505') return res.status(409).json({ ok:false, error:'already_joined', poolId:pool.id, poolName:pool.name });
+      throw eErr;
+    }
+    res.json({ ok:true, poolId: pool.id, poolName: pool.name });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/survivor/my-pools  (must be registered before /:poolId)
+app.get('/api/survivor/my-pools', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const { data: entries, error: eErr } = await sb.from('survivor_entries')
+      .select('*').eq('player_id', String(actor.actorId));
+    if (eErr) throw eErr;
+    const list = entries || [];
+    if (!list.length) return res.json({ ok:true, pools:[] });
+    const ids = list.map(function(e){ return e.pool_id; });
+    const { data: pools, error: pErr } = await sb.from('survivor_pools').select('*').in('id', ids);
+    if (pErr) throw pErr;
+    const byId = {};
+    (pools||[]).forEach(function(p){ byId[p.id]=p; });
+    res.json({
+      ok: true,
+      pools: list.map(function(e) {
+        const p = byId[e.pool_id] || {};
+        return {
+          poolId: e.pool_id,
+          name: p.name || null,
+          season: p.season,
+          joinCode: p.join_code,
+          status: p.status,
+          currentWeek: p.current_week,
+          myStatus: e.status,
+          eliminatedWeek: e.eliminated_week,
+          isHost: String(p.created_by) === String(actor.actorId),
+          createdAt: p.created_at
+        };
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/survivor/:poolId
+app.get('/api/survivor/:poolId', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
+    if (eErr) throw eErr;
+    const { data: weekPicks, error: wErr } = await sb.from('survivor_picks')
+      .select('*').eq('pool_id', poolId).eq('week', pool.current_week);
+    if (wErr) throw wErr;
+    const { data: myPicks, error: mErr } = await sb.from('survivor_picks')
+      .select('week,team,result').eq('pool_id', poolId).eq('player_id', String(actor.actorId));
+    if (mErr) throw mErr;
+    const usedTeams = (myPicks||[]).map(function(p){ return p.team; });
+    const myEntry = (entries||[]).find(function(e){ return String(e.player_id)===String(actor.actorId); }) || null;
+    const deadlinePassed = _survivorDeadlinePassed(pool);
+    res.json({
+      ok: true,
+      pool: {
+        id: pool.id, name: pool.name, season: pool.season, joinCode: pool.join_code,
+        status: pool.status, currentWeek: pool.current_week,
+        pickDeadlineDay: pool.pick_deadline_day, pickDeadlineTime: pool.pick_deadline_time,
+        createdBy: pool.created_by, createdAt: pool.created_at
+      },
+      entries: entries||[],
+      currentWeekPicks: weekPicks||[],
+      usedTeams: usedTeams,
+      myPicks: myPicks||[],
+      myEntry: myEntry,
+      isHost: _survivorIsHost(actor, pool),
+      deadlinePassed: deadlinePassed,
+      teams: NFL_SURVIVOR_TEAMS
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/survivor/:poolId/pick
+app.post('/api/survivor/:poolId/pick', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  const week = parseInt(req.body&&req.body.week, 10);
+  const team = String((req.body&&req.body.team)||'').trim();
+  const gameId = (req.body&&req.body.gameId) ? String(req.body.gameId) : null;
+  if (!week || !team) return res.status(400).json({ ok:false, error:'week_and_team_required' });
+  const known = NFL_SURVIVOR_TEAMS.some(function(t){ return _survivorTeamMatches(t, team); });
+  if (!known) return res.status(400).json({ ok:false, error:'unknown_team' });
+  const canonical = NFL_SURVIVOR_TEAMS.find(function(t){ return _survivorTeamMatches(t, team); }) || team;
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (pool.status !== 'active') return res.status(409).json({ ok:false, error:'pool_not_active' });
+    if (week !== pool.current_week) return res.status(400).json({ ok:false, error:'week_mismatch', currentWeek: pool.current_week });
+    const { data: entry } = await sb.from('survivor_entries').select('*')
+      .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).maybeSingle();
+    if (!entry) return res.status(403).json({ ok:false, error:'not_in_pool' });
+    if (entry.status !== 'alive') return res.status(403).json({ ok:false, error:'eliminated' });
+    // Deadline is recorded for clients; strict lockout is not enforced yet.
+    const { data: prior } = await sb.from('survivor_picks').select('*')
+      .eq('pool_id', poolId).eq('player_id', String(actor.actorId));
+    const reused = (prior||[]).some(function(p){
+      return p.week !== week && _survivorTeamMatches(p.team, canonical);
+    });
+    if (reused) return res.status(409).json({ ok:false, error:'team_already_used' });
+    const now = new Date().toISOString();
+    const existingWeek = (prior||[]).find(function(p){ return p.week === week; });
+    let pick, error;
+    if (existingWeek) {
+      const upd = await sb.from('survivor_picks').update({
+        team: canonical, game_id: gameId, result: 'pending', picked_at: now
+      }).eq('id', existingWeek.id).select().single();
+      pick = upd.data; error = upd.error;
+    } else {
+      const ins = await sb.from('survivor_picks').insert({
+        pool_id: poolId, player_id: String(actor.actorId),
+        week: week, team: canonical, game_id: gameId, result: 'pending', picked_at: now
+      }).select().single();
+      pick = ins.data; error = ins.error;
+    }
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ ok:false, error:'team_already_used' });
+      throw error;
+    }
+    res.json({ ok:true, pick: pick });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/survivor/:poolId/grade  — host/admin only
+app.post('/api/survivor/:poolId/grade', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  const week = parseInt(req.body&&req.body.week, 10);
+  if (!week) return res.status(400).json({ ok:false, error:'week_required' });
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    if (!_survivorIsHost(actor, pool)) return res.status(403).json({ ok:false, error:'host_or_admin_only' });
+    if (week !== pool.current_week) return res.status(400).json({ ok:false, error:'week_mismatch', currentWeek: pool.current_week });
+
+    const scores = await _fetchNflScores(7);
+    const games = scores.games || [];
+    const now = new Date().toISOString();
+
+    const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
+    if (eErr) throw eErr;
+    const { data: picks, error: pErr } = await sb.from('survivor_picks')
+      .select('*').eq('pool_id', poolId).eq('week', week);
+    if (pErr) throw pErr;
+    const pickByPlayer = {};
+    (picks||[]).forEach(function(p){ pickByPlayer[String(p.player_id)] = p; });
+
+    const results = [];
+    const eliminated = [];
+    const survivors = [];
+    let pendingRemain = 0;
+
+    for (let i=0;i<(entries||[]).length;i++) {
+      const entry = entries[i];
+      if (entry.status !== 'alive') continue;
+      const pick = pickByPlayer[String(entry.player_id)];
+      if (!pick) {
+        await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
+          .eq('id', entry.id);
+        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'no_pick' });
+        results.push({ playerId: entry.player_id, team: null, result:'lost', reason:'no_pick' });
+        continue;
+      }
+      if (pick.result === 'won' || pick.result === 'lost') {
+        if (pick.result === 'lost') eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'already_lost' });
+        else survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
+        results.push({ playerId: entry.player_id, team: pick.team, result: pick.result, reason:'already_graded' });
+        continue;
+      }
+      const game = _survivorGameForTeam(pick.team, games);
+      if (!game || !game.completed) {
+        pendingRemain++;
+        results.push({ playerId: entry.player_id, team: pick.team, result:'pending', reason: game ? 'game_not_final' : 'game_not_found' });
+        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
+        continue;
+      }
+      const won = _survivorTeamWon(pick.team, game);
+      const result = won ? 'won' : 'lost';
+      await sb.from('survivor_picks').update({
+        result: result, graded_at: now, game_id: pick.game_id || game.id
+      }).eq('id', pick.id);
+      if (won) {
+        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, team: pick.team });
+      } else {
+        await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
+          .eq('id', entry.id);
+        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, reason:'lost' });
+      }
+      results.push({ playerId: entry.player_id, team: pick.team, result: result, reason:'graded', gameId: game.id });
+    }
+
+    let weekAdvanced = false;
+    let currentWeek = pool.current_week;
+    let status = pool.status;
+    if (pendingRemain === 0) {
+      const stillAlive = (entries||[]).filter(function(e){
+        return e.status === 'alive' && !eliminated.some(function(x){ return String(x.playerId)===String(e.player_id); });
+      });
+      if (stillAlive.length <= 1) {
+        status = 'completed';
+        await sb.from('survivor_pools').update({ status: status }).eq('id', poolId);
+      } else {
+        currentWeek = pool.current_week + 1;
+        weekAdvanced = true;
+        await sb.from('survivor_pools').update({ current_week: currentWeek }).eq('id', poolId);
+      }
+    }
+
+    res.json({
+      ok: true, results: results, eliminated: eliminated, survivors: survivors,
+      weekAdvanced: weekAdvanced, currentWeek: currentWeek, status: status,
+      pendingRemain: pendingRemain,
+      scoresError: scores.error || null,
+      gamesChecked: games.length
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/survivor/:poolId/standings — no auth required
+app.get('/api/survivor/:poolId/standings', async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const poolId = String(req.params.poolId||'').trim();
+  try {
+    const pool = await _loadSurvivorPool(sb, poolId);
+    if (!pool) return res.status(404).json({ ok:false, error:'pool_not_found' });
+    const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
+    if (eErr) throw eErr;
+    const { data: weekPicks, error: wErr } = await sb.from('survivor_picks')
+      .select('player_id,team,result,week').eq('pool_id', poolId).eq('week', pool.current_week);
+    if (wErr) throw wErr;
+    const anyGraded = (weekPicks||[]).some(function(p){ return p.result === 'won' || p.result === 'lost'; });
+    const picksRevealed = anyGraded || _survivorDeadlinePassed(pool);
+    const nameById = {};
+    (entries||[]).forEach(function(e){ nameById[String(e.player_id)] = e.player_username; });
+    res.json({
+      ok: true,
+      pool: {
+        id: pool.id, name: pool.name, season: pool.season,
+        status: pool.status, currentWeek: pool.current_week
+      },
+      alive: (entries||[]).filter(function(e){ return e.status==='alive'; })
+        .map(function(e){ return { playerId:e.player_id, playerUsername:e.player_username }; }),
+      eliminated: (entries||[]).filter(function(e){ return e.status==='eliminated'; })
+        .map(function(e){ return { playerId:e.player_id, playerUsername:e.player_username, eliminatedWeek:e.eliminated_week }; }),
+      thisWeekPicks: (weekPicks||[]).map(function(p){
+        return {
+          playerId: p.player_id,
+          playerUsername: nameById[String(p.player_id)] || null,
+          team: picksRevealed ? p.team : null,
+          hasPick: true,
+          result: picksRevealed ? p.result : 'hidden'
+        };
+      }),
+      picksRevealed: picksRevealed
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   const _startSHA = 'v6-decode-fallback'; // bumped for v6
