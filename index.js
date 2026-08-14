@@ -9926,6 +9926,10 @@ function _survivorTeamMatches(a, b) {
   return na === nb || na.indexOf(nb) >= 0 || nb.indexOf(na) >= 0;
 }
 
+function _survivorPhase(week) {
+  return (parseInt(week, 10) || 0) <= 18 ? 'regular' : 'playoffs';
+}
+
 async function _survivorUsername(actorId) {
   try {
     const r = await query('SELECT name FROM users WHERE id::text=$1 LIMIT 1', [String(actorId)]);
@@ -10144,7 +10148,10 @@ app.get('/api/survivor/:poolId', async (req, res) => {
     const { data: myPicks, error: mErr } = await sb.from('survivor_picks')
       .select('week,team,result').eq('pool_id', poolId).eq('player_id', String(actor.actorId));
     if (mErr) throw mErr;
-    const usedTeams = (myPicks||[]).map(function(p){ return p.team; });
+    const phase = _survivorPhase(pool.current_week);
+    const usedTeams = (myPicks||[]).filter(function(p){
+      return _survivorPhase(p.week) === phase;
+    }).map(function(p){ return p.team; });
     const myEntry = (entries||[]).find(function(e){ return String(e.player_id)===String(actor.actorId); }) || null;
     const deadlinePassed = _survivorDeadlinePassed(pool);
     res.json({
@@ -10152,6 +10159,7 @@ app.get('/api/survivor/:poolId', async (req, res) => {
       pool: {
         id: pool.id, name: pool.name, season: pool.season, joinCode: pool.join_code,
         status: pool.status, currentWeek: pool.current_week,
+        phase: phase,
         pickDeadlineDay: pool.pick_deadline_day, pickDeadlineTime: pool.pick_deadline_time,
         createdBy: pool.created_by, createdAt: pool.created_at
       },
@@ -10193,8 +10201,11 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
     // Deadline is recorded for clients; strict lockout is not enforced yet.
     const { data: prior } = await sb.from('survivor_picks').select('*')
       .eq('pool_id', poolId).eq('player_id', String(actor.actorId));
+    const phase = _survivorPhase(week);
     const reused = (prior||[]).some(function(p){
-      return p.week !== week && _survivorTeamMatches(p.team, canonical);
+      return p.week !== week
+        && _survivorPhase(p.week) === phase
+        && _survivorTeamMatches(p.team, canonical);
     });
     if (reused) return res.status(409).json({ ok:false, error:'team_already_used' });
     const now = new Date().toISOString();
@@ -10216,7 +10227,8 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
       if (error.code === '23505') return res.status(409).json({ ok:false, error:'team_already_used' });
       throw error;
     }
-    res.json({ ok:true, pick: pick });
+    if (pick) pick.phase = phase;
+    res.json({ ok:true, pick: pick, phase: phase });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
