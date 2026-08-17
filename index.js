@@ -10262,13 +10262,16 @@ app.get('/api/survivor/:poolId', async (req, res) => {
     const myEntries = (entries||[]).filter(function(e){ return String(e.player_id)===playerId; })
       .sort(function(a,b){ return _survivorEntryNum(a)-_survivorEntryNum(b); });
     const usedTeamsByEntry = {};
+    myEntries.forEach(function(e){
+      usedTeamsByEntry[_survivorEntryNum(e)] = [];
+    });
     (myPicks||[]).forEach(function(p){
       if (_survivorPhase(p.week) !== phase) return;
       const n = _survivorEntryNum(p);
       if (!usedTeamsByEntry[n]) usedTeamsByEntry[n] = [];
-      usedTeamsByEntry[n].push(p.team);
+      usedTeamsByEntry[n].push({ team: p.team, week: p.week });
     });
-    const usedTeams = usedTeamsByEntry[1] || [];
+    const usedTeams = usedTeamsByEntry[1] || usedTeamsByEntry[_survivorEntryNum(myEntries[0])] || [];
     const myEntry = myEntries[0] || null;
     const deadlinePassed = _survivorDeadlinePassed(pool);
     const isHost = _survivorIsHost(actor, pool);
