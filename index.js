@@ -222,10 +222,17 @@ function rateLimitMiddleware(req, res, next) {
 
 // ─ CORS hardening ───────────────────────────────────────────────────────────────────
 const _IS_PROD_CORS = process.env.NODE_ENV==='production';
-const _ALLOWED_ORIGINS_RAW = process.env.ALLOWED_ORIGINS
-  ? process.env.ALLOWED_ORIGINS.split(',').map(function(s){ return s.trim(); })
-  : ['https://pocketbooks-sports.vercel.app',
-     'https://pocketbooks-sports-git-main.vercel.app'];
+const _ALWAYS_ALLOWED_ORIGINS = [
+  'https://pocketbookssports.com',
+  'https://www.pocketbookssports.com',
+];
+const _ALLOWED_ORIGINS_RAW = [
+  ...(process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(function(s){ return s.trim(); }).filter(Boolean)
+    : ['https://pocketbooks-sports.vercel.app',
+       'https://pocketbooks-sports-git-main.vercel.app']),
+  ..._ALWAYS_ALLOWED_ORIGINS,
+].filter(function(origin, i, arr){ return origin && arr.indexOf(origin) === i; });
 
 const _DEV_ORIGINS_EXTRA = ['http://localhost:3000','http://localhost:5000',
                              'http://localhost:8080','http://localhost:3001'];
