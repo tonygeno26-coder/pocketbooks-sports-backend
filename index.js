@@ -2340,6 +2340,27 @@ app.post('/api/auth/signup', async (req, res) => {
   }
 });
 
+// Login identifier columns on public.users. Postgres schema uses `name`
+// (display name). Supabase mirror may also have display_name / username.
+const LOGIN_NAME_COL_CANDIDATES = ['name', 'display_name', 'username'];
+let _loginNameCols = null;
+async function getLoginNameColumns() {
+  if (_loginNameCols) return _loginNameCols;
+  try {
+    const r = await query(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_schema='public' AND table_name='users'
+         AND column_name = ANY($1::text[])`,
+      [LOGIN_NAME_COL_CANDIDATES]
+    );
+    _loginNameCols = r.rows.map(row => row.column_name);
+  } catch (_e) {
+    _loginNameCols = ['name'];
+  }
+  if (!_loginNameCols.length) _loginNameCols = ['name'];
+  return _loginNameCols;
+}
+
 app.post('/api/auth/login', async (req, res) => {
   const raw = String((req.body && (req.body.email || req.body.identifier)) || '').trim();
   const password = req.body && req.body.password;
@@ -2352,9 +2373,11 @@ app.post('/api/auth/login', async (req, res) => {
     candidates.push('signal+' + alnum + '@pocketbooks.local');
   }
   try {
+    const nameCols = await getLoginNameColumns();
+    const nameMatch = nameCols.map(c => `lower(trim(${c}))=$2`).join(' OR ');
     const r = await query(
       `SELECT * FROM users
-       WHERE lower(email)=ANY($1::text[]) OR lower(name)=$2
+       WHERE lower(email)=ANY($1::text[]) OR ${nameMatch}
        ORDER BY CASE WHEN lower(email)=ANY($1::text[]) THEN 0 ELSE 1 END
        LIMIT 1`,
       [candidates, lower]
