@@ -11383,27 +11383,65 @@ function _etParts(ms) {
   const parts = dtf.formatToParts(new Date(ms||Date.now()));
   const get = function(t){ return (parts.find(function(p){ return p.type===t; })||{}).value; };
   const wd = { Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6 };
+  let hour = parseInt(get('hour'), 10);
+  if (hour === 24) hour = 0;
   return {
     dow: wd[get('weekday')],
-    hour: parseInt(get('hour'),10)||0,
-    minute: parseInt(get('minute'),10)||0
+    year: parseInt(get('year'), 10),
+    month: parseInt(get('month'), 10),
+    day: parseInt(get('day'), 10),
+    hour: hour || 0,
+    minute: parseInt(get('minute'), 10) || 0
   };
 }
 
-// Best-effort Sunday 1pm ET reveal window. Strict kickoff/bye enforcement is not wired.
-function _survivorDeadlinePassed(pool, nowMs) {
+// Convert an America/New_York wall clock to UTC ms.
+// 13:00 ET = 18:00 UTC in EST (winter); 17:00 UTC in EDT (summer).
+function _nyWallToUtcMs(year, month, day, hour, minute) {
+  const candidates = [
+    Date.UTC(year, month - 1, day, hour + 4, minute), // EDT
+    Date.UTC(year, month - 1, day, hour + 5, minute)  // EST
+  ];
+  for (let i = 0; i < candidates.length; i++) {
+    const et = _etParts(candidates[i]);
+    if (et.year === year && et.month === month && et.day === day && et.hour === hour && et.minute === minute)
+      return candidates[i];
+  }
+  return Date.UTC(year, month - 1, day, hour + 5, minute); // EST fallback = 18:00 UTC for 13:00
+}
+
+function _etAddDays(year, month, day, delta) {
+  const noon = _nyWallToUtcMs(year, month, day, 12, 0);
+  const et = _etParts(noon + delta * 86400000);
+  return { year: et.year, month: et.month, day: et.day };
+}
+
+// Sunday 1:00 PM America/New_York of the current NFL week (Thu–Wed).
+// TNF does not move this deadline. Uses pool.pick_deadline_day/time when set
+// (defaults Sunday 13:00). Dynamic — no stored deadline column required.
+function _survivorPickDeadlineMs(pool, nowMs) {
+  const now = nowMs || Date.now();
   const DAY_IDX = { sunday:0, monday:1, tuesday:2, wednesday:3, thursday:4, friday:5, saturday:6 };
-  const targetDow = DAY_IDX[String((pool&&pool.pick_deadline_day)||'Sunday').toLowerCase()];
-  if (targetDow == null) return false;
-  const timeParts = String((pool&&pool.pick_deadline_time)||'13:00').split(':');
-  const hh = isNaN(parseInt(timeParts[0],10)) ? 13 : parseInt(timeParts[0],10);
-  const mm = parseInt(timeParts[1],10)||0;
-  const et = _etParts(nowMs || Date.now());
-  let delta = et.dow - targetDow;
-  if (delta > 3) delta -= 7; // Thu–Sat sit before this week's Sunday
-  if (delta < 0) return false;
-  if (delta > 0) return true;
-  return et.hour > hh || (et.hour === hh && et.minute >= mm);
+  const targetDow = DAY_IDX[String((pool && pool.pick_deadline_day) || 'Sunday').toLowerCase()];
+  const dow = (targetDow == null) ? 0 : targetDow;
+  const timeParts = String((pool && pool.pick_deadline_time) || '13:00').split(':');
+  const hh = isNaN(parseInt(timeParts[0], 10)) ? 13 : parseInt(timeParts[0], 10);
+  const mm = parseInt(timeParts[1], 10) || 0;
+  const et = _etParts(now);
+  // Thu–Sat sit before this week's Sunday; Sun–Wed use this week's Sunday.
+  let delta = (et.dow >= 4) ? (7 - et.dow) : -et.dow;
+  delta += dow;
+  const sun = _etAddDays(et.year, et.month, et.day, delta);
+  return _nyWallToUtcMs(sun.year, sun.month, sun.day, hh, mm);
+}
+
+function _survivorPickDeadlineIso(pool, nowMs) {
+  return new Date(_survivorPickDeadlineMs(pool, nowMs)).toISOString();
+}
+
+function _survivorDeadlinePassed(pool, nowMs) {
+  const now = nowMs || Date.now();
+  return now >= _survivorPickDeadlineMs(pool, now);
 }
 
 function _survivorIsHost(actor, pool) {
@@ -11708,6 +11746,7 @@ app.get('/api/survivor/:poolId', async (req, res) => {
         status: pool.status, currentWeek: pool.current_week,
         phase: phase,
         pickDeadlineDay: pool.pick_deadline_day, pickDeadlineTime: pool.pick_deadline_time,
+        pickDeadline: _survivorPickDeadlineIso(pool),
         createdBy: pool.created_by, createdAt: pool.created_at
       },
       entries: (entries||[]).map(_survivorPublicEntry),
@@ -11726,6 +11765,7 @@ app.get('/api/survivor/:poolId', async (req, res) => {
       pendingRequestCount: pendingRequestCount,
       isHost: isHost,
       deadlinePassed: deadlinePassed,
+      pickDeadline: _survivorPickDeadlineIso(pool),
       teams: NFL_SURVIVOR_TEAMS
     });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -11855,7 +11895,11 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
       .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).eq('entry_number', entryNumber).maybeSingle();
     if (!entry) return res.status(403).json({ ok:false, error:'not_in_pool' });
     if (entry.status !== 'alive') return res.status(403).json({ ok:false, error:'eliminated' });
-    // Deadline is recorded for clients; strict lockout is not enforced yet.
+    if (_survivorDeadlinePassed(pool)) {
+      return res.status(403).json({
+        ok: false, error: 'picks_locked', deadline: _survivorPickDeadlineIso(pool)
+      });
+    }
     const { data: prior } = await sb.from('survivor_picks').select('*')
       .eq('pool_id', poolId).eq('player_id', String(actor.actorId)).eq('entry_number', entryNumber);
     const phase = _survivorPhase(week);
