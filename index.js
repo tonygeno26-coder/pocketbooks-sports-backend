@@ -1710,6 +1710,13 @@ function getSupabase() {
   return _supabase;
 }
 
+// Live ticket_legs.odds_snapshot_id is uuid; odds_snapshots.snapshot_id is a
+// text key like "mlb|Team|...|moneyline|...|ts". Only pass real UUIDs.
+function _uuidOrNull(v) {
+  return (typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v))
+    ? v : null;
+}
+
 // Fire-and-forget mirror: never throws, never blocks.
 async function mirrorTicketToSupabase(ticket) {
   const sb = getSupabase();
@@ -1740,7 +1747,7 @@ async function mirrorTicketToSupabase(ticket) {
     if (sels.length) {
       const legRows = sels.map(function(sel, i) {
         return {
-          id:                 sel.legId || (ticketId + '_leg' + i),
+          id:                 crypto.randomUUID(),
           ticket_id:          ticketId,
           leg_index:          i,
           provider_name:      sel.providerName      || 'odds-api',
@@ -8838,7 +8845,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
             accepted_odds_american: leg.accepted_odds_american||null,
             accepted_odds_decimal:  leg.accepted_odds_decimal||null,
             accepted_point_line:    leg.accepted_point_line||null,
-            odds_snapshot_id:       leg.odds_snapshot_id||null,
+            odds_snapshot_id:       _uuidOrNull(leg.odds_snapshot_id),
             accepted_at:            leg.accepted_at||null,
             market_type:              ident.marketType || _coerceMarketType(leg.market) || leg.market,
             canonical_market_key:     ident.canonicalMarketKey || null,
@@ -8987,7 +8994,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         accepted_odds_american: leg.accepted_odds_american||null,
         accepted_odds_decimal:  leg.accepted_odds_decimal||null,
         accepted_point_line:    leg.accepted_point_line||null,
-        odds_snapshot_id:       leg.odds_snapshot_id||null,
+        odds_snapshot_id:       _uuidOrNull(leg.odds_snapshot_id),
         accepted_at:            leg.accepted_at||null,
         // Canonical identity (priority #11). Optional columns — DB without
         // them gets stripped automatically by the catch below.
