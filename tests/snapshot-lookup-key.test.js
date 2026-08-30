@@ -74,10 +74,17 @@ function _gameKeyLookupCandidates(cKey) {
   return out;
 }
 
-function _normalizePickForSnapshotLookup(pick) {
+function _stripToWinSuffix(pick) {
   return String(pick || '')
-    .toLowerCase()
+    .replace(/\s+/g, ' ')
     .replace(/\s+to\s+win\s*$/i, '')
+    .replace(/\s+ml\s*$/i, '')
+    .trim();
+}
+
+function _normalizePickForSnapshotLookup(pick) {
+  return _stripToWinSuffix(pick)
+    .toLowerCase()
     .replace(/\s[+-]?\d+\.?\d*$/, '')
     .trim();
 }
@@ -90,9 +97,21 @@ test('index.js logs searched key, market, selection, and found/miss', function()
   assert(indexSource.includes('SNAPSHOT_LOOKUP_MISS'), 'MISS log missing');
   assert(indexSource.includes('cKey='), 'must log canonicalGameKey');
   assert(indexSource.includes('marketForLookup='), 'must log market');
+  assert(indexSource.includes('pickClean='), 'must log pickClean alongside raw pick');
   assert(indexSource.includes('selection='), 'must log selection');
   assert(indexSource.includes('found=true') || indexSource.includes("found=true"), 'must log found=true');
   assert(indexSource.includes('closestHint='), 'miss path must log closest keys, not dump table');
+});
+
+test('verify path uses pickClean for identity and selection_key query', function() {
+  assert(indexSource.includes('const pickClean = _stripToWinSuffix(pick)'),
+    'must compute pickClean from raw pick before lookup');
+  assert(indexSource.includes('pick: pickClean'),
+    'must pass pickClean into _normalizeLegIdentity so canonical key is not miami_marlins_to_win');
+  assert(indexSource.includes(".eq('selection_key', pickForLookup)"),
+    'legacy query must use pickForLookup (cleaned), not raw pick');
+  assert(indexSource.includes('_lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup)'),
+    'live-cache lookup must use cleaned pickForLookup');
 });
 
 test('mlb short prefix expands to baseball_mlb Owls key', function() {
@@ -119,6 +138,11 @@ test('already-correct Owls key is preserved', function() {
 test('moneyline To Win suffix is stripped for selection_key', function() {
   assertEq(_normalizePickForSnapshotLookup('Colorado Rockies To Win'), 'colorado rockies');
   assertEq(_normalizePickForSnapshotLookup('Boston Red Sox to win'), 'boston red sox');
+  assertEq(_normalizePickForSnapshotLookup('Miami Marlins To Win'), 'miami marlins');
+  assertEq(_normalizePickForSnapshotLookup('Miami  Marlins   To  Win'), 'miami marlins');
+  assertEq(_normalizePickForSnapshotLookup('Miami Marlins ML'), 'miami marlins');
+  assertEq(_stripToWinSuffix('Miami Marlins To Win'), 'Miami Marlins');
+  assertEq(_stripToWinSuffix('Miami Marlins to win'), 'Miami Marlins');
 });
 
 test('totals pick strips the numeric line for selection_key over/under', function() {

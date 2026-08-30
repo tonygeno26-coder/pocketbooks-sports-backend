@@ -3884,7 +3884,11 @@ function _buildCanonicalSelectionKey(input) {
   const line = (input.line != null && Number.isFinite(parseFloat(input.line)))
                   ? parseFloat(input.line) : null;
   if (mt === MARKET_TYPES.MONEYLINE || mt === MARKET_TYPES.PERIOD_MONEYLINE) {
-    return _normalizePlayerName(input.team || input.teamOrSide || input.selection || '');
+    // Strip lobby suffixes before slugifying — otherwise
+    // "Miami Marlins To Win" becomes "miami_marlins_to_win" and misses
+    // the DB key "miami_marlins".
+    const team = _stripToWinSuffix(input.team || input.teamOrSide || input.selection || '');
+    return _normalizePlayerName(team);
   }
   if (mt === MARKET_TYPES.SPREAD || mt === MARKET_TYPES.PERIOD_SPREAD) {
     const team = _normalizePlayerName(input.team || input.teamOrSide || '');
@@ -3987,17 +3991,19 @@ function _normalizeLegIdentity(leg) {
   // and extract the line so _buildCanonicalSelectionKey can produce a valid
   // spread key ("team_slug:1.5"). Without this, leg.line is null and the
   // canonical key is null → Tier 1 is skipped entirely.
-  let _teamForKey = leg.team || leg.teamOrSide || null;
+  let _teamForKey = _stripToWinSuffix(leg.team || leg.teamOrSide || '');
+  if (!_teamForKey) _teamForKey = null;
   let _lineForKey = line;
   if (isTeamMarket && !_teamForKey && leg.pick) {
-    const _m = leg.pick.match(/^(.*?)\s+([+-]?\d+\.?\d*)\s*$/);
+    const _pickClean = _stripToWinSuffix(leg.pick);
+    const _m = _pickClean.match(/^(.*?)\s+([+-]?\d+\.?\d*)\s*$/);
     if (_m) {
       _teamForKey = _m[1].trim();
       if (_lineForKey == null) _lineForKey = parseFloat(_m[2]);
     } else {
       // Lobby moneyline labels are "Colorado Rockies To Win" — strip the suffix
       // so the canonical key matches DB selection_key "colorado rockies".
-      _teamForKey = String(leg.pick).replace(/\s+to\s+win\s*$/i, '').trim();
+      _teamForKey = _pickClean;
     }
   }
   // Totals: lobby pick is "Over 9" / "Under 8.5" and often omits leg.line.
@@ -4013,7 +4019,7 @@ function _normalizeLegIdentity(leg) {
 
   const canonicalSelectionKey = _buildCanonicalSelectionKey({
     marketType,
-    team:   _teamForKey || (isTeamMarket ? String(leg.pick||'').replace(/\s+to\s+win\s*$/i, '').trim() : null),
+    team:   _teamForKey || (isTeamMarket ? _stripToWinSuffix(leg.pick) : null),
     player: playerName,
     side:   _sideForKey || (isSideMarket ? leg.pick : null),
     line:   _lineForKey,
@@ -4269,7 +4275,7 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
   const cacheAgeMs = _getLiveCacheAgeMs();
   if (!Number.isFinite(cacheAgeMs) || cacheAgeMs > PREGAME_SNAPSHOT_TTL_MS) return null;
 
-  const pickNorm = (pickForLookup || '').toLowerCase().trim();
+  const pickNorm = _normalizePickForSnapshotLookup(pickForLookup);
   const marketNorm = (marketForLookup || 'moneyline').toLowerCase();
   const mapKey = cKey + '|' + marketNorm;
   const byKey = cache.marketsByCanonicalKey || {};
@@ -4294,7 +4300,7 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
     } else {
       return null;
     }
-    if (legacySelectionKey !== pickNorm) return null;
+    if (_normalizePickForSnapshotLookup(legacySelectionKey) !== pickNorm) return null;
     const oddsAmerican = Math.round(_toAmericanOdds(Number(rawOdds)));
     if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) return null;
     const oddsDecimal = _americanToDecimalOdds(oddsAmerican);
@@ -4570,10 +4576,19 @@ function _gameKeyLookupCandidates(cKey) {
   return out;
 }
 
-function _normalizePickForSnapshotLookup(pick) {
+// Strip lobby moneyline suffixes ("To Win", extra spaces) but keep the
+// numeric line so totals/spreads can still parse "Over 9" → side+line.
+function _stripToWinSuffix(pick) {
   return String(pick || '')
-    .toLowerCase()
+    .replace(/\s+/g, ' ')
     .replace(/\s+to\s+win\s*$/i, '')
+    .replace(/\s+ml\s*$/i, '')
+    .trim();
+}
+
+function _normalizePickForSnapshotLookup(pick) {
+  return _stripToWinSuffix(pick)
+    .toLowerCase()
     .replace(/\s[+-]?\d+\.?\d*$/, '')
     .trim();
 }
@@ -4646,8 +4661,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   // Normalize display-label market names to the DB-stored keys for Tier 2 lookup.
   // e.g. "to win" → "moneyline", "run line" / "puck line" → "spread"
   const marketForLookup = _coerceMarketType(market) || market;
-  const pick   = (leg.pick||'').toLowerCase();
-  const pickForLookup = _normalizePickForSnapshotLookup(pick);
+  const pick   = String(leg.pick || '');
+  const pickClean = _stripToWinSuffix(pick);
+  const pickForLookup = _normalizePickForSnapshotLookup(pickClean);
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
   const bypassOk = !IS_PRODUCTION;
@@ -4657,7 +4673,10 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   // ----- Canonical identity (priority #11) -----
   // Rebuild identity against the Owls-style game key so canonical_market_key
   // matches what _upsertOddsSnapshots wrote (baseball_mlb|Away|Home|date|total).
-  const ident = _normalizeLegIdentity(Object.assign({}, leg, { canonicalGameKey: preferredKey })) || {};
+  const ident = _normalizeLegIdentity(Object.assign({}, leg, {
+    canonicalGameKey: preferredKey,
+    pick: pickClean
+  })) || {};
   const cmk = ident.canonicalMarketKey || null;
   const csk = ident.canonicalSelectionKey || null;
 
@@ -4667,6 +4686,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     + ' market=' + JSON.stringify(market)
     + ' marketForLookup=' + JSON.stringify(marketForLookup)
     + ' pick=' + JSON.stringify(pick)
+    + ' pickClean=' + JSON.stringify(pickClean)
     + ' selection=' + JSON.stringify(pickForLookup)
     + ' cmk=' + JSON.stringify(cmk)
     + ' csk=' + JSON.stringify(csk)
@@ -6154,9 +6174,11 @@ function validateLegOdds(leg, liveMap, nowMs) {
   if (liveMarket.suspended) return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
   if (liveMarket.closed)    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'closed' };
 
-  // Match outcome by pick name (case-insensitive)
+  // Match outcome by pick name (case-insensitive). Strip "To Win" so
+  // lobby "Miami Marlins To Win" matches provider outcome "Miami Marlins".
+  const pickNorm = _normalizePickForSnapshotLookup(leg.pick);
   const outcome = (liveMarket.outcomes||[]).find(o =>
-    o.name && leg.pick && o.name.toLowerCase() === leg.pick.toLowerCase()
+    o.name && pickNorm && _normalizePickForSnapshotLookup(o.name) === pickNorm
   );
   if (!outcome) return { ok:false, code:'market_closed', leg:leg.pick, reason:'outcome_not_found' };
 
@@ -6194,8 +6216,9 @@ function buildAcceptedOddsSnapshotFromCache(legs, cache) {
     const entry =
       (leg.providerGameId && cache.marketsByProviderGameId[leg.providerGameId+'|'+mLabel]) ||
       (leg.canonicalGameKey && cache.marketsByCanonicalKey[leg.canonicalGameKey+'|'+mLabel]);
+    const pickNorm = _normalizePickForSnapshotLookup(leg.pick);
     const outcome = entry && (entry.outcomes||[]).find(o =>
-      o.name && o.name.toLowerCase() === (leg.pick||'').toLowerCase());
+      o.name && pickNorm && _normalizePickForSnapshotLookup(o.name) === pickNorm);
     return Object.assign({}, leg, { odds: outcome ? outcome.price : leg.odds, oddsAcceptedAt: now });
   });
 }
@@ -6207,8 +6230,9 @@ function buildAcceptedOddsSnapshot(legs, liveMap) {
     const mLabel = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
     const liveMarket = (leg.providerGameId && liveMap[leg.providerGameId+'|'+mLabel]) ||
                        (leg.canonicalGameKey && liveMap[leg.canonicalGameKey+'|'+mLabel]);
+    const pickNorm = _normalizePickForSnapshotLookup(leg.pick);
     const outcome = liveMarket && (liveMarket.outcomes||[]).find(o =>
-      o.name && o.name.toLowerCase() === (leg.pick||'').toLowerCase());
+      o.name && pickNorm && _normalizePickForSnapshotLookup(o.name) === pickNorm);
     return Object.assign({}, leg, { odds: outcome ? outcome.price : leg.odds, oddsAcceptedAt: now });
   });
 }
