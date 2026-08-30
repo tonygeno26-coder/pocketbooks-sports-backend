@@ -11517,6 +11517,18 @@ const NFL_SURVIVOR_TEAMS = [
   'Seattle Seahawks','Tampa Bay Buccaneers','Tennessee Titans','Washington Commanders'
 ];
 
+const ESPN_ABBREV_TO_TEAM = {
+  ARI:'Arizona Cardinals', ATL:'Atlanta Falcons', BAL:'Baltimore Ravens', BUF:'Buffalo Bills',
+  CAR:'Carolina Panthers', CHI:'Chicago Bears', CIN:'Cincinnati Bengals', CLE:'Cleveland Browns',
+  DAL:'Dallas Cowboys', DEN:'Denver Broncos', DET:'Detroit Lions', GB:'Green Bay Packers',
+  HOU:'Houston Texans', IND:'Indianapolis Colts', JAX:'Jacksonville Jaguars', JAC:'Jacksonville Jaguars',
+  KC:'Kansas City Chiefs', LV:'Las Vegas Raiders', LAC:'Los Angeles Chargers', LAR:'Los Angeles Rams',
+  MIA:'Miami Dolphins', MIN:'Minnesota Vikings', NE:'New England Patriots', NO:'New Orleans Saints',
+  NYG:'New York Giants', NYJ:'New York Jets', PHI:'Philadelphia Eagles', PIT:'Pittsburgh Steelers',
+  SF:'San Francisco 49ers', SEA:'Seattle Seahawks', TB:'Tampa Bay Buccaneers', TEN:'Tennessee Titans',
+  WSH:'Washington Commanders', WAS:'Washington Commanders', WFT:'Washington Commanders'
+};
+
 function _survivorNorm(s) {
   return String(s||'').toLowerCase().replace(/[^a-z0-9]/g,'');
 }
@@ -11648,11 +11660,105 @@ function _fetchNflScores(daysFrom) {
   });
 }
 
+
+function _httpsGetJson(url, timeoutMs) {
+  return new Promise(function(resolve) {
+    const req2 = require('https').get(url, {
+      headers: { Accept: 'application/json', 'User-Agent': 'PocketBooksSports/1.0' }
+    }, function(r) {
+      let d = '';
+      r.on('data', function(c){ d += c; });
+      r.on('end', function() {
+        if (r.statusCode && r.statusCode >= 400)
+          return resolve({ error: 'espn_http_'+r.statusCode, data: null });
+        try { resolve({ data: JSON.parse(d) }); }
+        catch(_e) { resolve({ error: 'espn_parse_error', data: null }); }
+      });
+    });
+    req2.on('error', function(e){ resolve({ error: e.message, data: null }); });
+    req2.setTimeout(timeoutMs || 8000, function(){ req2.destroy(); resolve({ error: 'espn_timeout', data: null }); });
+  });
+}
+
+function _espnScoreboardToGames(data) {
+  const events = (data && data.events) || [];
+  return events.map(function(e) {
+    const c = (e.competitions || [])[0] || {};
+    const st = (c.status && c.status.type) || {};
+    let home='', away='', homeAbbrev='', awayAbbrev='', homeShort='', awayShort='';
+    let hs = null, as = null;
+    (c.competitors || []).forEach(function(x) {
+      const t = x.team || {};
+      const name = t.displayName || t.name || '';
+      const score = (x.score !== '' && x.score != null) ? parseInt(x.score, 10) : null;
+      if (x.homeAway === 'home') {
+        home = name; homeAbbrev = t.abbreviation || ''; homeShort = t.shortDisplayName || t.name || '';
+        hs = score;
+      } else {
+        away = name; awayAbbrev = t.abbreviation || ''; awayShort = t.shortDisplayName || t.name || '';
+        as = score;
+      }
+    });
+    return {
+      id: e.id || c.id,
+      home: home, away: away,
+      homeAbbrev: homeAbbrev, awayAbbrev: awayAbbrev,
+      homeShort: homeShort, awayShort: awayShort,
+      completed: !!(st.completed || st.name === 'STATUS_FINAL' || st.state === 'post'),
+      home_score: hs == null ? 0 : hs,
+      away_score: as == null ? 0 : as,
+      commence_time: c.date || e.date
+    };
+  });
+}
+
+// Regular season = seasontype=2. Empty slate retries without seasontype, then preseason (1).
+async function _fetchEspnNflScores(week) {
+  const w = Math.max(1, parseInt(week, 10) || 1);
+  const urls = [
+    'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=2&week='+w,
+    'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?week='+w,
+    'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?seasontype=1&week='+w
+  ];
+  let lastErr = null;
+  for (let i = 0; i < urls.length; i++) {
+    const r = await _httpsGetJson(urls[i], 8000);
+    if (r.error) { lastErr = r.error; continue; }
+    const games = _espnScoreboardToGames(r.data);
+    if (games.length) {
+      const source = urls[i].indexOf('seasontype=1') >= 0 ? 'espn_preseason' : 'espn';
+      return { games: games, source: source };
+    }
+    lastErr = 'espn_empty';
+  }
+  console.warn('[SURVIVOR_GRADE_ESPN_EMPTY] week='+w+' err='+lastErr);
+  return { error: lastErr || 'espn_empty', games: [] };
+}
+
+
+function _survivorSideLabels(game, side) {
+  const abbrev = side === 'home' ? game.homeAbbrev : game.awayAbbrev;
+  return [
+    side === 'home' ? game.home : game.away,
+    abbrev,
+    side === 'home' ? game.homeShort : game.awayShort,
+    ESPN_ABBREV_TO_TEAM[String(abbrev || '').toUpperCase()]
+  ];
+}
+
+function _survivorSideMatches(team, game, side) {
+  const labels = _survivorSideLabels(game, side);
+  for (let i = 0; i < labels.length; i++) {
+    if (labels[i] && _survivorTeamMatches(team, labels[i])) return true;
+  }
+  return false;
+}
+
 function _survivorGameForTeam(team, games) {
   const list = games || [];
   for (let i=0;i<list.length;i++) {
     const g = list[i];
-    if (_survivorTeamMatches(team, g.home) || _survivorTeamMatches(team, g.away)) return g;
+    if (_survivorSideMatches(team, g, 'home') || _survivorSideMatches(team, g, 'away')) return g;
   }
   return null;
 }
@@ -11662,8 +11768,8 @@ function _survivorTeamWon(team, game) {
   const homeWon = game.home_score > game.away_score;
   const awayWon = game.away_score > game.home_score;
   if (!homeWon && !awayWon) return false; // tie counts as a loss
-  if (_survivorTeamMatches(team, game.home)) return homeWon;
-  if (_survivorTeamMatches(team, game.away)) return awayWon;
+  if (_survivorSideMatches(team, game, 'home')) return homeWon;
+  if (_survivorSideMatches(team, game, 'away')) return awayWon;
   return null;
 }
 
@@ -12108,6 +12214,148 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+async function _gradeSurvivorPool(sb, pool, week, opts) {
+  opts = opts || {};
+  const poolId = pool.id;
+  const scores = await _fetchEspnNflScores(week);
+  if (scores.error) {
+    console.error('[SURVIVOR_GRADE_ESPN_FAIL] pool='+poolId+' week='+week+' err='+scores.error);
+    return { ok:false, error:'espn_scores_unavailable', scoresError: scores.error, gamesChecked: 0 };
+  }
+  const games = scores.games || [];
+  const now = new Date().toISOString();
+
+  const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
+  if (eErr) throw eErr;
+  const { data: picks, error: pErr } = await sb.from('survivor_picks')
+    .select('*').eq('pool_id', poolId).eq('week', week);
+  if (pErr) throw pErr;
+  const pickByEntry = {};
+  (picks||[]).forEach(function(p){
+    pickByEntry[String(p.player_id)+':'+_survivorEntryNum(p)] = p;
+  });
+
+  const results = [];
+  const eliminated = [];
+  const survivors = [];
+  let pendingRemain = 0;
+
+  for (let i=0;i<(entries||[]).length;i++) {
+    const entry = entries[i];
+    const entryNumber = _survivorEntryNum(entry);
+    const label = entry.entry_label || _survivorEntryLabel(entry.player_username, entryNumber);
+    if (entry.status !== 'alive') continue;
+    const pick = pickByEntry[String(entry.player_id)+':'+entryNumber];
+    if (!pick) {
+      await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
+        .eq('id', entry.id);
+      eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'no_pick' });
+      results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: null, result:'lost', reason:'no_pick' });
+      try { telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: null, won: false }); } catch(_e) {}
+      continue;
+    }
+    if (pick.result === 'won' || pick.result === 'lost') {
+      if (pick.result === 'lost') eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'already_lost' });
+      else survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
+      results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: pick.result, reason:'already_graded' });
+      continue;
+    }
+    const game = _survivorGameForTeam(pick.team, games);
+    if (!game || !game.completed) {
+      pendingRemain++;
+      results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result:'pending', reason: game ? 'game_not_final' : 'game_not_found' });
+      survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
+      continue;
+    }
+    const won = _survivorTeamWon(pick.team, game);
+    const result = won ? 'won' : 'lost';
+    await sb.from('survivor_picks').update({
+      result: result, graded_at: now, game_id: pick.game_id || game.id
+    }).eq('id', pick.id);
+    if (won) {
+      survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
+    } else {
+      await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
+        .eq('id', entry.id);
+      eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'lost' });
+    }
+    results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: result, reason:'graded', gameId: game.id });
+    try { telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: pick.team, won: !!won }); } catch(_e) {}
+  }
+
+  let weekAdvanced = false;
+  let currentWeek = pool.current_week;
+  let status = pool.status;
+  if (pendingRemain === 0) {
+    const elimIds = {};
+    eliminated.forEach(function(x){ elimIds[x.playerId+':'+x.entryNumber] = true; });
+    const stillAlive = (entries||[]).filter(function(e){
+      return e.status === 'alive' && !elimIds[e.player_id+':'+_survivorEntryNum(e)];
+    });
+    if (stillAlive.length <= 1) {
+      status = 'completed';
+      await sb.from('survivor_pools').update({ status: status }).eq('id', poolId);
+    } else {
+      currentWeek = pool.current_week + 1;
+      weekAdvanced = true;
+      await sb.from('survivor_pools').update({ current_week: currentWeek }).eq('id', poolId);
+    }
+  }
+
+  console.log('[SURVIVOR_GRADE_OK] pool='+poolId+' week='+week+' source='+(opts.source||'manual')+
+    ' graded='+results.filter(function(r){ return r.reason==='graded'; }).length+
+    ' pending='+pendingRemain+' elim='+eliminated.length+' advanced='+weekAdvanced);
+  return {
+    ok: true, results: results, eliminated: eliminated, survivors: survivors,
+    weekAdvanced: weekAdvanced, currentWeek: currentWeek, status: status,
+    pendingRemain: pendingRemain, scoresError: null, gamesChecked: games.length,
+    source: scores.source || 'espn'
+  };
+}
+
+const SURVIVOR_GRADE_INTERVAL_MS = 30 * 60 * 1000;
+
+function _isSurvivorGameDayEt(nowMs) {
+  const et = _etParts(nowMs || Date.now());
+  return et.dow === 0 || et.dow === 1 || et.dow === 4; // Sun, Mon, Thu ET
+}
+
+async function _survivorAutoGradeTick() {
+  if (!_isSurvivorGameDayEt()) {
+    console.log('[SURVIVOR_GRADE_SKIP] not_game_day');
+    return;
+  }
+  const sb = getSupabase();
+  if (!sb) {
+    console.warn('[SURVIVOR_GRADE_SKIP] supabase_not_configured');
+    return;
+  }
+  const { data: pools, error } = await sb.from('survivor_pools').select('*').eq('status', 'active');
+  if (error) {
+    console.error('[SURVIVOR_GRADE_LIST_FAIL]', error.message);
+    return;
+  }
+  for (let i = 0; i < (pools || []).length; i++) {
+    const pool = pools[i];
+    try {
+      const r = await _gradeSurvivorPool(sb, pool, pool.current_week, { source: 'auto' });
+      if (!r.ok) console.error('[SURVIVOR_GRADE_FAIL] pool='+pool.id+' err='+r.error+' '+ (r.scoresError||''));
+    } catch (e) {
+      console.error('[SURVIVOR_GRADE_FAIL] pool='+pool.id, e.message);
+    }
+  }
+}
+
+function _startSurvivorAutoGrade() {
+  console.log('[SURVIVOR_GRADE_SCHED] every 30m on Sun/Mon/Thu America/New_York');
+  setInterval(function() {
+    _survivorAutoGradeTick().catch(function(e){ console.error('[SURVIVOR_GRADE_TICK_FAIL]', e.message); });
+  }, SURVIVOR_GRADE_INTERVAL_MS);
+  setTimeout(function() {
+    _survivorAutoGradeTick().catch(function(e){ console.error('[SURVIVOR_GRADE_TICK_FAIL]', e.message); });
+  }, 20000);
+}
+
 // POST /api/survivor/:poolId/grade  — host/admin only
 app.post('/api/survivor/:poolId/grade', async (req, res) => {
   const actor = requireActor(req);
@@ -12123,94 +12371,15 @@ app.post('/api/survivor/:poolId/grade', async (req, res) => {
     if (!_survivorIsHost(actor, pool)) return res.status(403).json({ ok:false, error:'host_or_admin_only' });
     if (week !== pool.current_week) return res.status(400).json({ ok:false, error:'week_mismatch', currentWeek: pool.current_week });
 
-    const scores = await _fetchNflScores(7);
-    const games = scores.games || [];
-    const now = new Date().toISOString();
-
-    const { data: entries, error: eErr } = await sb.from('survivor_entries').select('*').eq('pool_id', poolId);
-    if (eErr) throw eErr;
-    const { data: picks, error: pErr } = await sb.from('survivor_picks')
-      .select('*').eq('pool_id', poolId).eq('week', week);
-    if (pErr) throw pErr;
-    const pickByEntry = {};
-    (picks||[]).forEach(function(p){
-      pickByEntry[String(p.player_id)+':'+_survivorEntryNum(p)] = p;
-    });
-
-    const results = [];
-    const eliminated = [];
-    const survivors = [];
-    let pendingRemain = 0;
-
-    for (let i=0;i<(entries||[]).length;i++) {
-      const entry = entries[i];
-      const entryNumber = _survivorEntryNum(entry);
-      const label = entry.entry_label || _survivorEntryLabel(entry.player_username, entryNumber);
-      if (entry.status !== 'alive') continue;
-      const pick = pickByEntry[String(entry.player_id)+':'+entryNumber];
-      if (!pick) {
-        await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
-          .eq('id', entry.id);
-        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'no_pick' });
-        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: null, result:'lost', reason:'no_pick' });
-        telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: null, won: false });
-        continue;
-      }
-      if (pick.result === 'won' || pick.result === 'lost') {
-        if (pick.result === 'lost') eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'already_lost' });
-        else survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
-        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: pick.result, reason:'already_graded' });
-        continue;
-      }
-      const game = _survivorGameForTeam(pick.team, games);
-      if (!game || !game.completed) {
-        pendingRemain++;
-        results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result:'pending', reason: game ? 'game_not_final' : 'game_not_found' });
-        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
-        continue;
-      }
-      const won = _survivorTeamWon(pick.team, game);
-      const result = won ? 'won' : 'lost';
-      await sb.from('survivor_picks').update({
-        result: result, graded_at: now, game_id: pick.game_id || game.id
-      }).eq('id', pick.id);
-      if (won) {
-        survivors.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, team: pick.team });
-      } else {
-        await sb.from('survivor_entries').update({ status:'eliminated', eliminated_week: week })
-          .eq('id', entry.id);
-        eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'lost' });
-      }
-      results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: result, reason:'graded', gameId: game.id });
-      telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: pick.team, won: !!won });
-    }
-
-    let weekAdvanced = false;
-    let currentWeek = pool.current_week;
-    let status = pool.status;
-    if (pendingRemain === 0) {
-      const elimIds = {};
-      eliminated.forEach(function(x){ elimIds[x.playerId+':'+x.entryNumber] = true; });
-      const stillAlive = (entries||[]).filter(function(e){
-        return e.status === 'alive' && !elimIds[e.player_id+':'+_survivorEntryNum(e)];
+    const graded = await _gradeSurvivorPool(sb, pool, week, { source: 'manual' });
+    if (!graded.ok) {
+      console.error('[SURVIVOR_GRADE_FAIL] pool='+poolId+' err='+graded.error+' '+(graded.scoresError||''));
+      return res.status(503).json({
+        ok: false, error: graded.error || 'espn_scores_unavailable',
+        scoresError: graded.scoresError || null
       });
-      if (stillAlive.length <= 1) {
-        status = 'completed';
-        await sb.from('survivor_pools').update({ status: status }).eq('id', poolId);
-      } else {
-        currentWeek = pool.current_week + 1;
-        weekAdvanced = true;
-        await sb.from('survivor_pools').update({ current_week: currentWeek }).eq('id', poolId);
-      }
     }
-
-    res.json({
-      ok: true, results: results, eliminated: eliminated, survivors: survivors,
-      weekAdvanced: weekAdvanced, currentWeek: currentWeek, status: status,
-      pendingRemain: pendingRemain,
-      scoresError: scores.error || null,
-      gamesChecked: games.length
-    });
+    res.json(graded);
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
@@ -12349,6 +12518,7 @@ app.listen(PORT, '0.0.0.0', () => {
   _startCryptoScanner();
   telegramBot.startTelegramBot();
   dailyAudit.startScheduler({ getSupabase: getSupabase });
+  _startSurvivorAutoGrade();
   // Init DB after server is bound
   initDB()
     .then(() => console.log('✅ DB ready'))
