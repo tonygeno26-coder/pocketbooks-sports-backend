@@ -2523,6 +2523,13 @@ app.get('/api/stats/weekly', auth, async (req, res) => {
 const ODDS_KEY = process.env.ODDS_API_KEY;
 const https = require('https');
 
+function _maskOddsKey(key) {
+  if (!key) return 'MISSING';
+  const s = String(key);
+  if (s.length <= 8) return 'set(****)';
+  return s.slice(0, 4) + '…' + s.slice(-4);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // OWLS INSIGHT ODDS PROVIDER (Phase 1)
 // ════════════════════════════════════════════════════════════════════════════
@@ -3116,22 +3123,28 @@ function fetchOdds(sport) {
     const url = `https://api.the-odds-api.com/v4/sports/${sport}/odds/?apiKey=${ODDS_KEY}&regions=us&markets=spreads,totals,h2h&oddsFormat=american&bookmakers=draftkings`;
     const req = https.get(url, (res) => {
       let d = '';
+      if (res.statusCode && res.statusCode >= 400) {
+        console.error('[ODDS] HTTP '+res.statusCode+' sport='+sport);
+      }
       res.on('data', c => d += c);
       res.on('end', () => {
         try {
           const parsed = JSON.parse(d);
           // Odds API returns an error object (not array) on quota/auth errors
           if (parsed && parsed.error_code) {
-            console.error('[ODDS] API error:', parsed.error_code, parsed.message);
+            console.error('[ODDS] API error sport='+sport+':', parsed.error_code, parsed.message);
             resolve({ _error: parsed.error_code, _message: parsed.message });
+          } else if (!Array.isArray(parsed)) {
+            console.error('[ODDS] unexpected non-array body sport='+sport+' http='+res.statusCode);
+            resolve({ _error: 'unexpected_body', _message: 'non_array_response' });
           } else {
             resolve(parsed);
           }
-        } catch(e) { console.error('Odds parse error:', e.message); resolve([]); }
+        } catch(e) { console.error('[ODDS] parse error sport='+sport+':', e.message); resolve({ _error: 'parse_error', _message: e.message }); }
       });
     });
-    req.on('error', e => { console.error('Odds fetch error:', e.message); resolve([]); });
-    req.setTimeout(8000, () => { req.destroy(); resolve([]); });
+    req.on('error', e => { console.error('[ODDS] fetch error sport='+sport+':', e.message); resolve({ _error: 'network_error', _message: e.message }); });
+    req.setTimeout(8000, () => { req.destroy(); resolve({ _error: 'timeout', _message: 'request_timeout' }); });
   });
 }
 
@@ -4831,8 +4844,11 @@ function _startOddsPoller(reason) {
   _oddsPollGeneration++;
   _oddsPollerStarted = true;
   _clearOddsPollTimer();
-  console.log('[poll] starting odds poller reason='+(reason||'boot')+
-    ' intervalMs='+LIVE_CACHE_POLL_INTERVAL_MS);
+  console.log('[poll] startup keyPresent='+(!!ODDS_KEY)+
+    ' keyMasked='+_maskOddsKey(ODDS_KEY)+
+    ' provider='+ODDS_PROVIDER+
+    ' pollerScheduled=true intervalMs='+LIVE_CACHE_POLL_INTERVAL_MS+
+    ' reason='+(reason||'boot'));
   _scheduleOddsPollTick(0);
 }
 
@@ -4861,6 +4877,9 @@ function _startOddsPollerWatchdog() {
 if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
   _startOddsPoller('boot');
   _startOddsPollerWatchdog();
+} else {
+  console.error('[poll] startup keyPresent=false keyMasked=MISSING provider='+ODDS_PROVIDER+
+    ' pollerScheduled=false reason=no_api_key');
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -5536,11 +5555,16 @@ function _deriveGameStatus(game) {
 
 function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
   const now = new Date().toISOString();
+  // A completed fetch that returned [] is a successful poll (offseason / empty
+  // slate). Callers must not pass error/failed fetches here — those should
+  // leave lastSuccessAt untouched so cacheAgeMs still looks dead.
   if (!Array.isArray(gamesArr) || !gamesArr.length) {
-    return Object.assign({}, prevCache || _makeEmptyCache(), {
-      sourceStatus: prevCache && prevCache.lastSuccessAt ? 'stale_preserved' : 'empty',
-      warnings:['fetch_returned_empty']
-    });
+    return {
+      updatedAt:now, lastSuccessAt:now, games:[],
+      marketsByCanonicalKey:{}, marketsByProviderGameId:{},
+      gameCount:0, marketCount:0, fetchDurationMs:fetchDurationMs||0,
+      sourceStatus:'empty', warnings:['empty_slate']
+    };
   }
   const byKey = {}, byId = {};
   let marketCount = 0;
@@ -5594,6 +5618,9 @@ let LIVE_MARKET_CACHE = _makeEmptyCache();
 // Rate-limit for Odds API fallback when Owls is unavailable: max 1 poll/min
 let _oddsApiFallbackLastRun = 0;
 const _ODDS_API_FALLBACK_INTERVAL_MS = 60 * 1000;
+// After OUT_OF_USAGE_CREDITS, stop hammering The Odds API every 5s.
+let _oddsApiQuotaBlockedUntil = 0;
+const _ODDS_API_QUOTA_BACKOFF_MS = 2 * 60 * 1000;
 
 // Normalize a cache market entry to a placement-relevant state.
 // Live games are 'open' — we want bets on them. Only block on real market
@@ -5624,32 +5651,59 @@ function _getSuspendedMarkets(cache, nowMs) {
     }).filter(Boolean);
 }
 
+function _oddsApiQuotaBlocked() {
+  return Date.now() < _oddsApiQuotaBlockedUntil;
+}
+
 // Poll The Odds API directly and atomically replace LIVE_MARKET_CACHE.
 async function _runOddsApiPoll(trigger) {
   if (!ODDS_KEY) {
     console.log('[live cache] ODDS_API_KEY not set — skipping poll trigger='+trigger);
     return false;
   }
+  if (_oddsApiQuotaBlocked()) {
+    console.warn('[live cache] Odds API quota backoff remainingMs='+
+      (_oddsApiQuotaBlockedUntil - Date.now())+' trigger='+trigger+
+      ' — lastSuccessfulPollAt unchanged');
+    return false;
+  }
   const start = Date.now();
   const allGames = [];
+  let sportsOk = 0;
+  let sportsErr = 0;
+  let quotaHit = false;
   try {
     await Promise.all(CACHE_SPORTS.map(async function(sport) {
       const games = await fetchOdds(sport);
-      if (Array.isArray(games)) allGames.push(...games);
+      if (Array.isArray(games)) {
+        sportsOk++;
+        allGames.push(...games);
+        return;
+      }
+      sportsErr++;
+      if (games && games._error === 'OUT_OF_USAGE_CREDITS') quotaHit = true;
     }));
+    if (quotaHit) {
+      _oddsApiQuotaBlockedUntil = Date.now() + _ODDS_API_QUOTA_BACKOFF_MS;
+      console.error('[live cache] Odds API OUT_OF_USAGE_CREDITS — backing off '+
+        _ODDS_API_QUOTA_BACKOFF_MS+'ms trigger='+trigger);
+    }
+    // API errors are not an empty slate. Do not update lastSuccessAt.
+    if (sportsOk === 0) {
+      console.error('[live cache] all sports failed trigger='+trigger+
+        ' errors='+sportsErr+' — lastSuccessfulPollAt unchanged');
+      _recordLiveDiagnosticEvent('provider_unhealthy', {
+        phase:'provider_poll', reason:quotaHit?'odds_api_quota':'odds_api_all_sports_failed', trigger
+      });
+      return false;
+    }
     const fetchDurationMs = Date.now() - start;
     const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
-    if (newCache.sourceStatus === 'healthy') {
-      LIVE_MARKET_CACHE = newCache;
-      console.log('[live cache] updated trigger='+trigger+' games='+newCache.gameCount+
-        ' markets='+newCache.marketCount+' fetch='+fetchDurationMs+'ms');
-      return true;
-    }
-    console.warn('[live cache] fetch returned empty trigger='+trigger+
-      ' — preserving previous cache ('+LIVE_MARKET_CACHE.gameCount+' games)');
-    _recordLiveDiagnosticEvent('provider_unhealthy', {
-      phase:'provider_poll', reason:'odds_api_empty_or_unhealthy', trigger
-    });
+    LIVE_MARKET_CACHE = newCache;
+    console.log('[live cache] updated trigger='+trigger+' games='+newCache.gameCount+
+      ' markets='+newCache.marketCount+' sportsOk='+sportsOk+
+      ' sourceStatus='+newCache.sourceStatus+' fetch='+fetchDurationMs+'ms');
+    return true;
   } catch(e) {
     console.error('[live cache] poll error trigger='+trigger+' — preserving previous cache:', e.message);
     _recordLiveDiagnosticEvent('provider_unhealthy', {
@@ -5668,15 +5722,22 @@ async function pollLiveOddsLoop() {
   console.log('[odds-provider] selected='+ODDS_PROVIDER+' hasOwlsKey='+(!!OWLS_KEY)+' hasOddsKey='+(!!ODDS_KEY)+
     ' cacheAgeMs='+cacheAgeMs);
 
-  // When cache is critically stale, prefer Odds API refresh (bypasses Owls).
-  if (criticallyStale && ODDS_KEY) {
+  const quotaBlocked = _oddsApiQuotaBlocked();
+
+  // When cache is critically stale, prefer Odds API refresh (bypasses Owls)
+  // unless quota is exhausted — hammering a dead key keeps lastSuccessAt null
+  // and burns remaining credits.
+  if (criticallyStale && ODDS_KEY && !quotaBlocked) {
     console.warn('[poll] cache critically stale ageMs='+cacheAgeMs+' — forcing Odds API refresh');
     _oddsApiFallbackLastRun = Date.now();
     await _runOddsApiPoll('cache_stale_recovery');
     return;
   }
 
-  if (ODDS_PROVIDER === 'owls_insight') {
+  if (ODDS_PROVIDER === 'owls_insight' || (quotaBlocked && OWLS_KEY)) {
+    if (quotaBlocked && ODDS_PROVIDER !== 'owls_insight') {
+      console.warn('[poll] Odds API quota blocked — trying Owls Insight fallback');
+    }
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
     const start = Date.now();
     const allGames = [];
@@ -5771,21 +5832,20 @@ async function pollLiveOddsLoop() {
       // eslint-disable-next-line no-console
       console.log(`OWLS_CACHE_SNAPSHOTS_READY games=${newCache.gameCount} markets=${overlayMarketCount}`);
 
-      // The previous Owls path skipped the cache replace when sourceStatus
-      // wasn't 'healthy'. We preserve that behavior — but a healthy Owls
-      // run with 0 overlay markets is still better than wiping the old map,
-      // so we only swap when we actually got data.
-      if (newCache.sourceStatus==='healthy') {
+      // Successful sport fetches (including empty slates) update lastSuccessAt.
+      // Only skip the replace when every sport failed — that is not an empty slate.
+      if (owlsResults.length > 0) {
         LIVE_MARKET_CACHE = newCache;
-        console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+' fetch='+fetchDurationMs+'ms');
-        return; // Owls healthy — no fallback needed
-      } else {
-        console.warn('[owls] fetch returned empty — preserving previous cache');
-        _recordLiveDiagnosticEvent('provider_unhealthy', {
-          phase:'provider_poll',
-          reason:'owls_empty_or_unhealthy'
-        });
+        console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+
+          ' sportsOk='+owlsResults.length+' sourceStatus='+newCache.sourceStatus+
+          ' fetch='+fetchDurationMs+'ms');
+        return;
       }
+      console.warn('[owls] all sports failed — lastSuccessfulPollAt unchanged');
+      _recordLiveDiagnosticEvent('provider_unhealthy', {
+        phase:'provider_poll',
+        reason:'owls_all_sports_failed'
+      });
     } catch(e) {
       console.error('[owls] poll error:', e.message);
       _recordLiveDiagnosticEvent('provider_unhealthy', {
@@ -5799,7 +5859,7 @@ async function pollLiveOddsLoop() {
     // Rate-limited to 1 poll/min so Odds API quota is protected — unless critically stale.
     const _cacheAgeForFb = _getLiveCacheAgeMs();
     const _needsFallback = !LIVE_MARKET_CACHE.gameCount || _cacheAgeForFb >= PREGAME_SNAPSHOT_TTL_MS;
-    if (!ODDS_KEY || !_needsFallback) return;
+    if (!ODDS_KEY || !_needsFallback || _oddsApiQuotaBlocked()) return;
     const _fbNow = Date.now();
     const _rateLimitOk = criticallyStale ||
       (_fbNow - _oddsApiFallbackLastRun >= _ODDS_API_FALLBACK_INTERVAL_MS);

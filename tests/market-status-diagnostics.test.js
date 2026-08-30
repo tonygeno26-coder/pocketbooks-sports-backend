@@ -31,6 +31,21 @@ test('split freshness defaults are wired', function() {
   assert(indexSource.includes("LIVE_ODDS_POLL_MS', 5 * 1000"), 'poll default must be 5s');
 });
 
+test('empty slate is a successful poll and quota errors are not', function() {
+  assert(indexSource.includes("sourceStatus:'empty', warnings:['empty_slate']"),
+    'empty slate must set lastSuccessAt with sourceStatus empty');
+  assert(indexSource.includes('lastSuccessfulPollAt unchanged'),
+    'API failures must leave lastSuccessfulPollAt unchanged');
+  assert(indexSource.includes("games && games._error === 'OUT_OF_USAGE_CREDITS'"),
+    'quota errors must be distinguished from empty slates');
+  assert(indexSource.includes('const _ODDS_API_QUOTA_BACKOFF_MS'),
+    'quota errors must back off instead of hammering every 5s');
+  assert(indexSource.includes('pollerScheduled=true'),
+    'startup log must confirm the poller was scheduled');
+  assert(indexSource.includes('function _maskOddsKey'),
+    'startup log must mask the API key');
+});
+
 test('odds poller uses recursive setTimeout plus 30s watchdog', function() {
   assert(indexSource.includes('function _scheduleOddsPollTick'), 'recursive setTimeout scheduler missing');
   assert(indexSource.includes('function _runOddsPollTick'), 'poll tick runner missing');
