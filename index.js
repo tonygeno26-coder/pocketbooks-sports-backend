@@ -648,19 +648,43 @@ async function _cleanupEventFeed() {
 // PHASE W: CRYPTO DEPOSIT INTENTS
 // ════════════════════════════════════════════════════════════════════════════
 
+function _pocketbooksEthAddress() {
+  return process.env.POCKETBOOKS_ETH_ADDRESS || process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F';
+}
+function _pocketbooksBtcAddress() {
+  return process.env.POCKETBOOKS_BTC_ADDRESS || process.env.WALLET_BTC || 'bc1qu6um0h9qdy8nn6w3m2t4x3ava8lp6tm96erwc4';
+}
+function _usdtContract() {
+  return (process.env.POCKETBOOKS_USDT_CONTRACT || '0xdAC17F958D2ee523a2206206994597C13D831ec7').toLowerCase();
+}
+function _usdcContract() {
+  return (process.env.POCKETBOOKS_USDC_CONTRACT || '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48').toLowerCase();
+}
+function _btcConfirmationsRequired() {
+  const n = parseInt(process.env.BTC_CONFIRMATIONS_REQUIRED, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 2;
+}
+function _ethConfirmationsRequired() {
+  const n = parseInt(process.env.ETH_CONFIRMATIONS_REQUIRED, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 12;
+}
+
 const CRYPTO_WALLETS = {
-  USDT: { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
-  USDC: { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
-  ETH:  { ERC20: process.env.WALLET_ERC20 || '0x61F74cD55bA283269eb86a2AA7a882B2e1a9225F' },
-  BTC:  { Bitcoin_SegWit: process.env.WALLET_BTC || 'bc1qu6um0h9qdy8nn6w3m2t4x3ava8lp6tm96erwc4' }
+  USDT: { ERC20: _pocketbooksEthAddress() },
+  USDC: { ERC20: _pocketbooksEthAddress() },
+  ETH:  { ERC20: _pocketbooksEthAddress() },
+  BTC:  { Bitcoin_SegWit: _pocketbooksBtcAddress() }
 };
 const INTENT_TTL_MS     = 60 * 60 * 1000;
 const FLAG_MISSING_MS   = 30 * 60 * 1000;
 const FLAG_UNCONF_MS    = 30 * 60 * 1000;
 
 function _resolveWallet(symbol, network) {
-  const s = CRYPTO_WALLETS[symbol];
-  return s ? s[network]||null : null;
+  const s = String(symbol||'').toUpperCase();
+  if (s === 'BTC') return _pocketbooksBtcAddress();
+  if (s === 'ETH' || s === 'USDT' || s === 'USDC') return _pocketbooksEthAddress();
+  const w = CRYPTO_WALLETS[symbol];
+  return w ? w[network]||null : null;
 }
 
 // POST /api/crypto/deposits/create-intent
@@ -783,46 +807,564 @@ app.get('/api/admin/crypto/deposits', async (req, res) => {
 });
 
 // ── SCANNER ENGINE ───────────────────────────────────────────────────────────────────────────
-const SCANNER_ENABLED   = process.env.BLOCKCHAIN_SCANNER_ENABLED === 'true';
+const SCANNER_ENABLED   = process.env.BLOCKCHAIN_SCANNER_ENABLED !== 'false';
 const AUTO_CREDIT_CRYPTO= process.env.AUTO_CREDIT_CONFIRMED_CRYPTO === 'true';
 const AMOUNT_TOLERANCE  = 0.02; // 2% underpay tolerance
 const MIN_CONFIRMATIONS = 3;
+const CRYPTO_SCAN_INTERVAL_MS = 2 * 60 * 1000;
+const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+let _cryptoScanTimer = null;
+let _cryptoScanTickRunning = false;
 
-function _verifyCryptoTx(txHash, network, mockResult) {
+function _addrEq(a, b) {
+  return String(a||'').toLowerCase() === String(b||'').toLowerCase();
+}
+
+function _topicToAddress(topic) {
+  if (!topic || String(topic).length < 40) return '';
+  return ('0x' + String(topic).slice(-40)).toLowerCase();
+}
+
+function _hexToDecimalAmount(hex, decimals) {
+  try {
+    const bi = BigInt(hex);
+    const base = 10n ** BigInt(decimals);
+    const whole = bi / base;
+    const frac = bi % base;
+    const fracStr = frac.toString().padStart(decimals, '0').replace(/0+$/, '');
+    return parseFloat(whole.toString() + (fracStr ? '.' + fracStr : ''));
+  } catch (_e) { return 0; }
+}
+
+function _isBtcNetwork(network, symbol) {
+  const n = String(network||'').toLowerCase();
+  const s = String(symbol||'').toUpperCase();
+  return s === 'BTC' || n.indexOf('bitcoin') >= 0 || n === 'btc';
+}
+
+function _httpsGet(url, timeoutMs) {
+  const httpsMod = require('https');
+  return new Promise(function(resolve) {
+    const req = httpsMod.get(url, {
+      headers: { 'User-Agent': 'pocketbooks-sports-backend/1.0', 'Accept': 'application/json' }
+    }, function(res) {
+      let d = '';
+      res.on('data', function(c){ d += c; });
+      res.on('end', function() {
+        const statusCode = res.statusCode || 0;
+        if (statusCode >= 400) {
+          return resolve({ ok:false, error:'http_'+statusCode, statusCode:statusCode, text:d.slice(0,200) });
+        }
+        let parsed = null;
+        try { parsed = JSON.parse(d); } catch (_e) { parsed = null; }
+        resolve({ ok:true, statusCode:statusCode, data:parsed, text:d });
+      });
+    });
+    req.on('error', function(e){ resolve({ ok:false, error:e.message }); });
+    req.setTimeout(timeoutMs || 12000, function(){ req.destroy(); resolve({ ok:false, error:'timeout' }); });
+  });
+}
+
+function _scanSummary(scanResult) {
+  return {
+    valid: !!scanResult.valid,
+    status: scanResult.status,
+    confirmations: scanResult.confirmations || 0,
+    to_address: scanResult.toAddress || scanResult.to_address || null,
+    amount_btc: scanResult.amount_btc != null ? scanResult.amount_btc : null,
+    amount_usd: scanResult.amount_usd != null ? scanResult.amount_usd : (scanResult.amountUsdEstimate != null ? scanResult.amountUsdEstimate : null),
+    token: scanResult.token || null,
+    error: scanResult.errorMessage || null
+  };
+}
+
+function _baseScanResult(txHash, network, extra) {
+  return Object.assign({
+    txHash: txHash,
+    network: network,
+    valid: false,
+    status: 'scan_error',
+    confirmations: 0,
+    amountCrypto: null,
+    amountUsdEstimate: null,
+    amount_btc: null,
+    amount_usd: null,
+    token: null,
+    fromAddress: null,
+    toAddress: null,
+    to_address: null,
+    errorMessage: null
+  }, extra || {});
+}
+
+async function _btcUsdEstimate(amountBtc) {
+  if (!(amountBtc > 0)) return null;
+  const tick = await _httpsGet('https://blockchain.info/ticker');
+  const last = tick.ok && tick.data && tick.data.USD && (tick.data.USD.last || tick.data.USD['15m']);
+  const px = parseFloat(last);
+  if (!Number.isFinite(px) || px <= 0) return null;
+  return Math.round(amountBtc * px * 100) / 100;
+}
+
+async function _ethUsdEstimate(amountEth) {
+  if (!(amountEth > 0)) return null;
+  const spot = await _httpsGet('https://api.coinbase.com/v2/prices/ETH-USD/spot');
+  const amt = spot.ok && spot.data && spot.data.data && spot.data.data.amount;
+  const px = parseFloat(amt);
+  if (!Number.isFinite(px) || px <= 0) return null;
+  return Math.round(amountEth * px * 100) / 100;
+}
+
+async function _scanBtcTx(txHash) {
+  const dest = _pocketbooksBtcAddress();
+  const need = _btcConfirmationsRequired();
+  const txRes = await _httpsGet('https://blockchain.info/rawtx/' + encodeURIComponent(txHash) + '?format=json');
+  if (!txRes.ok) {
+    const notFound = txRes.statusCode === 404 || /not found/i.test(txRes.text || txRes.error || '');
+    console.log('[CRYPTO_SCAN_BTC] hash=' + String(txHash).slice(0,18) + ' ok=false err=' + (notFound ? 'not_found' : (txRes.error||'http')));
+    return _baseScanResult(txHash, 'BTC', {
+      status: notFound ? 'not_found' : 'scan_error',
+      toAddress: dest, to_address: dest, token: 'BTC',
+      errorMessage: notFound ? null : (txRes.error || 'btc_fetch_failed')
+    });
+  }
+  const tx = txRes.data;
+  if (!tx || tx.error || !tx.hash) {
+    console.log('[CRYPTO_SCAN_BTC] hash=' + String(txHash).slice(0,18) + ' not_found');
+    return _baseScanResult(txHash, 'BTC', {
+      status: 'not_found', toAddress: dest, to_address: dest, token: 'BTC',
+      errorMessage: (tx && tx.error) || 'not_found'
+    });
+  }
+  const destLc = dest.toLowerCase();
+  let paidSats = 0;
+  let matchedAddr = null;
+  (tx.out || []).forEach(function(o) {
+    const addr = String(o.addr || '');
+    if (addr && addr.toLowerCase() === destLc) {
+      paidSats += Number(o.value || 0);
+      matchedAddr = addr;
+    }
+  });
+  let confirmations = 0;
+  if (tx.block_height && tx.block_height > 0) {
+    const heightRes = await _httpsGet('https://blockchain.info/q/getblockcount');
+    const chainHeight = parseInt((heightRes.text || '').trim(), 10);
+    if (Number.isFinite(chainHeight) && chainHeight >= tx.block_height) {
+      confirmations = chainHeight - tx.block_height + 1;
+    } else {
+      confirmations = 1;
+    }
+  }
+  const amountBtc = paidSats / 1e8;
+  const paidOk = paidSats > 0;
+  const amountUsd = await _btcUsdEstimate(amountBtc);
+  let status = 'mismatch';
+  if (paidOk && confirmations >= need) status = 'found_confirmed';
+  else if (paidOk) status = 'found_pending';
+  const fromAddr = tx.inputs && tx.inputs[0] && tx.inputs[0].prev_out && tx.inputs[0].prev_out.addr || null;
+  console.log('[CRYPTO_SCAN_BTC] hash=' + String(txHash).slice(0,18) +
+    ' valid=' + (paidOk && confirmations >= need) +
+    ' conf=' + confirmations + '/' + need +
+    ' paidSats=' + paidSats +
+    ' status=' + status);
+  return _baseScanResult(txHash, 'BTC', {
+    valid: paidOk && confirmations >= need,
+    status: status,
+    confirmations: confirmations,
+    amountCrypto: amountBtc,
+    amount_btc: amountBtc,
+    amountUsdEstimate: amountUsd,
+    amount_usd: amountUsd,
+    token: 'BTC',
+    fromAddress: fromAddr,
+    toAddress: matchedAddr || dest,
+    to_address: matchedAddr || dest,
+    errorMessage: paidOk ? null : 'wallet_mismatch'
+  });
+}
+
+async function _etherscanProxy(action, extraQuery) {
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  const url = 'https://api.etherscan.io/api?module=proxy&action=' + encodeURIComponent(action) +
+    (extraQuery || '') + '&apikey=' + encodeURIComponent(apiKey);
+  const res = await _httpsGet(url);
+  if (!res.ok) return { ok:false, error:res.error };
+  const body = res.data;
+  if (!body) return { ok:false, error:'empty_etherscan_body' };
+  if (body.status === '0' && body.message && String(body.message).toUpperCase() === 'NOTOK') {
+    return { ok:false, error:String(body.result || body.message || 'etherscan_notok') };
+  }
+  return { ok:true, result: body.result };
+}
+
+async function _scanEthFamilyTx(txHash, symbol) {
+  const dest = _pocketbooksEthAddress();
+  const need = _ethConfirmationsRequired();
+  const token = String(symbol || 'ETH').toUpperCase();
+  const apiKey = process.env.ETHERSCAN_API_KEY;
+  if (!apiKey) {
+    console.warn('[CRYPTO_SCAN_NO_ETHERSCAN_KEY] token=' + token + ' hash=' + String(txHash).slice(0,18));
+    return _baseScanResult(txHash, 'ETH', {
+      status: 'scan_error', toAddress: dest, to_address: dest, token: token,
+      errorMessage: 'etherscan_api_key_missing'
+    });
+  }
+  const receiptWrap = await _etherscanProxy('eth_getTransactionReceipt', '&txhash=' + encodeURIComponent(txHash));
+  const txWrap = await _etherscanProxy('eth_getTransactionByHash', '&txhash=' + encodeURIComponent(txHash));
+  const headWrap = await _etherscanProxy('eth_blockNumber', '');
+  if (!txWrap.ok) {
+    console.log('[CRYPTO_SCAN_ETH] hash=' + String(txHash).slice(0,18) + ' token=' + token + ' err=' + txWrap.error);
+    return _baseScanResult(txHash, 'ETH', {
+      status: 'scan_error', toAddress: dest, to_address: dest, token: token,
+      errorMessage: txWrap.error || 'etherscan_tx_failed'
+    });
+  }
+  if (!txWrap.result) {
+    console.log('[CRYPTO_SCAN_ETH] hash=' + String(txHash).slice(0,18) + ' token=' + token + ' not_found');
+    return _baseScanResult(txHash, 'ETH', {
+      status: 'not_found', toAddress: dest, to_address: dest, token: token
+    });
+  }
+  const tx = txWrap.result;
+  const receipt = receiptWrap.ok ? receiptWrap.result : null;
+  let confirmations = 0;
+  const txBlockHex = (receipt && receipt.blockNumber) || tx.blockNumber;
+  const headHex = headWrap.ok ? headWrap.result : null;
+  if (txBlockHex && headHex) {
+    const txBlock = parseInt(txBlockHex, 16);
+    const head = parseInt(headHex, 16);
+    if (Number.isFinite(txBlock) && Number.isFinite(head) && head >= txBlock) {
+      confirmations = head - txBlock + 1;
+    }
+  }
+  const fromAddress = tx.from || (receipt && receipt.from) || null;
+  if (receipt && receipt.status && receipt.status !== '0x1') {
+    console.log('[CRYPTO_SCAN_ETH] hash=' + String(txHash).slice(0,18) + ' token=' + token + ' failed_receipt');
+    return _baseScanResult(txHash, 'ETH', {
+      status: 'mismatch', confirmations: confirmations, fromAddress: fromAddress,
+      toAddress: dest, to_address: dest, token: token, errorMessage: 'tx_failed'
+    });
+  }
+
+  if (token === 'ETH') {
+    const toAddr = (receipt && receipt.to) || tx.to || null;
+    const paidOk = _addrEq(toAddr, dest);
+    const amountEth = _hexToDecimalAmount(tx.value || '0x0', 18);
+    const amountUsd = await _ethUsdEstimate(amountEth);
+    let status = 'mismatch';
+    if (paidOk && confirmations >= need) status = 'found_confirmed';
+    else if (paidOk) status = 'found_pending';
+    console.log('[CRYPTO_SCAN_ETH] hash=' + String(txHash).slice(0,18) +
+      ' token=ETH valid=' + (paidOk && confirmations >= need) +
+      ' conf=' + confirmations + '/' + need + ' status=' + status);
+    return _baseScanResult(txHash, 'ETH', {
+      valid: paidOk && confirmations >= need,
+      status: status,
+      confirmations: confirmations,
+      amountCrypto: amountEth,
+      amountUsdEstimate: amountUsd,
+      amount_usd: amountUsd,
+      token: 'ETH',
+      fromAddress: fromAddress,
+      toAddress: toAddr || dest,
+      to_address: toAddr || dest,
+      errorMessage: paidOk ? null : 'wallet_mismatch'
+    });
+  }
+
+  const wantContract = token === 'USDC' ? _usdcContract() : _usdtContract();
+  const logs = (receipt && receipt.logs) || [];
+  let paidRaw = 0n;
+  let matchedTo = null;
+  logs.forEach(function(log) {
+    if (!_addrEq(log.address, wantContract)) return;
+    const topics = log.topics || [];
+    if (!_addrEq(topics[0], ERC20_TRANSFER_TOPIC)) return;
+    const toAddr = _topicToAddress(topics[2]);
+    if (!_addrEq(toAddr, dest)) return;
+    try { paidRaw += BigInt(log.data || '0x0'); } catch (_e) {}
+    matchedTo = toAddr;
+  });
+  const amountToken = _hexToDecimalAmount('0x' + paidRaw.toString(16), 6);
+  const paidOk = paidRaw > 0n;
+  let status = 'mismatch';
+  if (paidOk && confirmations >= need) status = 'found_confirmed';
+  else if (paidOk) status = 'found_pending';
+  console.log('[CRYPTO_SCAN_ETH] hash=' + String(txHash).slice(0,18) +
+    ' token=' + token + ' valid=' + (paidOk && confirmations >= need) +
+    ' conf=' + confirmations + '/' + need + ' status=' + status);
+  return _baseScanResult(txHash, 'ETH', {
+    valid: paidOk && confirmations >= need,
+    status: status,
+    confirmations: confirmations,
+    amountCrypto: amountToken,
+    amountUsdEstimate: amountToken,
+    amount_usd: amountToken,
+    token: token,
+    fromAddress: fromAddress,
+    toAddress: matchedTo || dest,
+    to_address: matchedTo || dest,
+    errorMessage: paidOk ? null : 'token_transfer_not_found'
+  });
+}
+
+async function _verifyCryptoTx(txHash, network, mockResult, cryptoSymbol) {
   if (!SCANNER_ENABLED) {
-    return { txHash, network, status:'scan_error', confirmations:0,
-             amountCrypto:null, amountUsdEstimate:null,
-             fromAddress:null, toAddress:null,
-             errorMessage:'scanner_not_configured' };
+    return _baseScanResult(txHash, network, { errorMessage:'scanner_not_configured' });
   }
   if (mockResult) {
-    return Object.assign({ txHash, network, errorMessage:null }, mockResult);
+    return Object.assign(_baseScanResult(txHash, network, { errorMessage:null }), mockResult);
   }
-  // Real scanner would call Etherscan/BlockCypher API here
-  return { txHash, network, status:'not_found', confirmations:0,
-           amountCrypto:null, amountUsdEstimate:null,
-           fromAddress:null, toAddress:null, errorMessage:null };
+  const symbol = String(cryptoSymbol || '').toUpperCase();
+  try {
+    if (_isBtcNetwork(network, symbol)) return await _scanBtcTx(txHash);
+    const token = symbol || 'ETH';
+    return await _scanEthFamilyTx(txHash, token);
+  } catch (e) {
+    console.warn('[CRYPTO_SCAN_ERROR] hash=' + String(txHash).slice(0,18) + ' err=' + e.message);
+    return _baseScanResult(txHash, network, { errorMessage: e.message || 'scan_exception' });
+  }
+}
+
+function _onChainMeetsExpected(intent, scanResult) {
+  const expected = parseFloat(intent.expected_usd || 0);
+  if (!(expected > 0)) return true;
+  const actualUsd = parseFloat(scanResult.amountUsdEstimate || scanResult.amount_usd || 0);
+  if (actualUsd > 0) return actualUsd >= expected * (1 - AMOUNT_TOLERANCE);
+  return false;
 }
 
 function _matchScanToIntent(scanResult, intent) {
   if (!intent) return { matched:false, reason:'no_intent' };
   if (scanResult.status==='scan_error') return { matched:false, reason:'scan_error' };
   if (scanResult.status==='not_found')  return { matched:false, reason:'not_found' };
-  const expectedWallet = intent.assigned_wallet_address;
-  const actualWallet   = (scanResult.toAddress||'').toLowerCase();
+  const expectedWallet = intent.assigned_wallet_address ||
+    (_isBtcNetwork(intent.network, intent.crypto_symbol) ? _pocketbooksBtcAddress() : _pocketbooksEthAddress());
+  const actualWallet   = (scanResult.toAddress || scanResult.to_address || '').toLowerCase();
   if (actualWallet && expectedWallet && actualWallet !== expectedWallet.toLowerCase())
     return { matched:false, reason:'wallet_mismatch', expected:expectedWallet, actual:scanResult.toAddress };
   const expectedUsd = parseFloat(intent.expected_usd||0);
-  const actualUsd   = parseFloat(scanResult.amountUsdEstimate||0);
+  const actualUsd   = parseFloat(scanResult.amountUsdEstimate||scanResult.amount_usd||0);
   if (expectedUsd>0 && actualUsd>0) {
     const minAcceptable = expectedUsd*(1-AMOUNT_TOLERANCE);
     if (actualUsd<minAcceptable)
       return { matched:false, reason:'amount_short', expectedUsd, actualUsd, minAcceptable };
   }
+  if (scanResult.status==='mismatch') return { matched:false, reason:scanResult.errorMessage||'mismatch' };
   return { matched:true,
            matchedIntentId:intent.intent_id, matchedPlayerId:intent.player_id,
            matchedClubId:intent.club_id, scanStatus:scanResult.status,
            confirmations:scanResult.confirmations };
+}
+
+function _scanRowFromResult(scanResult, intent, matchResult, hash, network) {
+  const now = new Date().toISOString();
+  return {
+    scan_id: 'SCAN_'+String(hash).slice(0,16)+'_'+Date.now(),
+    tx_hash: hash,
+    network: network,
+    crypto_symbol: intent && intent.crypto_symbol || scanResult.token || null,
+    status: scanResult.status,
+    confirmations: scanResult.confirmations||0,
+    amount_crypto: scanResult.amountCrypto||null,
+    amount_usd_estimate: scanResult.amountUsdEstimate||null,
+    from_address: scanResult.fromAddress||null,
+    to_address: scanResult.toAddress||scanResult.to_address||null,
+    matched_intent_id: matchResult && matchResult.matched ? matchResult.matchedIntentId : null,
+    matched_player_id: matchResult && matchResult.matched ? matchResult.matchedPlayerId : null,
+    matched_club_id:   matchResult && matchResult.matched ? matchResult.matchedClubId : null,
+    scanned_at: now,
+    raw_json: _scanSummary(scanResult),
+    error_message: scanResult.errorMessage||null
+  };
+}
+
+async function _creditHostDiamondPurchase(sb, intent, scanResult) {
+  const diamonds = parseFloat(intent.package_amount_diamonds);
+  if (!(diamonds > 0)) return { ok:false, error:'invalid_package' };
+  const txHash = intent.tx_hash;
+  const iKey = 'CRYPTO_HD_' + (txHash || intent.intent_id);
+
+  const { data: alreadyHash } = await sb.from('crypto_deposit_intents')
+    .select('intent_id,status')
+    .eq('tx_hash', txHash)
+    .in('status', ['credited','confirmed'])
+    .neq('intent_id', intent.intent_id)
+    .limit(1);
+  if (alreadyHash && alreadyHash[0]) {
+    console.warn('[CRYPTO_SCAN_DUP] intent=' + intent.intent_id + ' other=' + alreadyHash[0].intent_id);
+    return { ok:false, error:'duplicate_tx', otherIntentId: alreadyHash[0].intent_id };
+  }
+
+  const { data: existingLedger } = await sb.from('host_diamond_ledger')
+    .select('ledger_id').eq('idempotency_key', iKey).limit(1);
+  if (existingLedger && existingLedger[0]) {
+    return { ok:true, idempotent:true, ledgerId: existingLedger[0].ledger_id };
+  }
+
+  const { data: creditedSame } = await sb.from('crypto_deposit_intents')
+    .select('intent_id').eq('intent_id', intent.intent_id).eq('status','credited').limit(1);
+  if (creditedSame && creditedSame[0]) return { ok:true, idempotent:true };
+
+  if (!_onChainMeetsExpected(intent, scanResult)) {
+    console.warn('[CRYPTO_SCAN_AMOUNT_SHORT] intent=' + intent.intent_id);
+    return { ok:false, error:'amount_short' };
+  }
+
+  const { data: balRow } = await sb.from('host_diamond_balances')
+    .select('*').eq('club_id', intent.club_id).limit(1);
+  const host = balRow && balRow[0];
+  if (!host) {
+    console.warn('[CRYPTO_SCAN_NO_BALANCE] club=' + intent.club_id + ' intent=' + intent.intent_id);
+    return { ok:false, error:'host_diamond_balance_missing' };
+  }
+
+  const balBefore = parseFloat(host.balance_diamonds);
+  const balAfter = balBefore + diamonds;
+  const now = new Date().toISOString();
+  const { error: balErr } = await sb.from('host_diamond_balances')
+    .update({ balance_diamonds: balAfter, updated_at: now }).eq('club_id', intent.club_id);
+  if (balErr) {
+    console.warn('[CRYPTO_SCAN_CREDIT_FAIL] intent=' + intent.intent_id + ' err=' + balErr.message);
+    return { ok:false, error: balErr.message };
+  }
+  await _writeHostDiamondLedger(sb, {
+    ledgerId: iKey, clubId: intent.club_id, hostActorId: host.host_actor_id,
+    eventType: 'HOST_DIAMOND_PURCHASE', amount: diamonds, direction: 'credit',
+    balanceBefore: balBefore, balanceAfter: balAfter,
+    createdBy: 'crypto_scanner', reason: 'crypto_purchase:' + intent.intent_id,
+    idempotencyKey: iKey,
+    metadata: { source: 'crypto_purchase', txHash: txHash, cryptoSymbol: intent.crypto_symbol }
+  });
+  console.log('[CRYPTO_SCAN_CREDIT] intent=' + intent.intent_id + ' +' + diamonds + 'd club=' + intent.club_id);
+  return { ok:true, diamonds: diamonds, balanceAfter: balAfter, ledgerId: iKey };
+}
+
+async function _persistCryptoScan(sb, intent, scanResult) {
+  const hash = intent.tx_hash;
+  const network = intent.network;
+  const matchResult = _matchScanToIntent(scanResult, intent);
+  const scanRow = _scanRowFromResult(scanResult, intent, matchResult, hash, network);
+  const { error } = await sb.from('crypto_tx_scans').insert(scanRow);
+  if (error) console.warn('[CRYPTO_SCAN_WRITE_FAIL] intent=' + intent.intent_id + ' err=' + error.message);
+  return { scanRow: scanRow, matchResult: matchResult };
+}
+
+async function _processScannedIntent(sb, intent, scanResult) {
+  const now = new Date().toISOString();
+  const { matchResult } = await _persistCryptoScan(sb, intent, scanResult);
+
+  if (intent.status === 'credited') {
+    console.log('[CRYPTO_SCAN_SKIP] intent=' + intent.intent_id + ' already_credited');
+    return { action: 'already_credited' };
+  }
+
+  if (matchResult.reason === 'scan_error' || scanResult.status === 'scan_error') {
+    return { action: 'scan_error', error: scanResult.errorMessage };
+  }
+  if (scanResult.status === 'not_found') return { action: 'not_found' };
+
+  const dup = await sb.from('crypto_deposit_intents')
+    .select('intent_id,status').eq('tx_hash', intent.tx_hash)
+    .neq('intent_id', intent.intent_id)
+    .in('status', ['credited','confirmed','hash_submitted','pending_review'])
+    .limit(1);
+  if (dup.data && dup.data[0] && dup.data[0].status === 'credited') {
+    await sb.from('crypto_deposit_intents').update({
+      status: 'rejected', reject_reason: 'duplicate_tx', updated_at: now
+    }).eq('intent_id', intent.intent_id).neq('status', 'credited');
+    console.warn('[CRYPTO_SCAN_DUP] rejected intent=' + intent.intent_id);
+    return { action: 'duplicate_tx' };
+  }
+
+  if (scanResult.status === 'found_pending' || (matchResult.matched && !scanResult.valid)) {
+    if (intent.status !== 'pending_review' && intent.status !== 'confirmed') {
+      await sb.from('crypto_deposit_intents').update({ status:'pending_review', updated_at:now })
+        .eq('intent_id', intent.intent_id);
+    }
+    console.log('[CRYPTO_SCAN_WAIT] intent=' + intent.intent_id + ' conf=' + (scanResult.confirmations||0));
+    return { action: 'waiting_confirmations', confirmations: scanResult.confirmations||0 };
+  }
+
+  if (scanResult.status === 'mismatch' || !matchResult.matched) {
+    if (intent.status !== 'pending_review') {
+      await sb.from('crypto_deposit_intents').update({ status:'pending_review', updated_at:now })
+        .eq('intent_id', intent.intent_id);
+    }
+    return { action: 'mismatch', reason: matchResult.reason };
+  }
+
+  if (scanResult.valid && scanResult.status === 'found_confirmed') {
+    await sb.from('crypto_deposit_intents').update({ status:'confirmed', updated_at:now })
+      .eq('intent_id', intent.intent_id).neq('status', 'credited');
+    const credit = await _creditHostDiamondPurchase(sb, Object.assign({}, intent, { status:'confirmed' }), scanResult);
+    if (credit.ok) {
+      await sb.from('crypto_deposit_intents').update({
+        status:'credited', credited_at: now, credited_by: 'crypto_scanner',
+        idempotency_key: credit.ledgerId || ('CRYPTO_HD_' + intent.tx_hash),
+        updated_at: now
+      }).eq('intent_id', intent.intent_id);
+      emitEvent('balance_changed', { clubId: intent.club_id, event: 'host_diamond_purchase', diamonds: intent.package_amount_diamonds },
+        { clubId: intent.club_id, playerId: intent.player_id });
+      return { action: 'credited', diamonds: intent.package_amount_diamonds };
+    }
+    if (credit.error === 'duplicate_tx') {
+      await sb.from('crypto_deposit_intents').update({
+        status:'rejected', reject_reason:'duplicate_tx', updated_at:now
+      }).eq('intent_id', intent.intent_id).neq('status','credited');
+      return { action: 'duplicate_tx' };
+    }
+    return { action: 'confirmed_not_credited', error: credit.error };
+  }
+  return { action: 'noop' };
+}
+
+async function _cryptoScanTick() {
+  if (_cryptoScanTickRunning) return;
+  const sb = getSupabase();
+  if (!sb || !SCANNER_ENABLED) return;
+  _cryptoScanTickRunning = true;
+  try {
+    const { data: intents, error } = await sb.from('crypto_deposit_intents')
+      .select('*')
+      .in('status', ['hash_submitted','pending_review','confirmed'])
+      .not('tx_hash', 'is', null)
+      .order('updated_at', { ascending: true })
+      .limit(25);
+    if (error) {
+      console.warn('[CRYPTO_SCAN_ERROR] list=' + error.message);
+      return;
+    }
+    const list = intents || [];
+    console.log('[CRYPTO_SCAN_TICK] n=' + list.length);
+    for (let i = 0; i < list.length; i++) {
+      const intent = list[i];
+      if (!intent.tx_hash) continue;
+      try {
+        const scanResult = await _verifyCryptoTx(intent.tx_hash, intent.network, null, intent.crypto_symbol);
+        await _processScannedIntent(sb, intent, scanResult);
+      } catch (e) {
+        console.warn('[CRYPTO_SCAN_ERROR] intent=' + intent.intent_id + ' err=' + e.message);
+      }
+    }
+  } finally {
+    _cryptoScanTickRunning = false;
+  }
+}
+
+function _startCryptoScanner() {
+  if (process.env.CRYPTO_SCANNER_DISABLED === 'true') {
+    console.log('[CRYPTO_SCAN_LOOP] disabled');
+    return;
+  }
+  const tick = async function() {
+    try { await _cryptoScanTick(); }
+    catch (e) { console.warn('[CRYPTO_SCAN_ERROR] tick=' + e.message); }
+    _cryptoScanTimer = setTimeout(tick, CRYPTO_SCAN_INTERVAL_MS);
+  };
+  _cryptoScanTimer = setTimeout(tick, 15000);
+  console.log('[CRYPTO_SCAN_LOOP] started intervalMs=' + CRYPTO_SCAN_INTERVAL_MS);
 }
 
 // GET /api/admin/crypto/reconciliation
@@ -972,40 +1514,45 @@ app.post('/api/admin/crypto/deposits/scan', async (req, res) => {
     const network = intent.network;
     if (!hash) return res.status(400).json({ ok:false, error:'no_tx_hash_on_intent' });
 
-    // Run scanner
-    const scanResult = _verifyCryptoTx(hash, network, mockResult||null);
+    // Run scanner (same engine as the 2-minute auto-scanner)
+    const scanResult = await _verifyCryptoTx(hash, network, mockResult||null, intent.crypto_symbol);
     const matchResult= _matchScanToIntent(scanResult, intent);
 
-    // Build and persist scan row
     const now    = new Date().toISOString();
-    const scanId = 'SCAN_'+hash.slice(0,16)+'_'+Date.now();
-    const scanRow = {
-      scan_id:scanId, tx_hash:hash, network, crypto_symbol:intent.crypto_symbol,
-      status:scanResult.status, confirmations:scanResult.confirmations||0,
-      amount_crypto:scanResult.amountCrypto||null,
-      amount_usd_estimate:scanResult.amountUsdEstimate||null,
-      from_address:scanResult.fromAddress||null,
-      to_address:scanResult.toAddress||null,
-      matched_intent_id:  matchResult.matched?matchResult.matchedIntentId:null,
-      matched_player_id:  matchResult.matched?matchResult.matchedPlayerId:null,
-      matched_club_id:    matchResult.matched?matchResult.matchedClubId:null,
-      scanned_at:now, raw_json:scanResult,
-      error_message:scanResult.errorMessage||null
-    };
+    const scanRow = _scanRowFromResult(scanResult, intent, matchResult, hash, network);
+    const scanId = scanRow.scan_id;
     await sb.from('crypto_tx_scans').insert(scanRow);
 
     // Update intent status based on scan
     let newIntentStatus = intent.status;
     if (matchResult.matched && scanResult.status==='found_pending') newIntentStatus='pending_review';
-    if (matchResult.matched && scanResult.status==='found_confirmed') newIntentStatus='pending_review';
-    if (!matchResult.matched && scanResult.status==='not_found') newIntentStatus=intent.status; // no change
+    if (matchResult.matched && scanResult.status==='found_confirmed') newIntentStatus='confirmed';
+    if (!matchResult.matched && scanResult.status==='not_found') newIntentStatus=intent.status;
     await sb.from('crypto_deposit_intents')
       .update({ status:newIntentStatus, updated_at:now })
       .eq('intent_id',intent.intent_id);
 
+    if (!mockResult && scanResult.valid && scanResult.status==='found_confirmed') {
+      const credit = await _creditHostDiamondPurchase(sb, Object.assign({}, intent, { status:'confirmed' }), scanResult);
+      if (credit.ok) {
+        await sb.from('crypto_deposit_intents').update({
+          status:'credited', credited_at:now, credited_by:'crypto_scanner',
+          idempotency_key: credit.ledgerId || ('CRYPTO_HD_'+hash), updated_at:now
+        }).eq('intent_id',intent.intent_id);
+        newIntentStatus='credited';
+        emitEvent('balance_changed', { clubId:intent.club_id, event:'host_diamond_purchase', diamonds:intent.package_amount_diamonds },
+          { clubId:intent.club_id, playerId:intent.player_id }, req.requestId);
+      } else if (credit.error==='duplicate_tx') {
+        await sb.from('crypto_deposit_intents').update({
+          status:'rejected', reject_reason:'duplicate_tx', updated_at:now
+        }).eq('intent_id',intent.intent_id).neq('status','credited');
+        newIntentStatus='rejected';
+      }
+    }
+
     // Auto-credit if enabled and confirmed
     let autoCredited = false;
-    if (AUTO_CREDIT_CRYPTO && matchResult.matched &&
+    if (AUTO_CREDIT_CRYPTO && newIntentStatus!=='credited' && matchResult.matched &&
         scanResult.status==='found_confirmed' &&
         scanResult.confirmations>=MIN_CONFIRMATIONS) {
       const iKey = 'AUTO_CRYPTO_'+intent.intent_id;
@@ -1206,7 +1753,8 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
 // ── Host diamond ledger writer ──────────────────────────────────────────────────────────────────────────
 const VALID_HD_EVENT_TYPES = new Set([
   'HOST_DIAMOND_TOPUP','HOST_ACTIVE_BETTOR_CHARGE',
-  'HOST_DIAMOND_ADJUSTMENT','HOST_DIAMOND_REFUND'
+  'HOST_DIAMOND_ADJUSTMENT','HOST_DIAMOND_REFUND',
+  'HOST_DIAMOND_PURCHASE'
 ]);
 
 async function _writeHostDiamondLedger(sb, params) {
@@ -1916,12 +2464,16 @@ app.get('/api/admin/env-check', async (req, res) => {
   ];
   const RECOMMENDED = [
     { key:'PLATFORM_ADMIN_ALLOWLIST', reason:'platform_admin escape hatch' },
-    { key:'WALLET_ERC20',             reason:'crypto deposit wallet (ERC20)' },
-    { key:'WALLET_BTC',               reason:'crypto deposit wallet (BTC)' },
+    { key:'POCKETBOOKS_ETH_ADDRESS',  reason:'crypto deposit wallet (ETH/USDT/USDC)' },
+    { key:'POCKETBOOKS_BTC_ADDRESS',  reason:'crypto deposit wallet (BTC)' },
+    { key:'ETHERSCAN_API_KEY',        reason:'ETH/USDT/USDC blockchain scanner' },
     { key:'ENABLE_WORKER',            reason:'background job worker' },
   ];
   const OPTIONAL = [
     'BLOCKCHAIN_SCANNER_ENABLED','AUTO_CREDIT_CONFIRMED_CRYPTO',
+    'WALLET_ERC20','WALLET_BTC',
+    'POCKETBOOKS_USDT_CONTRACT','POCKETBOOKS_USDC_CONTRACT',
+    'BTC_CONFIRMATIONS_REQUIRED','ETH_CONFIRMATIONS_REQUIRED',
     'APP_VERSION','COMMIT_SHA','LOG_VERBOSE'
   ];
   const missing  = REQUIRED.filter(function(k){ return !process.env[k]; }).map(function(k){ return { key:k, level:'required' }; });
@@ -11485,6 +12037,7 @@ app.listen(PORT, '0.0.0.0', () => {
       ' ledgerWrites='+BROWSER_LEDGER_MIRROR_WRITES_ENABLED);
   console.log('╚══════════════════════════════════════════════════╝\n');
   console.log(`✅ Server running on port ${PORT}`);
+  _startCryptoScanner();
   // Init DB after server is bound
   initDB()
     .then(() => console.log('✅ DB ready'))
