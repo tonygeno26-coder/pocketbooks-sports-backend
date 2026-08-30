@@ -2844,8 +2844,9 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
     var sport  = ev.sport_key || ev.sport || sportKey || '?';
     var home   = ev.home_team  || ev.home  || ev.homeTeam  || '';
     var away   = ev.away_team  || ev.away  || ev.awayTeam  || '';
-    var ct     = ev.commence_time || ev.start_time || ev.game_time || ev.startTime || '';
-    var date   = ct ? ct.slice(0,10) : '';
+    var ct     = ev.commence_time || ev.start_time || ev.game_time || ev.startTime
+               || ev.scheduled_start || ev.commenceTime || ev.start || '';
+    var date   = _isoDateFromValue(ct);
     var ck     = sport+'|'+away+'|'+home+'|'+date;
 
     // ── Normalize Owls event status into our 3-state model: upcoming | live | final ──
@@ -4576,6 +4577,102 @@ function _gameKeyLookupCandidates(cKey) {
   return out;
 }
 
+// Lobby / Owls keys sometimes arrive as "sport|Away|Home|" with no date
+// while odds_snapshots stores "...|2026-08-30". Fill from scheduledStart
+// when it is a real ISO timestamp; display strings like "Sun 7:10 PM"
+// do not parse in Node and stay empty.
+function _isoDateFromValue(v) {
+  if (v == null || v === '') return '';
+  const s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+  const ms = new Date(s).getTime();
+  if (!isNaN(ms)) return new Date(ms).toISOString().slice(0, 10);
+  return '';
+}
+
+function _gameKeyNeedsDateFlex(cKey) {
+  const parts = String(cKey || '').split('|');
+  if (parts.length < 4) return true;
+  return !/^\d{4}-\d{2}-\d{2}$/.test(parts[parts.length - 1] || '');
+}
+
+function _fillEmptyGameKeyDate(cKey, dateStr) {
+  if (!cKey || !dateStr) return cKey;
+  const parts = String(cKey).split('|');
+  if (parts.length < 4) return String(cKey);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(parts[parts.length - 1] || '')) return String(cKey);
+  parts[parts.length - 1] = dateStr;
+  return parts.join('|');
+}
+
+function _gameKeyPrefixWithoutDate(cKey) {
+  const parts = String(cKey || '').split('|');
+  if (parts.length < 3) return '';
+  return parts[0] + '|' + parts[1] + '|' + parts[2] + '|';
+}
+
+function _pickDateFlexSnapshotRow(rows, today) {
+  if (!rows || !rows.length) return null;
+  function dateOf(r) {
+    const parts = String((r && r.canonical_game_key) || '').split('|');
+    return parts[parts.length - 1] || '';
+  }
+  function isTodayDate(d) {
+    return d === today || (today && String(d).indexOf(today) === 0);
+  }
+  const todayRows = rows.filter(function(r) { return isTodayDate(dateOf(r)); });
+  const pool = todayRows.length ? todayRows : rows;
+  const keys = [];
+  const seen = {};
+  pool.forEach(function(r) {
+    const k = (r && r.canonical_game_key) || '';
+    if (k && !seen[k]) { seen[k] = true; keys.push(k); }
+  });
+  if (keys.length > 1) {
+    if (todayRows.length > 0) return null;
+    let latest = '';
+    keys.forEach(function(k) {
+      const d = String(k).split('|').pop() || '';
+      if (d > latest) latest = d;
+    });
+    const latestKeys = keys.filter(function(k) { return String(k).split('|').pop() === latest; });
+    if (latestKeys.length !== 1) return null;
+    const latestRows = pool.filter(function(r) { return r.canonical_game_key === latestKeys[0]; });
+    latestRows.sort(function(a, b) {
+      return new Date(b.fetched_at || 0) - new Date(a.fetched_at || 0);
+    });
+    return latestRows[0] || null;
+  }
+  pool.sort(function(a, b) {
+    return new Date(b.fetched_at || 0) - new Date(a.fetched_at || 0);
+  });
+  return pool[0] || null;
+}
+
+async function _lookupSnapshotByDateFlexPrefix(sb, cKey, marketForLookup, pickForLookup) {
+  const prefixes = [];
+  const seen = {};
+  _gameKeyLookupCandidates(cKey).forEach(function(k) {
+    const p = _gameKeyPrefixWithoutDate(k);
+    if (!p || seen[p]) return;
+    seen[p] = true;
+    prefixes.push(p);
+  });
+  const today = new Date().toISOString().slice(0, 10);
+  for (let i = 0; i < prefixes.length; i++) {
+    const prefix = prefixes[i];
+    const { data, error } = await sb.from('odds_snapshots').select('*')
+      .like('canonical_game_key', prefix + '%')
+      .eq('market_key', marketForLookup)
+      .eq('selection_key', pickForLookup)
+      .limit(12);
+    if (error) throw error;
+    const picked = _pickDateFlexSnapshotRow(data || [], today);
+    if (picked) return { snap: picked, prefix: prefix };
+  }
+  return null;
+}
+
 // Strip lobby moneyline suffixes ("To Win", extra spaces) but keep the
 // numeric line so totals/spreads can still parse "Over 9" → side+line.
 function _stripToWinSuffix(pick) {
@@ -4653,7 +4750,9 @@ async function _logClosestSnapshotKeys(sb, cKey, marketForLookup, pickForLookup)
 // Dev+bypass: warn and fall back to client odds
 async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   nowMs = nowMs||Date.now();
-  const rawKey = leg.canonicalGameKey||'';
+  const rawKeyIn = leg.canonicalGameKey||'';
+  const dateFromLeg = _isoDateFromValue(leg.scheduledStart || leg.commenceTime || leg.commence_time || '');
+  const rawKey = _fillEmptyGameKeyDate(rawKeyIn, dateFromLeg) || rawKeyIn;
   const keyCandidates = _gameKeyLookupCandidates(rawKey);
   const preferredKey = keyCandidates[keyCandidates.length - 1] || rawKey;
   const cKey   = preferredKey;
@@ -4681,7 +4780,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const csk = ident.canonicalSelectionKey || null;
 
   console.log('SNAPSHOT_LOOKUP_BEGIN'
-    + ' cKey=' + JSON.stringify(rawKey)
+    + ' cKey=' + JSON.stringify(rawKeyIn)
+    + ' filledKey=' + JSON.stringify(rawKey)
+    + ' dateFromLeg=' + JSON.stringify(dateFromLeg)
     + ' preferredKey=' + JSON.stringify(preferredKey)
     + ' market=' + JSON.stringify(market)
     + ' marketForLookup=' + JSON.stringify(marketForLookup)
@@ -4791,6 +4892,23 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
                  acceptedOddsDecimal:null, isLive:false };
       }
       return { ok:false, code:'odds_service_unavailable', reason:'db_error', leg:leg.pick };
+    }
+  }
+
+  // Tier 2b: empty date on the searched key ("sport|Away|Home|") while the
+  // DB row has YYYY-MM-DD. Prefer today's dated row; refuse doubleheaders.
+  if (!snap && _gameKeyNeedsDateFlex(rawKeyIn) && !dateFromLeg) {
+    try {
+      const flexed = await _lookupSnapshotByDateFlexPrefix(sb, preferredKey, marketForLookup, pickForLookup);
+      if (flexed && flexed.snap) {
+        snap = flexed.snap;
+        matchStrategy = 'date_flex';
+        _logSnapshotLookupHit('date_flex', snap,
+          'searchedKey=' + rawKeyIn + ' prefix=' + flexed.prefix
+          + ' market=' + marketForLookup + ' selection=' + pickForLookup);
+      }
+    } catch (flexErr) {
+      console.warn('[snapshot] date-flex lookup error:', (flexErr && flexErr.message) || flexErr);
     }
   }
 
