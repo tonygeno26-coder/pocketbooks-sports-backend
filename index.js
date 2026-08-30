@@ -7934,6 +7934,52 @@ app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh')
 });
 // ───────────────────────────────────────────────────────────────────────────
 
+function _fmtAmericanOdds(o) {
+  if (o == null || o === '') return '';
+  var n = parseFloat(o);
+  if (isNaN(n)) return String(o);
+  return n > 0 ? '+' + n : String(n);
+}
+
+function _enrichHostTicket(t, legs) {
+  var sels = (legs || []).slice().sort(function(a,b){ return (a.leg_index||0)-(b.leg_index||0); }).map(function(l) {
+    var home = l.home_team || '';
+    var away = l.away_team || '';
+    var odds = _fmtAmericanOdds(l.accepted_odds_american != null ? l.accepted_odds_american : l.odds);
+    return {
+      pick: l.pick || '',
+      market: l.market || l.market_type || '',
+      odds: odds,
+      line: l.line,
+      side: l.side,
+      homeTeam: home,
+      awayTeam: away,
+      matchup: (away && home) ? (away + ' @ ' + home) : (away || home || ''),
+      sport: l.sport
+    };
+  });
+  var first = sels[0] || {};
+  var uname = t.player_username || t.playerUsername || '';
+  return Object.assign({}, t, {
+    playerId: t.player_id,
+    playerUsername: uname,
+    playerName: uname,
+    type: t.type || 'Single',
+    status: t.status,
+    riskAmount: parseFloat(t.risk_amount) || 0,
+    potentialProfit: parseFloat(t.potential_profit) || 0,
+    estimatedPayout: parseFloat(t.estimated_payout) || 0,
+    placedAt: t.placed_at,
+    gradedAt: t.graded_at,
+    odds: t.odds || first.odds || '',
+    pick: first.pick || '',
+    matchup: first.matchup || '',
+    game: first.matchup || '',
+    selections: sels,
+    legs: sels
+  });
+}
+
 // GET /api/host/dashboard?clubId=...
 app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
   const sb = getSupabase();
@@ -7941,9 +7987,10 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
   try {
-    // Load tickets
+    // Load tickets (club-scoped). Extra columns are additive for the host Bets tab.
     let tq = sb.from('tickets')
-      .select('id,status,type,risk_amount,potential_profit,estimated_payout,player_id,placed_at,graded_at');
+      .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at')
+      .order('placed_at', { ascending:false });
     if (clubId)   tq = tq.eq('club_id',   clubId);
     if (playerId) tq = tq.eq('player_id', playerId);
     const { data: tickets, error: tErr } = await tq;
@@ -7958,28 +8005,137 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     const { data: ledger, error: lErr } = await lq;
     if (lErr) throw lErr;
 
+    // Join ticket_legs so the host Bets tab can render matchup / pick / odds.
+    var legsByTicket = {};
+    var ticketIds = (tickets||[]).map(function(t){ return t.id; }).filter(Boolean);
+    if (ticketIds.length) {
+      try {
+        const { data: legData, error: lErr2 } = await sb.from('ticket_legs')
+          .select('id,ticket_id,leg_index,pick,market,odds,line,side,sport,home_team,away_team,accepted_odds_american,market_type')
+          .in('ticket_id', ticketIds);
+        if (lErr2) throw lErr2;
+        (legData||[]).forEach(function(l) {
+          if (!l || !l.ticket_id) return;
+          if (!legsByTicket[l.ticket_id]) legsByTicket[l.ticket_id] = [];
+          legsByTicket[l.ticket_id].push(l);
+        });
+      } catch(_le) {
+        console.warn('[host/dashboard] ticket_legs join failed:', _le.message);
+      }
+    }
+
+    // Starting balances from club_members (canonical balance table).
+    var memberMap = {};
+    try {
+      let plq = sb.from('club_members').select('player_id,balance_start');
+      if (clubId) plq = plq.eq('club_id', clubId);
+      const { data: plRows } = await plq;
+      (plRows||[]).forEach(function(r) {
+        if (r.player_id == null) return;
+        memberMap[String(r.player_id)] = {
+          balance_start: r.balance_start != null ? parseFloat(r.balance_start) : null
+        };
+      });
+    } catch(_e) { console.warn('[host/dashboard] club_members fetch error:', _e.message); }
+
+    // Optional display-name lookup. Fail closed to ticket.player_username.
+    var nameById = {};
+    var playerIds = [];
+    var seenPid = {};
+    (tickets||[]).forEach(function(t) {
+      var pid = t.player_id != null ? String(t.player_id) : '';
+      if (!pid || seenPid[pid]) return;
+      seenPid[pid] = true;
+      playerIds.push(pid);
+    });
+    Object.keys(memberMap).forEach(function(pid) {
+      if (!seenPid[pid]) { seenPid[pid] = true; playerIds.push(pid); }
+    });
+    if (playerIds.length) {
+      try {
+        const { data: userRows } = await sb.from('users')
+          .select('id,name,username,display_name')
+          .in('id', playerIds);
+        (userRows||[]).forEach(function(u) {
+          if (!u || u.id == null) return;
+          nameById[String(u.id)] = u.display_name || u.username || u.name || '';
+        });
+      } catch(_ue) { /* users table shape varies; ticket.player_username is enough */ }
+    }
+
+    function rnd(v) { return Math.round((isNaN(v)?0:v)*100)/100; }
+
     // Derive stats from tickets only (source of truth)
     var handle=0, activeRisk=0, hostAtRisk=0, settledGain=0, settledLoss=0;
     var activeBetCount=0, gradedCount=0, canceledCount=0;
     const active=[], graded=[];
+    var byPlayer = {};
+
+    function getOrCreatePlayer(pid, username) {
+      var key = String(pid || 'unknown');
+      if (!byPlayer[key]) {
+        var meta = memberMap[key] || {};
+        var uname = username || nameById[key] || key;
+        byPlayer[key] = {
+          playerId:          key,
+          username:          uname,
+          playerName:        uname,
+          startingBalance:   meta.balance_start != null ? rnd(meta.balance_start) : null,
+          availableBalance:  null,
+          openRisk:          0,
+          settledGains:      0,
+          settledLosses:     0,
+          activeBetCount:    0
+        };
+      } else if (username && byPlayer[key].username === key) {
+        byPlayer[key].username = username;
+        byPlayer[key].playerName = username;
+      }
+      return byPlayer[key];
+    }
+
+    Object.keys(memberMap).forEach(function(pid) { getOrCreatePlayer(pid, nameById[pid]); });
 
     (tickets||[]).forEach(function(t) {
       var s      = (t.status||'').toLowerCase();
       var risk   = parseFloat(t.risk_amount)||0;
       var profit = parseFloat(t.potential_profit)||0;
+      var pid    = t.player_id != null ? String(t.player_id) : 'unknown';
+      var uname  = t.player_username || nameById[pid] || '';
+      var p      = getOrCreatePlayer(pid, uname);
+      if (uname) { p.username = uname; p.playerName = uname; }
+      var enriched = _enrichHostTicket(Object.assign({}, t, { player_username: uname || t.player_username }), legsByTicket[t.id] || []);
+
       if (s==='canceled'||s==='voided'||s==='deleted') { canceledCount++; return; }
       if (s==='active'||s==='open') {
-        handle+=risk; activeRisk+=risk; hostAtRisk+=profit; activeBetCount++; active.push(t);
+        handle+=risk; activeRisk+=risk; hostAtRisk+=profit; activeBetCount++;
+        p.openRisk += risk; p.activeBetCount++;
+        active.push(enriched);
       } else if (s==='won') {
-        handle+=risk; settledLoss+=profit; gradedCount++; graded.push(t);
+        handle+=risk; settledLoss+=profit; gradedCount++;
+        p.settledGains += profit;
+        graded.push(enriched);
       } else if (s==='lost') {
-        handle+=risk; settledGain+=risk; gradedCount++; graded.push(t);
+        handle+=risk; settledGain+=risk; gradedCount++;
+        p.settledLosses += risk;
+        graded.push(enriched);
       } else if (s==='push'||s==='pushed') {
-        handle+=risk; gradedCount++; graded.push(t);
+        handle+=risk; gradedCount++;
+        graded.push(enriched);
       }
     });
 
-    function rnd(v) { return Math.round((isNaN(v)?0:v)*100)/100; }
+    const players = Object.keys(byPlayer).map(function(k) {
+      var p = byPlayer[k];
+      p.openRisk = rnd(p.openRisk);
+      p.settledGains = rnd(p.settledGains);
+      p.settledLosses = rnd(p.settledLosses);
+      p.availableBalance = p.startingBalance != null
+        ? rnd(p.startingBalance - p.openRisk - p.settledLosses + p.settledGains)
+        : null;
+      return p;
+    }).sort(function(a,b){ return (b.openRisk||0) - (a.openRisk||0); });
+
     const settledHandle = handle - activeRisk;
     const profit        = rnd(settledGain - settledLoss);
     const holdPct       = settledHandle>0 ? rnd(profit/settledHandle*100) : null;
@@ -8005,11 +8161,17 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
 
     res.json({
       ok: true, source: 'db', clubId: clubId||null,
-      players:        [], // reserved for Phase C Step 3
+      players:        players,
       activeTickets:  active,
       gradedTickets:  graded,
       ledgerEntries:  ledger||[],
       stats,
+      summary: {
+        activeBetCount: stats.activeBetCount,
+        atRisk:         stats.hostAtRisk,
+        activeRisk:     stats.activeRisk,
+        profit:         stats.profit
+      },
       warnings
     });
   } catch(e) {
