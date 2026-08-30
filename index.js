@@ -679,23 +679,72 @@ const INTENT_TTL_MS     = 60 * 60 * 1000;
 const FLAG_MISSING_MS   = 30 * 60 * 1000;
 const FLAG_UNCONF_MS    = 30 * 60 * 1000;
 
+function _normalizeCryptoSymbol(raw) {
+  return String(raw||'').trim().toUpperCase();
+}
+function _normalizeCryptoNetwork(symbol, network) {
+  const s = _normalizeCryptoSymbol(symbol);
+  const n = String(network||'').replace(/[-\s]/g,'').toUpperCase();
+  if (s === 'BTC') return 'Bitcoin_SegWit';
+  if (n === 'ERC20' || n === 'ETHEREUM' || n === 'ETHEREUMERC20' || n === 'ETH') return 'ERC20';
+  if (n === 'BITCOIN' || n === 'BITCOINSEGWIT' || n === 'BITCOINMAINNET' || n === 'BTC') return 'Bitcoin_SegWit';
+  return network || (s === 'BTC' ? 'Bitcoin_SegWit' : 'ERC20');
+}
 function _resolveWallet(symbol, network) {
-  const s = String(symbol||'').toUpperCase();
+  const s = _normalizeCryptoSymbol(symbol);
   if (s === 'BTC') return _pocketbooksBtcAddress();
   if (s === 'ETH' || s === 'USDT' || s === 'USDC') return _pocketbooksEthAddress();
-  const w = CRYPTO_WALLETS[symbol];
-  return w ? w[network]||null : null;
+  const w = CRYPTO_WALLETS[s];
+  return w ? w[network]||w[Object.keys(w)[0]]||null : null;
 }
 
-// POST /api/crypto/deposits/create-intent
+// Request ID (must be defined before app.use — crypto routes follow immediately)
+const _SAFE_REQ_ID_RE = /^[a-zA-Z0-9_\-]{6,64}$/;
+function requestIdMiddleware(req, res, next) {
+  const incoming = (req.headers['x-request-id']||'').trim();
+  req.requestId = _SAFE_REQ_ID_RE.test(incoming)
+    ? incoming
+    : 'req_'+Date.now().toString(36)+'_'+crypto.randomBytes(4).toString('hex');
+  res.setHeader('x-request-id', req.requestId);
+  next();
+}
 
 const app = express();
 
+// Core middleware MUST run before any route. Express matches in registration
+// order — a later app.use(express.json()) never runs for routes above it.
+app.use(requestIdMiddleware);
+app.use(_hardenedCors);
+app.use(express.json({ limit:'100kb' }));
+app.use(securityHeadersMiddleware);
+app.use(payloadSizeMiddleware);
+app.use(rateLimitMiddleware);
+
+// POST /api/crypto/deposits/create-intent
 app.post('/api/crypto/deposits/create-intent', async (req, res) => {
   const actor = requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
-  const { clubId, playerId, packageAmountDiamonds, expectedUsd, cryptoSymbol, network } = req.body||{};
+  const body = (req.body && typeof req.body === 'object') ? req.body : {};
+  const nested = (body.deposit && typeof body.deposit === 'object') ? body.deposit
+               : (body.intent && typeof body.intent === 'object') ? body.intent
+               : (body.payload && typeof body.payload === 'object') ? body.payload
+               : {};
+  const q = req.query || {};
+  const clubId = body.clubId || body.club_id || nested.clubId || q.clubId;
+  const playerId = body.playerId || body.player_id || nested.playerId || q.playerId;
+  const packageAmountDiamonds = body.packageAmountDiamonds || body.package_amount_diamonds
+    || body.diamonds || nested.packageAmountDiamonds;
+  const expectedUsd = body.expectedUsd || body.expected_usd || nested.expectedUsd;
+  const cryptoSymbol = _normalizeCryptoSymbol(
+    body.cryptoSymbol || body.crypto_symbol || body.symbol || body.method
+    || nested.cryptoSymbol || nested.crypto_symbol || nested.symbol || nested.method
+    || q.cryptoSymbol || q.crypto_symbol
+  );
+  const network = _normalizeCryptoNetwork(
+    cryptoSymbol,
+    body.network || nested.network || q.network
+  );
   const errors = [];
   if (!clubId||!playerId)               errors.push('missing_clubId_or_playerId');
   if (!packageAmountDiamonds||parseFloat(packageAmountDiamonds)<=0) errors.push('invalid_package');
@@ -2226,16 +2275,7 @@ function logEvent(level, event, data, requestId) {
   return entry;
 }
 
-// Request ID middleware
-const _SAFE_REQ_ID_RE = /^[a-zA-Z0-9_\-]{6,64}$/;
-function requestIdMiddleware(req, res, next) {
-  const incoming = (req.headers['x-request-id']||'').trim();
-  req.requestId = _SAFE_REQ_ID_RE.test(incoming)
-    ? incoming
-    : 'req_'+Date.now().toString(36)+'_'+_crypto.randomBytes(4).toString('hex');
-  res.setHeader('x-request-id', req.requestId);
-  next();
-}
+// Request ID middleware defined above (before const app / routes).
 // ───────────────────────────────────────────────────────────────────────────
 
 // ── Supabase mirror client (Phase A — passive write only) ─────────────────────
@@ -2423,13 +2463,9 @@ app.get('/api/events', async (req, res) => {
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'pocketbooks-sports-secret-2026';
 
-// Phase Q+R: request ID → CORS → security headers → payload → rate limit
-app.use(requestIdMiddleware);
-app.use(_hardenedCors);
-app.use(express.json({ limit:'100kb' }));
-app.use(securityHeadersMiddleware);
-app.use(payloadSizeMiddleware);
-app.use(rateLimitMiddleware);
+// Core middleware (json/cors/rate-limit/…) is registered immediately after
+// `const app = express()` so every route below — including crypto deposits —
+// sees a parsed body.
 
 // ===== HEALTH + DIAGNOSTICS (Phase R) =====
 
