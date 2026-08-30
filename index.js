@@ -8432,7 +8432,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     // Load tickets (club-scoped). Extra columns are additive for the host Bets tab.
     let tq = sb.from('tickets')
       .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at')
-      .order('placed_at', { ascending:false });
+      .order('placed_at', { ascending:false })
+      .limit(1000);
     if (clubId)   tq = tq.eq('club_id',   clubId);
     if (playerId) tq = tq.eq('player_id', playerId);
     const { data: tickets, error: tErr } = await tq;
@@ -8467,11 +8468,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     }
 
     // Starting balances from club_members (canonical balance table).
+    // Approved members only — hosts must see every player in the club, not
+    // just those with a ticket in this response.
     var memberMap = {};
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start');
+      let plq = sb.from('club_members').select('player_id,balance_start,status');
       if (clubId) plq = plq.eq('club_id', clubId);
-      const { data: plRows } = await plq;
+      plq = plq.eq('status', 'approved');
+      const { data: plRows, error: mErr } = await plq;
+      if (mErr) throw mErr;
       (plRows||[]).forEach(function(r) {
         if (r.player_id == null) return;
         memberMap[String(r.player_id)] = {
@@ -8480,8 +8485,11 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       });
     } catch(_e) { console.warn('[host/dashboard] club_members fetch error:', _e.message); }
 
-    // Optional display-name lookup. Fail closed to ticket.player_username.
+    // Username lookup. users has username + display_name (no `name` column).
+    // Prefer users.username over tickets.player_username — the ticket field is
+    // often null or a copy of player_id.
     var nameById = {};
+    var displayNameById = {};
     var playerIds = [];
     var seenPid = {};
     (tickets||[]).forEach(function(t) {
@@ -8495,14 +8503,31 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     });
     if (playerIds.length) {
       try {
-        const { data: userRows } = await sb.from('users')
-          .select('id,name,username,display_name')
+        const { data: userRows, error: uErr } = await sb.from('users')
+          .select('id,username,display_name')
           .in('id', playerIds);
-        (userRows||[]).forEach(function(u) {
-          if (!u || u.id == null) return;
-          nameById[String(u.id)] = u.display_name || u.username || u.name || '';
-        });
+        if (uErr) {
+          console.warn('[host/dashboard] users lookup failed:', uErr.message);
+        } else {
+          (userRows||[]).forEach(function(u) {
+            if (!u || u.id == null) return;
+            var id = String(u.id);
+            nameById[id] = u.username || u.display_name || '';
+            displayNameById[id] = u.display_name || u.username || '';
+          });
+        }
       } catch(_ue) { /* users table shape varies; ticket.player_username is enough */ }
+    }
+
+    function _uuidLike(s) {
+      return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
+    }
+    function _playerLabel(pid, ticketUsername) {
+      var fromUsers = nameById[String(pid)] || '';
+      if (fromUsers) return fromUsers;
+      var tu = ticketUsername || '';
+      if (tu && tu !== String(pid) && !_uuidLike(tu)) return tu;
+      return displayNameById[String(pid)] || '';
     }
 
     function rnd(v) { return Math.round((isNaN(v)?0:v)*100)/100; }
@@ -8517,11 +8542,11 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       var key = String(pid || 'unknown');
       if (!byPlayer[key]) {
         var meta = memberMap[key] || {};
-        var uname = username || nameById[key] || key;
+        var uname = username || nameById[key] || displayNameById[key] || key;
         byPlayer[key] = {
           playerId:          key,
           username:          uname,
-          playerName:        uname,
+          playerName:        displayNameById[key] || uname,
           startingBalance:   meta.balance_start != null ? rnd(meta.balance_start) : null,
           availableBalance:  null,
           openRisk:          0,
@@ -8543,9 +8568,9 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       var risk   = parseFloat(t.risk_amount)||0;
       var profit = parseFloat(t.potential_profit)||0;
       var pid    = t.player_id != null ? String(t.player_id) : 'unknown';
-      var uname  = t.player_username || nameById[pid] || '';
+      var uname  = _playerLabel(pid, t.player_username);
       var p      = getOrCreatePlayer(pid, uname);
-      if (uname) { p.username = uname; p.playerName = uname; }
+      if (uname) { p.username = uname; p.playerName = displayNameById[pid] || uname; }
       var enriched = _enrichHostTicket(Object.assign({}, t, { player_username: uname || t.player_username }), legsByTicket[t.id] || []);
 
       if (s==='canceled'||s==='voided'||s==='deleted') { canceledCount++; return; }
