@@ -3995,15 +3995,27 @@ function _normalizeLegIdentity(leg) {
       _teamForKey = _m[1].trim();
       if (_lineForKey == null) _lineForKey = parseFloat(_m[2]);
     } else {
-      _teamForKey = leg.pick.trim();
+      // Lobby moneyline labels are "Colorado Rockies To Win" — strip the suffix
+      // so the canonical key matches DB selection_key "colorado rockies".
+      _teamForKey = String(leg.pick).replace(/\s+to\s+win\s*$/i, '').trim();
+    }
+  }
+  // Totals: lobby pick is "Over 9" / "Under 8.5" and often omits leg.line.
+  // Parse side + numeric line so canonical_selection_key is "over:9" not null.
+  let _sideForKey = side;
+  if (isSideMarket && leg.pick) {
+    const _ou = String(leg.pick).match(/\b(over|under)\b(?:\s+([+-]?\d+(?:\.\d+)?))?/i);
+    if (_ou) {
+      if (!_sideForKey) _sideForKey = _ou[1];
+      if (_lineForKey == null && _ou[2] != null) _lineForKey = parseFloat(_ou[2]);
     }
   }
 
   const canonicalSelectionKey = _buildCanonicalSelectionKey({
     marketType,
-    team:   _teamForKey || (isTeamMarket ? leg.pick : null),
+    team:   _teamForKey || (isTeamMarket ? String(leg.pick||'').replace(/\s+to\s+win\s*$/i, '').trim() : null),
     player: playerName,
-    side:   side || (isSideMarket ? leg.pick : null),
+    side:   _sideForKey || (isSideMarket ? leg.pick : null),
     line:   _lineForKey,
   });
 
@@ -4514,30 +4526,151 @@ async function _upsertOddsSnapshots() {
   return result;
 }
 
+// Expand short/legacy sport prefixes on a canonical game key so lobby keys
+// like "mlb|Miami Marlins|..." match Owls snapshots "baseball_mlb|Miami Marlins|...".
+function _expandSportPrefixOnGameKey(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (!parts[0]) return cKey;
+  const raw = parts[0].toLowerCase();
+  const map = (typeof _CACHE_SPORT_KEY_BY_SHORT !== 'undefined' && _CACHE_SPORT_KEY_BY_SHORT) || {};
+  const expanded = map[raw] || raw;
+  if (expanded === parts[0]) return String(cKey);
+  parts[0] = expanded;
+  return parts.join('|');
+}
+
+// Convert hyphenated team slugs to Owls display names:
+//   "colorado-rockies" → "Colorado Rockies"
+function _unhyphenateGameKeyTeams(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return String(cKey);
+  function titleCaseWords(s) {
+    return String(s || '').replace(/-/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+  }
+  parts[1] = titleCaseWords(parts[1]);
+  parts[2] = titleCaseWords(parts[2]);
+  return parts.join('|');
+}
+
+function _gameKeyLookupCandidates(cKey) {
+  const seen = {};
+  const out = [];
+  function add(k) {
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    out.push(k);
+  }
+  add(cKey);
+  const expanded = _expandSportPrefixOnGameKey(cKey);
+  add(expanded);
+  add(_unhyphenateGameKeyTeams(cKey));
+  add(_unhyphenateGameKeyTeams(expanded));
+  return out;
+}
+
+function _normalizePickForSnapshotLookup(pick) {
+  return String(pick || '')
+    .toLowerCase()
+    .replace(/\s+to\s+win\s*$/i, '')
+    .replace(/\s[+-]?\d+\.?\d*$/, '')
+    .trim();
+}
+
+function _gameKeySearchHint(cKey) {
+  const parts = String(cKey || '').split('|');
+  const away = String(parts[1] || '').replace(/-/g, ' ');
+  const words = away.split(/\s+/).filter(function(w) { return w.length >= 5; });
+  const hint = (words[words.length - 1] || away).replace(/[^a-zA-Z0-9 ]/g, '').slice(0, 40);
+  return hint;
+}
+
+function _logSnapshotLookupHit(strategy, snap, extra) {
+  const foundKey = snap && (snap.canonical_game_key || snap._source || '') || '';
+  const foundMkt = snap && (snap.market_key || '') || '';
+  const foundSel = snap && (snap.selection_key || '') || '';
+  const foundCsk = snap && (snap.canonical_selection_key || '') || '';
+  console.log('SNAPSHOT_LOOKUP_HIT strategy=' + strategy
+    + ' found=true'
+    + ' foundKey=' + foundKey
+    + ' foundMarket=' + foundMkt
+    + ' foundSelection=' + foundSel
+    + ' foundCsk=' + foundCsk
+    + (extra ? ' ' + extra : ''));
+}
+
+async function _logClosestSnapshotKeys(sb, cKey, marketForLookup, pickForLookup) {
+  const hint = _gameKeySearchHint(cKey);
+  if (!hint || hint.length < 3) {
+    console.log('SNAPSHOT_LOOKUP_MISS found=false closest=skipped reason=no_hint'
+      + ' searchedKey=' + JSON.stringify(cKey)
+      + ' market=' + JSON.stringify(marketForLookup)
+      + ' selection=' + JSON.stringify(pickForLookup));
+    return;
+  }
+  try {
+    const { data, error } = await sb.from('odds_snapshots')
+      .select('canonical_game_key,market_key,selection_key,canonical_selection_key')
+      .ilike('canonical_game_key', '%' + hint + '%')
+      .eq('market_key', marketForLookup)
+      .limit(6);
+    if (error) throw error;
+    const compact = (data || []).map(function(r) {
+      return (r.canonical_game_key || '') + '>' + (r.market_key || '')
+        + '>' + (r.selection_key || '') + '>' + (r.canonical_selection_key || '');
+    }).join(';');
+    console.log('SNAPSHOT_LOOKUP_MISS found=false'
+      + ' searchedKey=' + JSON.stringify(cKey)
+      + ' market=' + JSON.stringify(marketForLookup)
+      + ' selection=' + JSON.stringify(pickForLookup)
+      + ' closestHint=' + hint
+      + ' closest=' + (compact || '(none)'));
+  } catch (e) {
+    console.log('SNAPSHOT_LOOKUP_MISS found=false closest=error'
+      + ' searchedKey=' + JSON.stringify(cKey)
+      + ' msg=' + String((e && e.message) || e).slice(0, 120));
+  }
+}
+
 // Phase L: fail-closed odds verification
 // Production: any error → odds_service_unavailable (never use client odds)
 // Dev+bypass: warn and fall back to client odds
 async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   nowMs = nowMs||Date.now();
-  const cKey   = leg.canonicalGameKey||'';
+  const rawKey = leg.canonicalGameKey||'';
+  const keyCandidates = _gameKeyLookupCandidates(rawKey);
+  const preferredKey = keyCandidates[keyCandidates.length - 1] || rawKey;
+  const cKey   = preferredKey;
   const market = (leg.market||'moneyline').toLowerCase();
   // Normalize display-label market names to the DB-stored keys for Tier 2 lookup.
   // e.g. "to win" → "moneyline", "run line" / "puck line" → "spread"
   const marketForLookup = _coerceMarketType(market) || market;
   const pick   = (leg.pick||'').toLowerCase();
-  console.log('[snapshot-diag] cKey='+JSON.stringify(cKey)+' market='+JSON.stringify(market)+' marketForLookup='+JSON.stringify(marketForLookup)+' pick='+JSON.stringify(pick));
+  const pickForLookup = _normalizePickForSnapshotLookup(pick);
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
   const bypassOk = !IS_PRODUCTION;
   let snap = null;
+  let matchStrategy = null;
 
   // ----- Canonical identity (priority #11) -----
-  // Normalize the incoming leg into structured identity. For props this
-  // sniffs the legacy {market:'total', isPlayerProp:true} shape and upgrades
-  // it to {marketType:'player_prop', canonicalMarketKey, canonicalSelectionKey}.
-  const ident = _normalizeLegIdentity(leg) || {};
+  // Rebuild identity against the Owls-style game key so canonical_market_key
+  // matches what _upsertOddsSnapshots wrote (baseball_mlb|Away|Home|date|total).
+  const ident = _normalizeLegIdentity(Object.assign({}, leg, { canonicalGameKey: preferredKey })) || {};
   const cmk = ident.canonicalMarketKey || null;
   const csk = ident.canonicalSelectionKey || null;
+
+  console.log('SNAPSHOT_LOOKUP_BEGIN'
+    + ' cKey=' + JSON.stringify(rawKey)
+    + ' preferredKey=' + JSON.stringify(preferredKey)
+    + ' market=' + JSON.stringify(market)
+    + ' marketForLookup=' + JSON.stringify(marketForLookup)
+    + ' pick=' + JSON.stringify(pick)
+    + ' selection=' + JSON.stringify(pickForLookup)
+    + ' cmk=' + JSON.stringify(cmk)
+    + ' csk=' + JSON.stringify(csk)
+    + ' keyCandidates=' + JSON.stringify(keyCandidates));
 
   // Tier 1: canonical lookup. Skipped when we can't build a structured key
   // (e.g. legacy leg with too little data) — we'll fall back to legacy below.
@@ -4550,15 +4683,11 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
       if (error) throw error;
       if (data && data[0]) {
         snap = data[0];
+        matchStrategy = 'canonical';
         if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
-          // eslint-disable-next-line no-console
           console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=canonical`);
-        } else {
-          // Non-prop canonical match — same shape as the prop log so Railway
-          // grep + downstream tooling can index a single SNAPSHOT_MATCH stem.
-          // eslint-disable-next-line no-console
-          console.log(`SNAPSHOT_MATCH via=canonical marketType=${ident.marketType||'?'} canonicalMarketKey=${cmk} canonicalSelectionKey=${csk}`);
         }
+        _logSnapshotLookupHit('canonical', snap, 'cmk=' + cmk + ' csk=' + csk);
       }
     } catch(dbErr) {
       // 42703 = column not found. Old DB, no canonical columns. Silent
@@ -4570,31 +4699,67 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     }
   }
 
+  // Tier 1b: totals/spreads — exact line in canonical_selection_key missed
+  // (lobby Over 9 vs snapshot over:8.5). Same market + same side only; never
+  // cross moneyline. Caller still applies exact odds + exact line checks.
+  if (!snap && cmk && (ident.marketType === MARKET_TYPES.TOTAL
+      || ident.marketType === MARKET_TYPES.PERIOD_TOTAL
+      || ident.marketType === MARKET_TYPES.TEAM_TOTAL
+      || ident.marketType === MARKET_TYPES.SPREAD
+      || ident.marketType === MARKET_TYPES.PERIOD_SPREAD)) {
+    const sidePrefix = (csk && String(csk).indexOf('under') === 0) ? 'under:'
+      : (csk && String(csk).indexOf(':') >= 0) ? String(csk).slice(0, String(csk).lastIndexOf(':') + 1)
+      : (pick.indexOf('under') >= 0 ? 'under:' : null);
+    // Totals: over:/under:. Spreads: team_slug:  — only flex the numeric suffix.
+    const likePrefix = sidePrefix || (ident.marketType === MARKET_TYPES.TOTAL
+      || ident.marketType === MARKET_TYPES.PERIOD_TOTAL
+      || ident.marketType === MARKET_TYPES.TEAM_TOTAL
+        ? (pick.indexOf('under') >= 0 ? 'under:' : 'over:')
+        : null);
+    if (likePrefix) {
+      try {
+        const { data, error } = await sb.from('odds_snapshots').select('*')
+          .eq('canonical_market_key', cmk)
+          .like('canonical_selection_key', likePrefix + '%')
+          .limit(4);
+        if (error) throw error;
+        if (data && data[0]) {
+          snap = data[0];
+          matchStrategy = 'canonical_line_flex';
+          _logSnapshotLookupHit('canonical_line_flex', snap,
+            'cmk=' + cmk + ' searchedCsk=' + csk + ' likePrefix=' + likePrefix);
+        }
+      } catch (flexErr) {
+        const msg = (flexErr && flexErr.message) || '';
+        if (!/canonical_market_key|canonical_selection_key/.test(msg)) {
+          console.warn('[snapshot] canonical line-flex lookup error:', msg);
+        }
+      }
+    }
+  }
+
   // Tier 2: legacy lookup by (canonical_game_key, market_key, selection_key).
-  // This is the original code path — keeps existing snapshots discoverable
-  // until the canonical columns are populated everywhere.
-  //
   // selection_key in the DB stores only the team/side name with no spread:
   //   e.g. "toronto blue jays"  (NOT "toronto blue jays +1.5")
-  // Strip any trailing point-spread suffix from pick before matching.
-  const pickForLookup = pick.replace(/\s[+-]?\d+\.?\d*$/, '').trim();
-  console.log('[snapshot-diag] tier2 pickForLookup='+JSON.stringify(pickForLookup)+' (was: '+JSON.stringify(pick)+')');
+  //   e.g. "over"               (NOT "over 9")
+  //   e.g. "colorado rockies"   (NOT "colorado rockies to win")
   if (!snap) {
     try {
-      const { data, error } = await sb.from('odds_snapshots').select('*')
-        .eq('canonical_game_key',cKey).eq('market_key',marketForLookup).eq('selection_key',pickForLookup)
-        .limit(1);
-      if (error) throw error;
-      snap = data&&data[0]||null;
-      if (snap) {
-        if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
-          // eslint-disable-next-line no-console
-          console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
-        } else {
-          // Non-prop legacy match — echoes the legacy column trio the
-          // verifier used (canonical_game_key + market_key + selection_key).
-          // eslint-disable-next-line no-console
-          console.log(`SNAPSHOT_MATCH via=legacy marketType=${ident.marketType||'?'} marketKey=${market} selectionKey=${pick}`);
+      for (let ki = 0; ki < keyCandidates.length; ki++) {
+        const tryKey = keyCandidates[ki];
+        const { data, error } = await sb.from('odds_snapshots').select('*')
+          .eq('canonical_game_key', tryKey).eq('market_key', marketForLookup).eq('selection_key', pickForLookup)
+          .limit(1);
+        if (error) throw error;
+        if (data && data[0]) {
+          snap = data[0];
+          matchStrategy = 'legacy';
+          if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+            console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+          }
+          _logSnapshotLookupHit('legacy', snap,
+            'searchedKey=' + tryKey + ' market=' + marketForLookup + ' selection=' + pickForLookup);
+          break;
         }
       }
     } catch(dbErr) {
@@ -4611,9 +4776,16 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
 
   // Tier 3: fresh in-memory poll cache when DB row is missing or stale.
   if (!snap || _classifyMarket(snap, nowMs) === 'stale') {
-    const cacheSnap = _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup);
+    let cacheSnap = null;
+    let cacheKeyUsed = null;
+    for (let ki = 0; ki < keyCandidates.length; ki++) {
+      cacheSnap = _lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup);
+      if (cacheSnap) { cacheKeyUsed = keyCandidates[ki]; break; }
+    }
     if (cacheSnap) {
-      console.log('[snapshot] LIVE_CACHE_FALLBACK cKey='+cKey+' market='+marketForLookup+' pick='+pickForLookup);
+      matchStrategy = 'live_cache';
+      _logSnapshotLookupHit('live_cache', cacheSnap,
+        'searchedKey=' + cacheKeyUsed + ' market=' + marketForLookup + ' selection=' + pickForLookup);
       snap = cacheSnap;
     }
   }
@@ -4621,15 +4793,19 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   // Snapshot not found via either tier
   if (!snap) {
     if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
-      // eslint-disable-next-line no-console
       console.log(`PROP_SNAPSHOT_MISS gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} cmk=${cmk||'-'} csk=${csk||'-'}`);
     }
+    await _logClosestSnapshotKeys(sb, preferredKey, marketForLookup, pickForLookup);
     if (bypassOk) {
       console.warn('[snapshot] MISSING — DEV FALLBACK for', leg.pick);
       return { ok:true, devFallback:true, warn:'odds_snapshot_missing',
                acceptedOddsAmerican:parseInt(leg.odds,10)||0, acceptedOddsDecimal:null, isLive:false };
     }
     return { ok:false, code:'odds_service_unavailable', reason:'snapshot_missing', leg:leg.pick };
+  }
+
+  if (!matchStrategy) {
+    _logSnapshotLookupHit('existing', snap, '');
   }
 
   // Market state classification
@@ -4719,7 +4895,10 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     acceptedOddsDecimal:  parseFloat(snap.odds_decimal),
     acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
     commenceTime:         commenceTime,
-    isLive:               state === 'live'   // server-authoritative; never trust client leg.isLive
+    isLive:               state === 'live',   // server-authoritative; never trust client leg.isLive
+    // Prefer the snapshot's Owls key so ticket_legs grade against the same
+    // identity we looked up (not the lobby's short "mlb|..." key).
+    canonicalGameKey:     snap.canonical_game_key || preferredKey || rawKey
   };
 }
 
@@ -4804,7 +4983,8 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
       odds_snapshot_id:       vr.snapshotId||null,
       accepted_at:            new Date(nowMs).toISOString(),
       dev_fallback:           vr.devFallback||false,
-      server_is_live:         vr.isLive||false   // server-derived; used by RPC, not client leg.isLive
+      server_is_live:         vr.isLive||false,   // server-derived; used by RPC, not client leg.isLive
+      canonicalGameKey:       vr.canonicalGameKey || legs[i].canonicalGameKey
     }));
   }
   const payout = Math.round(stake*product*100)/100;
