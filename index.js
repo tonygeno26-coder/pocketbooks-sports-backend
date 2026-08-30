@@ -7760,25 +7760,34 @@ app.get('/api/markets/status', async (req, res) => {
   const providerHealthy = cache.sourceStatus === 'healthy' &&
     cache.gameCount > 0 &&
     (cacheAgeMs === null || cacheAgeMs <= PREGAME_SNAPSHOT_TTL_MS);
-  // Count markets by state from cache (fast, no DB hit)
+  // Count markets by state from cache (fast, no DB hit).
+  // Same three shapes as _upsertOddsSnapshots:
+  //   Odds-API object { outcomes, updatedAt }  — classify once
+  //   Owls overlay    [ entry, entry, ... ]    — classify each outcome
+  //   Single Owls     { marketType, ... }      — classify the entry
+  // Owls arrays have no updatedAt; use cache.updatedAt like _lookupSnapshotFromLiveCache.
   let active=0, live=0, suspended=0, stale=0, finalCount=0, canceled=0;
-  Object.values(cache.marketsByCanonicalKey).forEach(function(entry) {
-    const state = _classifyMarket({
-      fetched_at: entry.updatedAt,
-      suspended: entry.suspended,
-      commence_time: entry.commenceTime,
-      event_status: entry.gameStatus,
-      market_status: entry.marketStatus,
-      eventCompleted: entry.eventCompleted,
-      eventCanceled: entry.eventCanceled,
-      eventLive: entry.eventLive
-    }, nowMs);
-    if (state==='active')        active++;
-    else if (state==='live')      { live++; active++; } // live counts as placeable
-    else if (state==='suspended') suspended++;
-    else if (state==='stale')     stale++;
-    else if (state==='final')     finalCount++;
-    else if (state==='canceled')  canceled++;
+  Object.values(cache.marketsByCanonicalKey).forEach(function(value) {
+    const entries = Array.isArray(value) ? value : [value];
+    entries.forEach(function(entry) {
+      if (!entry || typeof entry !== 'object') return;
+      const state = _classifyMarket({
+        fetched_at: entry.updatedAt || cache.updatedAt,
+        suspended: entry.suspended,
+        commence_time: entry.commenceTime,
+        event_status: entry.gameStatus || entry.eventStatus,
+        market_status: entry.marketStatus,
+        eventCompleted: entry.eventCompleted,
+        eventCanceled: entry.eventCanceled,
+        eventLive: entry.eventLive
+      }, nowMs);
+      if (state==='active')        active++;
+      else if (state==='live')      { live++; active++; } // live counts as placeable
+      else if (state==='suspended') suspended++;
+      else if (state==='stale')     stale++;
+      else if (state==='final')     finalCount++;
+      else if (state==='canceled')  canceled++;
+    });
   });
   const warnings = [];
   if (stale > 0)         warnings.push('stale_markets:'+stale);
