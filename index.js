@@ -12488,6 +12488,14 @@ app.get('/api/admin/audit/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+try {
+  require('./admin-diamonds-routes')({
+    app, requireActor, ROLE_RANK, getSupabase, _getWeekStart,
+    _verifyCryptoTx, _persistCryptoScan, _creditHostDiamondPurchase,
+    _writeHostDiamondLedger, emitEvent, _writeAuthAudit
+  });
+} catch (e) { console.warn('[admin-diamonds] register failed:', e.message); }
+
 app.listen(PORT, '0.0.0.0', () => {
   const _startSHA = 'v6-decode-fallback'; // bumped for v6
   console.log('\n╔══════════════════════════════════════════════════╗');
