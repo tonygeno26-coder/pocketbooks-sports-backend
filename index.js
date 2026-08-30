@@ -455,18 +455,11 @@ const _jobHandlers = {
   result_refresh: async function(job) {
     const p = job.payload_json||{};
     const sports = p.sports||(CACHE_SPORTS||['baseball_mlb']);
-    for (const sport of sports) {
-      try {
-        const url = 'https://api.the-odds-api.com/v4/sports/'+sport+
-          '/scores/?apiKey='+ODDS_KEY+'&daysFrom='+(p.daysBack||3);
-        const data = await new Promise(function(resolve){
-          const https=require('https');
-          const req=https.get(url,function(res){ let d=''; res.on('data',function(c){d+=c;});
-            res.on('end',function(){ try{resolve(JSON.parse(d));}catch(_e){resolve([]);} }); });
-          req.on('error',function(){ resolve([]); }); req.setTimeout(8000,function(){ req.destroy(); resolve([]); });
-        });
-        if (Array.isArray(data)) await _upsertResultSnapshots(data, sport);
-      } catch(_e) { logEvent('warn','job:result_refresh_sport_error',{ sport, err:_e.message }); }
+    await _refreshResultSnapshots(sports, p.daysBack||3);
+    if (!_mlbGradePollerStarted) {
+      enqueueJob('result_refresh', p, {
+        runAfter: new Date(Date.now() + MLB_GRADE_POLL_MS).toISOString()
+      });
     }
   },
   grade_run: async function(job) {
@@ -478,6 +471,11 @@ const _jobHandlers = {
     const fakeReq = { body:{ daysBack:p.daysBack||3, clubId:p.clubId }, _actor:{ actorId:'worker', role:'owner' }, _clubId:p.clubId||null };
     // Call the grade core function
     await _runGradeCore(fakeReq, sb);
+    if (!_mlbGradePollerStarted) {
+      enqueueJob('grade_run', p, {
+        runAfter: new Date(Date.now() + MLB_GRADE_POLL_MS).toISOString()
+      });
+    }
   },
   settlement_close_check: async function(job) {
     // Check for clubs with no activity this week — log only, no auto-close
@@ -499,10 +497,19 @@ async function _runGradeCore(fakeReq, sb) {
   if (!tickets||!tickets.length) return { graded:0, skipped:0 };
   const ticketIds = tickets.map(function(t){ return t.id; });
   const { data:allLegs } = await sb.from('ticket_legs').select('*').in('ticket_id',ticketIds);
+  const sports = [...new Set((allLegs||[]).map(function(l){
+    return _oddsApiSportKey(l.sport || l.league || 'baseball_mlb');
+  }))];
+  try { await _refreshResultSnapshots(sports.length ? sports : ['baseball_mlb'], daysBack); }
+  catch(_e) { console.warn('[grade-core] result refresh', _e.message); }
   const uniqueKeys = [...new Set((allLegs||[]).map(function(l){ return l.canonical_game_key||''; }).filter(Boolean))];
-  const { data:snapRows } = uniqueKeys.length ? await sb.from('result_snapshots').select('*').in('canonical_game_key',uniqueKeys) : { data:[] };
+  const lookupKeys = [];
+  uniqueKeys.forEach(function(k) {
+    _gameKeyLookupCandidates(k).forEach(function(c){ lookupKeys.push(c); });
+  });
+  const { data:snapRows } = lookupKeys.length ? await sb.from('result_snapshots').select('*').in('canonical_game_key',lookupKeys) : { data:[] };
   const resultsByKey = {};
-  (snapRows||[]).forEach(function(r){ resultsByKey[r.canonical_game_key]=r; });
+  (snapRows||[]).forEach(function(r){ _indexResultByLookupKeys(resultsByKey, r); });
   let graded=0, skipped=0;
   for (const ticket of tickets) {
     try {
@@ -538,7 +545,17 @@ async function _runGradeCore(fakeReq, sb) {
         p_idempotency_key:'GR_'+outcome.outcome+'_'+ticket.id, p_created_by:'worker',
         p_override_profit:overrideProfit  // null on normal path; non-null for push-reduced parlays
       });
-      if (gr.ok||gr.idempotent) graded++; else skipped++;
+      if (gr.ok||gr.idempotent) {
+        graded++;
+        try {
+          await sb.from('audit_events').insert({
+            event_type:'ticket_graded_server',
+            ticket_id:ticket.id, club_id:ticket.club_id||null, actor_id:'worker',
+            payload:{ result:outcome.outcome, source:'worker', playerId:ticket.player_id,
+                      pushReduced:overrideProfit!=null, overrideProfit }
+          });
+        } catch(_ae) {}
+      } else skipped++;
     } catch(_e) { logEvent('error','grade_core_ticket_error',{ ticketId:ticket.id, err:_e.message }); skipped++; }
   }
   return { graded, skipped };
@@ -548,6 +565,11 @@ async function _runGradeCore(fakeReq, sb) {
 const crypto = require('crypto');
 const WORKER_ID = 'worker_'+crypto.randomBytes(4).toString('hex');
 const WORKER_POLL_MS = parseInt(process.env.WORKER_POLL_MS)||20000; // 20s default
+const MLB_GRADE_POLL_MS = parseInt(process.env.MLB_GRADE_POLL_MS, 10) || 60000;
+let _lastResultSuccessAt = null;
+let _lastGradePollAt = null;
+let _mlbGradePollerStarted = false;
+let _gradePollInFlight = false;
 
 async function _workerTick() {
   const job = await _claimNextJob(WORKER_ID);
@@ -573,6 +595,7 @@ if (process.env.ENABLE_WORKER==='true') {
   // Seed recurring jobs
   enqueueJob('odds_refresh',{},{idempotencyKey:'BOOT_odds_refresh'});
   enqueueJob('result_refresh',{},{idempotencyKey:'BOOT_result_refresh'});
+  enqueueJob('grade_run',{},{idempotencyKey:'BOOT_grade_run'});
 }
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -2648,8 +2671,10 @@ app.get('/api/health', async (req, res) => {
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
-    resultStatus:'unknown', queueStatus:'not_implemented',
-    lastOddsSuccessAt:lastOdds, lastResultSuccessAt:null,
+    resultStatus:_lastResultSuccessAt?'healthy':(_mlbGradePollerStarted?'starting':'unknown'),
+    queueStatus:'not_implemented',
+    lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
+    lastGradePollAt:_lastGradePollAt, gradePollerStarted:_mlbGradePollerStarted,
     requestId:req.requestId });
 });
 
@@ -8108,20 +8133,122 @@ console.log('ODDS_API_KEY set:', !!_k, '| fingerprint:', _k ? _k.slice(0,4)+'...
 // RESULT SNAPSHOT ENGINE (Phase M)
 // ════════════════════════════════════════════════════════════════════════════
 
+// Map ticket sport labels (MLB, mlb, baseball_mlb) to Odds API sport keys.
+function _oddsApiSportKey(sport) {
+  const s = String(sport || 'baseball_mlb').toLowerCase().trim();
+  if (!s || s === 'unknown') return 'baseball_mlb';
+  if (typeof _CACHE_SPORT_KEY_BY_SHORT !== 'undefined' && _CACHE_SPORT_KEY_BY_SHORT[s])
+    return _CACHE_SPORT_KEY_BY_SHORT[s];
+  return s;
+}
+
+// Ticket/odds_snapshots keys are "baseball_mlb|Boston Red Sox|New York Yankees|YYYY-MM-DD".
+function _resultSnapshotCanonicalKey(game, sport) {
+  const sportKey = _oddsApiSportKey((game && game.sport_key) || sport || 'baseball_mlb');
+  const away = (game && game.away_team) || '';
+  const home = (game && game.home_team) || '';
+  const date = String((game && game.commence_time) || '').slice(0, 10);
+  return sportKey + '|' + away + '|' + home + '|' + date;
+}
+
+function _indexResultByLookupKeys(resultsByKey, row) {
+  if (!row || !resultsByKey) return;
+  _gameKeyLookupCandidates(row.canonical_game_key || '').forEach(function(k) {
+    resultsByKey[k] = row;
+  });
+  if (row.away_team && row.home_team) {
+    const slug = _buildCKeyFromGame({
+      sport_key: row.sport || 'baseball_mlb',
+      away_team: row.away_team,
+      home_team: row.home_team,
+      commence_time: row.commence_time || ''
+    });
+    _gameKeyLookupCandidates(slug).forEach(function(k) { resultsByKey[k] = row; });
+  }
+}
+
+function _lookupResultByGameKey(resultsByKey, cKey) {
+  if (!resultsByKey) return null;
+  const cands = _gameKeyLookupCandidates(cKey);
+  for (let i = 0; i < cands.length; i++) {
+    if (resultsByKey[cands[i]]) return resultsByKey[cands[i]];
+  }
+  return null;
+}
+
+function _fetchOddsApiScores(sport, daysBack) {
+  const sportKey = _oddsApiSportKey(sport);
+  const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+
+    '/scores/?apiKey='+ODDS_KEY+'&daysFrom='+(daysBack||3);
+  return new Promise(function(resolve){
+    const https=require('https');
+    const req=https.get(url,function(res){ let d=''; res.on('data',function(c){d+=c;});
+      res.on('end',function(){ try{resolve(JSON.parse(d));}catch(_e){resolve([]);} }); });
+    req.on('error',function(){ resolve([]); });
+    req.setTimeout(8000,function(){ req.destroy(); resolve([]); });
+  });
+}
+
+async function _refreshResultSnapshots(sports, daysBack) {
+  sports = sports && sports.length ? sports : ['baseball_mlb'];
+  let upserted = 0;
+  for (let i = 0; i < sports.length; i++) {
+    const sport = sports[i];
+    try {
+      const data = await _fetchOddsApiScores(sport, daysBack);
+      if (Array.isArray(data) && data.length) {
+        const n = await _upsertResultSnapshots(data, sport);
+        upserted += (typeof n === 'number' ? n : 0);
+      }
+    } catch (_e) {
+      logEvent('warn','job:result_refresh_sport_error',{ sport, err:_e.message });
+    }
+  }
+  return upserted;
+}
+
+async function _mlbGradePollTick() {
+  if (_gradePollInFlight) return;
+  _gradePollInFlight = true;
+  _lastGradePollAt = new Date().toISOString();
+  try {
+    const sb = getSupabase();
+    if (!sb || !ODDS_KEY) {
+      console.warn('[grade-poll] skip sb='+!!sb+' oddsKey='+!!ODDS_KEY);
+      return;
+    }
+    await _refreshResultSnapshots(['baseball_mlb'], 3);
+    const r = await _runGradeCore({ body:{ daysBack:3 } }, sb);
+    console.log('[grade-poll] graded='+(r&&r.graded||0)+' skipped='+(r&&r.skipped||0)+
+      ' lastResult='+_lastResultSuccessAt);
+  } catch (e) {
+    console.error('[grade-poll] fail', e.message);
+  } finally {
+    _gradePollInFlight = false;
+  }
+}
+
+function _startMlbGradePoller() {
+  if (_mlbGradePollerStarted) return;
+  _mlbGradePollerStarted = true;
+  console.log('[grade-poll] starting intervalMs='+MLB_GRADE_POLL_MS);
+  setTimeout(function() {
+    _mlbGradePollTick().catch(function(e){ console.error('[grade-poll]', e.message); });
+  }, 15000);
+  setInterval(function() {
+    _mlbGradePollTick().catch(function(e){ console.error('[grade-poll]', e.message); });
+  }, MLB_GRADE_POLL_MS);
+}
+
 // Upsert result snapshots from Odds API scores response
 async function _upsertResultSnapshots(scoresData, sport) {
   const sb = getSupabase();
-  if (!sb || !Array.isArray(scoresData)) return;
+  if (!sb || !Array.isArray(scoresData)) return 0;
   const now = new Date().toISOString();
   const rows = scoresData.map(function(game) {
     const sport_key = game.sport_key||sport||'unknown';
-    const sp = sport_key.split('_')[0].toUpperCase()==='BASEBALL'?'MLB'
-      :sport_key.split('_')[0].toUpperCase()==='BASKETBALL'?'NBA'
-      :sport_key.toUpperCase().split('_')[0];
-    const away = (game.away_team||'').toLowerCase().replace(/\s+/g,'-');
-    const home = (game.home_team||'').toLowerCase().replace(/\s+/g,'-');
-    const date = (game.commence_time||'').slice(0,10);
-    const cKey = sp+'|'+away+'|'+home+'|'+date;
+    const sp = _oddsApiSportKey(sport_key);
+    const cKey = _resultSnapshotCanonicalKey(game, sport);
     // Derive winner from scores
     const scores = game.scores||[];
     let homeScore=null, awayScore=null, winner=null;
@@ -8152,11 +8279,17 @@ async function _upsertResultSnapshots(scoresData, sport) {
       source:'odds-api', fetched_at:now
     };
   });
-  if (!rows.length) return;
+  if (!rows.length) return 0;
   try {
-    await sb.from('result_snapshots').upsert(rows, { onConflict:'canonical_game_key' });
+    const { error } = await sb.from('result_snapshots').upsert(rows, { onConflict:'canonical_game_key' });
+    if (error) {
+      console.warn('[results] upsert error:', error.message);
+      return 0;
+    }
+    _lastResultSuccessAt = now;
     console.log('[results] upserted '+rows.length+' result snapshots for '+sport);
-  } catch(e) { console.warn('[results] upsert error:', e.message); }
+    return rows.length;
+  } catch(e) { console.warn('[results] upsert error:', e.message); return 0; }
 }
 
 // Derive leg outcome from result snapshot
@@ -8208,7 +8341,7 @@ function _deriveTicketOutcome(ticket, legs, resultsByKey) {
   const type = (ticket.type||'single').toLowerCase();
   if (!legs.length) return { outcome:'error', reason:'no_legs' };
   const legOutcomes = legs.map(function(leg) {
-    const result = resultsByKey[leg.canonical_game_key||'']||null;
+    const result = _lookupResultByGameKey(resultsByKey, leg.canonical_game_key||'')||null;
     return Object.assign({ leg:leg.pick }, _deriveLegOutcome(leg, result));
   });
   const pending = legOutcomes.find(function(l){ return l.outcome==='pending'||l.outcome==='error'; });
@@ -8448,38 +8581,36 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
     let resultsByKey = {};
     if (uniqueKeys.length) {
       try {
+        const lookupKeys = [];
+        uniqueKeys.forEach(function(k) {
+          _gameKeyLookupCandidates(k).forEach(function(c){ lookupKeys.push(c); });
+        });
         const { data: snapRows } = await sb.from('result_snapshots').select('*')
-          .in('canonical_game_key', uniqueKeys);
-        (snapRows||[]).forEach(function(r){ resultsByKey[r.canonical_game_key]=r; });
-        // Also try to refresh from Odds API scores
-        const sports = [...new Set((allLegs||[]).map(function(l){ return (l.sport||'baseball_mlb').toLowerCase(); }))];
+          .in('canonical_game_key', lookupKeys);
+        (snapRows||[]).forEach(function(r){ _indexResultByLookupKeys(resultsByKey, r); });
+        const sports = [...new Set((allLegs||[]).map(function(l){ return _oddsApiSportKey(l.sport||'baseball_mlb'); }))];
         for (const sport of sports) {
           try {
-            const url = `https://api.the-odds-api.com/v4/sports/${sport}/scores/?apiKey=${ODDS_KEY}&daysFrom=${daysBack}`;
-            const scoresData = await new Promise(function(resolve) {
-              const https = require('https');
-              const req = https.get(url, function(res) {
-                let d=''; res.on('data',function(c){d+=c;}); res.on('end',function(){try{resolve(JSON.parse(d));}catch(_e){resolve([]);}});
-              }); req.on('error',function(){ resolve([]); }); req.setTimeout(8000,function(){ req.destroy(); resolve([]); });
-            });
+            const scoresData = await _fetchOddsApiScores(sport, daysBack);
             if (Array.isArray(scoresData)) {
               await _upsertResultSnapshots(scoresData, sport);
-              // Re-load updated snapshots
               scoresData.forEach(function(g){
-                if (!g.completed) return;
-                const sp=g.sport_key.includes('baseball')?'MLB':g.sport_key.split('_')[0].toUpperCase();
-                const away=(g.away_team||'').toLowerCase().replace(/\s+/g,'-');
-                const home=(g.home_team||'').toLowerCase().replace(/\s+/g,'-');
-                const date=(g.commence_time||'').slice(0,10);
-                const cKey=sp+'|'+away+'|'+home+'|'+date;
                 const scores=g.scores||[];
                 const h=scores.find(function(s){return s.name===g.home_team;});
                 const a=scores.find(function(s){return s.name===g.away_team;});
-                if(h&&a){
-                  resultsByKey[cKey]={ status:'final', home_team:g.home_team, away_team:g.away_team,
-                    home_score:parseInt(h.score,10)||0, away_score:parseInt(a.score,10)||0,
-                    winner:parseInt(h.score,10)>parseInt(a.score,10)?'home':parseInt(a.score,10)>parseInt(h.score,10)?'away':'tie' };
-                }
+                const row = {
+                  canonical_game_key:_resultSnapshotCanonicalKey(g, sport),
+                  status: g.completed ? 'final' : 'scheduled',
+                  home_team:g.home_team, away_team:g.away_team,
+                  commence_time:g.commence_time,
+                  sport:_oddsApiSportKey(g.sport_key||sport),
+                  home_score:h?parseInt(h.score,10)||0:null,
+                  away_score:a?parseInt(a.score,10)||0:null,
+                  winner: (g.completed && h && a)
+                    ? (parseInt(h.score,10)>parseInt(a.score,10)?'home':parseInt(a.score,10)>parseInt(h.score,10)?'away':'tie')
+                    : null
+                };
+                _indexResultByLookupKeys(resultsByKey, row);
               });
             }
           } catch(_e) { console.warn('[grade/run] score fetch for '+sport+':', _e.message); }
@@ -8558,8 +8689,9 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
 
         const { data: auditData } = await sb.from('audit_events').insert({
           event_type:'ticket_graded_server',
-          ticket_id:ticket.id, player_id:ticket.player_id, club_id:ticket.club_id,
-          payload:{ result:combined, source:'result_snapshot', legCount:ticketLegs.length,
+          ticket_id:ticket.id, club_id:ticket.club_id, actor_id:'server-grade-api',
+          payload:{ result:combined, source:'result_snapshot', playerId:ticket.player_id,
+                    legCount:ticketLegs.length,
                     payout, delta, pushReduced:overrideProfit!=null, overrideProfit,
                     rpcOk:gradeResult.ok, balanceAfter:gradeResult.balance_after }
         }).select('id');
@@ -11496,6 +11628,8 @@ app.get('/api/grade/status', async (req, res) => {
       .select('id',{ count:'exact' }).in('status',['active','open']);
     res.json({ enabled:true, lastGradedAt: recent&&recent[0] ? recent[0].created_at : null,
       recentGrades: recent||[], activeTicketCount: active ? active.length : 0,
+      lastResultSuccessAt:_lastResultSuccessAt, lastGradePollAt:_lastGradePollAt,
+      gradePollerStarted:_mlbGradePollerStarted,
       containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
       dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
@@ -12527,6 +12661,7 @@ app.listen(PORT, '0.0.0.0', () => {
   telegramBot.startTelegramBot();
   dailyAudit.startScheduler({ getSupabase: getSupabase });
   _startSurvivorAutoGrade();
+  _startMlbGradePoller();
   // Init DB after server is bound
   initDB()
     .then(() => console.log('✅ DB ready'))
