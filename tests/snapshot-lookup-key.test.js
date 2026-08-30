@@ -258,6 +258,23 @@ test('verify path fills empty date and date-flexes prefix lookup', function() {
     'date-flex must prefix-match canonical_game_key');
 });
 
+test('date-flex runs on any miss, not only empty-date keys', function() {
+  assert(!/!snap && _gameKeyNeedsDateFlex\(rawKeyIn\) && !dateFromLeg/.test(indexSource),
+    'must not gate date-flex on empty date + missing scheduledStart');
+});
+
+test('live-cache snapshot includes point_line for totals exact-line check', function() {
+  assert(/point_line:\s*pointLine/.test(indexSource),
+    'live-cache snap must carry point_line so totals do not fail line_changed');
+});
+
+test('place-bet ingest fills missing line from pick and normalizes game key', function() {
+  assert(indexSource.includes('_extractSubmittedPointLine(out)'),
+    'must parse line from Over 9 / team +1.5 when client omits line');
+  assert(indexSource.includes('_gameKeyLookupCandidates(filledKey || out.canonicalGameKey)'),
+    'must expand mlb/hyphenated keys to Owls form at ingest');
+});
+
 test('moneyline vs total cannot share a line-flex prefix', function() {
   assert(indexSource.includes("ident.marketType === MARKET_TYPES.TOTAL"),
     'line-flex must be gated on total/spread market types');

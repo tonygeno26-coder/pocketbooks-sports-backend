@@ -4305,9 +4305,16 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
     const oddsAmerican = Math.round(_toAmericanOdds(Number(rawOdds)));
     if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) return null;
     const oddsDecimal = _americanToDecimalOdds(oddsAmerican);
+    const pointLine = isOwls
+      ? (entry.line != null ? entry.line : null)
+      : (outcome && outcome.point != null ? outcome.point : null);
     return {
       odds_american: oddsAmerican,
       odds_decimal: oddsDecimal,
+      point_line: pointLine,
+      canonical_game_key: entry.canonicalKey || entry.cKey || cKey,
+      market_key: marketNorm,
+      selection_key: pickNorm,
       fetched_at: cache.updatedAt,
       commence_time: entry.commenceTime || null,
       event_status: entry.gameStatus || null,
@@ -4335,6 +4342,38 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
     for (const entry of owlsList) {
       const s = snapFromEntry(entry, null);
       if (s) return s;
+    }
+  }
+
+  // Prefix fallback: cache is dated (sport|Away|Home|YYYY-MM-DD) while the
+  // searched key may still be empty-dated or a short/hyphenated sibling.
+  const prefix = _gameKeyPrefixWithoutDate(cKey);
+  if (prefix) {
+    const today = new Date().toISOString().slice(0, 10);
+    const keys = Object.keys(byKey).filter(function(k) {
+      return k === cKey || k.indexOf(prefix) === 0 ||
+        _gameKeyPrefixWithoutDate(k) === prefix;
+    });
+    keys.sort(function(a, b) {
+      const da = String(a).split('|').pop() || '';
+      const db = String(b).split('|').pop() || '';
+      if (da === today && db !== today) return -1;
+      if (db === today && da !== today) return 1;
+      return db.localeCompare(da);
+    });
+    for (let i = 0; i < keys.length; i++) {
+      const list = byKey[keys[i]];
+      if (Array.isArray(list)) {
+        for (const entry of list) {
+          const s = snapFromEntry(entry, null);
+          if (s) return s;
+        }
+      } else if (list && Array.isArray(list.outcomes)) {
+        for (const o of list.outcomes) {
+          const s = snapFromEntry(list, o);
+          if (s) return s;
+        }
+      }
     }
   }
 
@@ -4895,9 +4934,10 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     }
   }
 
-  // Tier 2b: empty date on the searched key ("sport|Away|Home|") while the
-  // DB row has YYYY-MM-DD. Prefer today's dated row; refuse doubleheaders.
-  if (!snap && _gameKeyNeedsDateFlex(rawKeyIn) && !dateFromLeg) {
+  // Tier 2b: prefix-match the game key date. Covers empty dates, timezone
+  // off-by-one, and leftover display-string suffixes. Prefer today's dated
+  // row; refuse doubleheaders.
+  if (!snap) {
     try {
       const flexed = await _lookupSnapshotByDateFlexPrefix(sb, preferredKey, marketForLookup, pickForLookup);
       if (flexed && flexed.snap) {
@@ -8960,6 +9000,15 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     if (out.line != null && typeof out.line !== 'number') {
       const parsedLine = Number(out.line);
       if (Number.isFinite(parsedLine)) out.line = parsedLine;
+    }
+    if (out.line == null || !Number.isFinite(Number(out.line))) {
+      const parsedFromPick = _extractSubmittedPointLine(out);
+      if (Number.isFinite(parsedFromPick)) out.line = parsedFromPick;
+    }
+    if (out.canonicalGameKey) {
+      const filledKey = _fillEmptyGameKeyDate(out.canonicalGameKey, _isoDateFromValue(out.scheduledStart));
+      const cands = _gameKeyLookupCandidates(filledKey || out.canonicalGameKey);
+      out.canonicalGameKey = cands[cands.length - 1] || filledKey || out.canonicalGameKey;
     }
     return out;
   }) : [];
