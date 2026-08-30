@@ -275,6 +275,20 @@ test('place-bet ingest fills missing line from pick and normalizes game key', fu
     'must expand mlb/hyphenated keys to Owls form at ingest');
 });
 
+test('place-bet validates the snapshot contract fields including gameId', function() {
+  assert(indexSource.includes('function _ingestPlaceBetLeg'), 'must ingest via _ingestPlaceBetLeg');
+  assert(indexSource.includes('function _validatePlaceBetLegContract'), 'must validate contract');
+  assert(indexSource.includes("PLACE_BET_LEG_CONTRACT_FIELDS"), 'must declare contract field list');
+  ['pick','market','odds','line','canonicalGameKey','scheduledStart','gameId'].forEach(function(f) {
+    assert(indexSource.includes("'" + f + "'"), 'contract list missing ' + f);
+  });
+  assert(indexSource.includes('_missing_gameId'), 'must require gameId (or providerGameId alias)');
+  assert(indexSource.includes("out.gameId || out.providerGameId"),
+    'must map gameId from providerGameId alias');
+  assert(indexSource.includes("eq('provider_game_id'"),
+    'snapshot lookup must read contract gameId via provider_game_id');
+});
+
 test('moneyline vs total cannot share a line-flex prefix', function() {
   assert(indexSource.includes("ident.marketType === MARKET_TYPES.TOTAL"),
     'line-flex must be gated on total/spread market types');

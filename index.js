@@ -4818,6 +4818,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const cmk = ident.canonicalMarketKey || null;
   const csk = ident.canonicalSelectionKey || null;
 
+  const contractGameId = leg.gameId || leg.providerGameId || leg.provider_game_id || null;
   console.log('SNAPSHOT_LOOKUP_BEGIN'
     + ' cKey=' + JSON.stringify(rawKeyIn)
     + ' filledKey=' + JSON.stringify(rawKey)
@@ -4828,6 +4829,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     + ' pick=' + JSON.stringify(pick)
     + ' pickClean=' + JSON.stringify(pickClean)
     + ' selection=' + JSON.stringify(pickForLookup)
+    + ' gameId=' + JSON.stringify(contractGameId)
+    + ' line=' + JSON.stringify(leg.line != null ? leg.line : null)
+    + ' scheduledStart=' + JSON.stringify(leg.scheduledStart || null)
     + ' cmk=' + JSON.stringify(cmk)
     + ' csk=' + JSON.stringify(csk)
     + ' keyCandidates=' + JSON.stringify(keyCandidates));
@@ -4949,6 +4953,29 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
       }
     } catch (flexErr) {
       console.warn('[snapshot] date-flex lookup error:', (flexErr && flexErr.message) || flexErr);
+    }
+  }
+
+  // Tier 2c: contract gameId → provider_game_id (Owls/provider event id).
+  if (!snap && contractGameId) {
+    try {
+      const { data, error } = await sb.from('odds_snapshots').select('*')
+        .eq('provider_game_id', String(contractGameId))
+        .eq('market_key', marketForLookup)
+        .eq('selection_key', pickForLookup)
+        .limit(1);
+      if (error) throw error;
+      if (data && data[0]) {
+        snap = data[0];
+        matchStrategy = 'provider_game_id';
+        _logSnapshotLookupHit('provider_game_id', snap,
+          'gameId=' + contractGameId + ' market=' + marketForLookup + ' selection=' + pickForLookup);
+      }
+    } catch (gidErr) {
+      const msg = (gidErr && gidErr.message) || '';
+      if (!/provider_game_id/.test(msg)) {
+        console.warn('[snapshot] provider_game_id lookup error:', msg);
+      }
     }
   }
 
@@ -5101,6 +5128,59 @@ function _extractSubmittedPointLine(leg) {
   const text = String(leg.pick||leg.selectionLabel||'');
   const m = text.match(/(?:^|\s)([+-]?\d+(?:\.\d+)?)(?:\s|$)/);
   return m ? Number(m[1]) : NaN;
+}
+
+// Place-bet snapshot contract. Frontend _buildContractPlaceLeg and this
+// ingest MUST agree. Extra aliases (scheduled_start, commenceTime,
+// providerGameId) are fallbacks only — these seven fields are canonical.
+const PLACE_BET_LEG_CONTRACT_FIELDS = Object.freeze([
+  'pick', 'market', 'odds', 'line', 'canonicalGameKey', 'scheduledStart', 'gameId'
+]);
+
+function _ingestPlaceBetLeg(leg) {
+  const out = Object.assign({}, leg || {});
+  out.pick = _stripToWinSuffix(out.pick || '');
+  out.canonicalGameKey = out.canonicalGameKey || out.canonical_game_key || out.gameKey || null;
+  out.scheduledStart   = out.scheduledStart || out.scheduled_start || out.commenceTime || out.commence_time || null;
+  out.gameId           = out.gameId || out.providerGameId || out.provider_game_id || null;
+  if (out.gameId != null && out.gameId !== '') out.gameId = String(out.gameId);
+  else out.gameId = null;
+  out.providerGameId   = out.providerGameId || out.provider_game_id || out.gameId || null;
+  if (!out.market && out.marketType) out.market = out.marketType;
+  const coerced = _coerceMarketType(out.market);
+  if (coerced) out.market = coerced;
+  else if (out.market) out.market = String(out.market).toLowerCase().trim();
+  if (out.odds != null && typeof out.odds !== 'number') {
+    const parsedOdds = Number(String(out.odds).replace('+', ''));
+    if (Number.isFinite(parsedOdds)) out.odds = parsedOdds;
+  }
+  if (out.line != null && out.line !== '' && typeof out.line !== 'number') {
+    const parsedLine = Number(out.line);
+    if (Number.isFinite(parsedLine)) out.line = parsedLine;
+  }
+  if (out.line == null || out.line === '' || !Number.isFinite(Number(out.line))) {
+    const parsedFromPick = _extractSubmittedPointLine(out);
+    out.line = Number.isFinite(parsedFromPick) ? parsedFromPick : null;
+  } else {
+    out.line = Number(out.line);
+  }
+  if (out.market === 'moneyline') out.line = null;
+  if (out.canonicalGameKey) {
+    const filledKey = _fillEmptyGameKeyDate(out.canonicalGameKey, _isoDateFromValue(out.scheduledStart));
+    const cands = _gameKeyLookupCandidates(filledKey || out.canonicalGameKey);
+    out.canonicalGameKey = cands[cands.length - 1] || filledKey || out.canonicalGameKey;
+  }
+  return out;
+}
+
+function _validatePlaceBetLegContract(leg, i, errors) {
+  if (!leg.pick) errors.push('leg'+i+'_missing_pick');
+  if (!leg.market) errors.push('leg'+i+'_missing_market');
+  if (typeof leg.odds !== 'number' || !Number.isFinite(leg.odds)) errors.push('leg'+i+'_invalid_odds');
+  if (leg.line != null && !Number.isFinite(Number(leg.line))) errors.push('leg'+i+'_invalid_line');
+  if (!leg.canonicalGameKey) errors.push('leg'+i+'_missing_canonicalGameKey');
+  if (!leg.scheduledStart) errors.push('leg'+i+'_missing_scheduledStart');
+  if (!leg.gameId) errors.push('leg'+i+'_missing_gameId');
 }
 
 // Classify a snapshot into a market state.
@@ -8987,38 +9067,10 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   if (!VALID_TYPES.has(betType)) errors.push('invalid_betType:'+betType);
   const stakeAmt = parseFloat(stake);
   if (isNaN(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
-  let legsArr = Array.isArray(legs) ? legs.map(function(leg) {
-    const out = Object.assign({}, leg || {});
-    out.canonicalGameKey = out.canonicalGameKey || out.canonical_game_key || out.gameKey || null;
-    out.scheduledStart   = out.scheduledStart || out.scheduled_start || out.commenceTime || out.commence_time || null;
-    out.providerGameId   = out.providerGameId || out.provider_game_id || out.gameId || null;
-    if (!out.market && out.marketType) out.market = out.marketType;
-    if (out.odds != null && typeof out.odds !== 'number') {
-      const parsedOdds = Number(out.odds);
-      if (Number.isFinite(parsedOdds)) out.odds = parsedOdds;
-    }
-    if (out.line != null && typeof out.line !== 'number') {
-      const parsedLine = Number(out.line);
-      if (Number.isFinite(parsedLine)) out.line = parsedLine;
-    }
-    if (out.line == null || !Number.isFinite(Number(out.line))) {
-      const parsedFromPick = _extractSubmittedPointLine(out);
-      if (Number.isFinite(parsedFromPick)) out.line = parsedFromPick;
-    }
-    if (out.canonicalGameKey) {
-      const filledKey = _fillEmptyGameKeyDate(out.canonicalGameKey, _isoDateFromValue(out.scheduledStart));
-      const cands = _gameKeyLookupCandidates(filledKey || out.canonicalGameKey);
-      out.canonicalGameKey = cands[cands.length - 1] || filledKey || out.canonicalGameKey;
-    }
-    return out;
-  }) : [];
+  let legsArr = Array.isArray(legs) ? legs.map(_ingestPlaceBetLeg) : [];
   if (!legsArr.length) errors.push('no_legs');
   legsArr.forEach(function(leg,i) {
-    if (!leg.pick) errors.push('leg'+i+'_missing_pick');
-    if (!leg.market) errors.push('leg'+i+'_missing_market');
-    if (!leg.canonicalGameKey) errors.push('leg'+i+'_missing_canonicalGameKey');
-    if (typeof leg.odds !== 'number') errors.push('leg'+i+'_invalid_odds');
-    if (!leg.scheduledStart) errors.push('leg'+i+'_missing_scheduledStart');
+    _validatePlaceBetLegContract(leg, i, errors);
   });
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
@@ -9363,7 +9415,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
             ticket_id:             combo.id,
             leg_index:             legIdx,
             provider_name:         leg.providerName||'odds-api',
-            provider_game_id:      leg.providerGameId||null,
+            provider_game_id:      leg.providerGameId||leg.gameId||null,
             canonical_game_key:    leg.canonicalGameKey,
             sport:                 leg.sport||null,
             home_team:             leg.homeTeam||null,
@@ -9515,7 +9567,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       var ident = _normalizeLegIdentity(leg) || {};
       return {
         id: crypto.randomUUID(), ticket_id: ticketId, leg_index: i,
-        provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
+        provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||leg.gameId||null,
         canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
         home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
         scheduled_start: leg.scheduledStart||leg.commenceTime||null,
