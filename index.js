@@ -430,8 +430,15 @@ const _jobHandlers = {
     await pollLiveOddsLoop();
     try {
       const r = await _upsertOddsSnapshots();
-      if (r && !r.ok) console.error('[jobs] snapshot upsert failed:', r.error);
-    } catch(e) { console.error('[jobs] snapshot upsert threw:', e.message); }
+      if (r && r.ok) {
+        console.log('SNAPSHOT_UPSERT_RESULT source=job ok=true rows='+(r.rowsUpserted||0));
+      } else {
+        console.error('SNAPSHOT_UPSERT_RESULT source=job ok=false reason='+(r && (r.reason||r.error) || 'unknown')+
+          ' code='+(r && r.code || '?')+' rows='+(r && r.rowsUpserted || 0));
+      }
+    } catch(e) {
+      console.error('SNAPSHOT_UPSERT_RESULT source=job ok=false reason=threw message='+JSON.stringify(String(e && e.message || e).slice(0,300)));
+    }
     logEvent('info','job:odds_refresh',{ jobId:job.job_id });
     // In-process poller is the 5s production path. If it is not running
     // (no provider keys at boot, or poller never started), keep refreshing
@@ -4309,19 +4316,27 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
 }
 
 async function _upsertSnapshotRowsChunked(sb, rows) {
-  if (!rows || !rows.length) return { ok:true, rowsUpserted:0 };
+  if (!rows || !rows.length) {
+    console.log('SNAPSHOT_UPSERT_SKIP reason=empty_batch');
+    return { ok:true, rowsUpserted:0 };
+  }
   let rowsUpserted = 0;
+  const batchCount = Math.ceil(rows.length / SNAPSHOT_UPSERT_BATCH_SIZE);
+  console.log('SNAPSHOT_UPSERT_WRITE rows='+rows.length+' batches='+batchCount+' batchSize='+SNAPSHOT_UPSERT_BATCH_SIZE);
   for (let i = 0; i < rows.length; i += SNAPSHOT_UPSERT_BATCH_SIZE) {
     const batch = rows.slice(i, i + SNAPSHOT_UPSERT_BATCH_SIZE);
+    const batchIndex = Math.floor(i / SNAPSHOT_UPSERT_BATCH_SIZE) + 1;
     try {
       const { error: upsertErr } = await sb.from('odds_snapshots').upsert(batch,
         { onConflict:'canonical_game_key,market_key,selection_key' });
       if (upsertErr) throw upsertErr;
       rowsUpserted += batch.length;
+      console.log('SNAPSHOT_UPSERT_BATCH_OK batch='+batchIndex+'/'+batchCount+' rows='+batch.length+' total='+rowsUpserted);
     } catch(e) {
       const msg = (e && e.message) || '';
+      const code = (e && (e.code||e.statusCode)) || '?';
       if (/canonical_market_key|canonical_selection_key|market_type|player_name|prop_type|prop_side|player_team|provider_game_id/.test(msg)) {
-        console.warn('[snapshot] upsert: optional columns missing on DB, falling back to legacy projection');
+        console.warn('SNAPSHOT_UPSERT_FALLBACK reason=optional_columns_missing code='+code+' msg='+JSON.stringify(msg.slice(0,200)));
         const legacyRows = batch.map(function(r) {
           const copy = Object.assign({}, r);
           delete copy.canonical_market_key;
@@ -4339,14 +4354,15 @@ async function _upsertSnapshotRowsChunked(sb, rows) {
         const { error: legacyErr } = await sb.from('odds_snapshots').upsert(legacyRows,
           { onConflict:'canonical_game_key,market_key,selection_key' });
         if (legacyErr) {
-          console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR legacy', legacyErr, legacyRows));
-          return { ok:false, error:legacyErr.message, rowsUpserted };
+          console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_FAIL legacy', legacyErr, legacyRows));
+          return { ok:false, error:legacyErr.message, code:legacyErr.code||'?', rowsUpserted };
         }
         rowsUpserted += legacyRows.length;
+        console.log('SNAPSHOT_UPSERT_BATCH_OK batch='+batchIndex+'/'+batchCount+' rows='+legacyRows.length+' total='+rowsUpserted+' via=legacy');
         continue;
       }
-      console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_ERR primary', e, batch));
-      return { ok:false, error:msg || String(e), rowsUpserted };
+      console.error(_fmtSnapshotErr('SNAPSHOT_UPSERT_FAIL primary', e, batch));
+      return { ok:false, error:msg || String(e), code:code, rowsUpserted };
     }
   }
   return { ok:true, rowsUpserted };
@@ -4357,12 +4373,18 @@ async function _upsertOddsSnapshots() {
   const now = new Date().toISOString();
   const exp = new Date(Date.now()+SNAPSHOT_TTL_MS).toISOString();
   const cache = LIVE_MARKET_CACHE;
+  const cacheKeysPreview = Object.keys((cache && cache.marketsByCanonicalKey) || {});
+  console.log('SNAPSHOT_UPSERT_BEGIN games='+(cache && cache.gameCount || 0)+
+    ' markets='+(cache && cache.marketCount || 0)+
+    ' keys='+cacheKeysPreview.length+
+    ' hasSb='+(!!sb)+
+    ' provider='+(ODDS_PROVIDER||'unknown'));
   if (!sb) {
-    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_supabase');
+    console.log('SNAPSHOT_UPSERT_SKIP reason=no_supabase games='+(cache && cache.gameCount || 0));
     return { ok:false, reason:'no_supabase', rowsUpserted:0 };
   }
   if (!cache.gameCount) {
-    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+(ODDS_PROVIDER||'unknown')+' reason=no_games_in_cache');
+    console.log('SNAPSHOT_UPSERT_SKIP reason=no_games_in_cache hasSb=true');
     return { ok:false, reason:'no_games_in_cache', rowsUpserted:0 };
   }
 
@@ -4385,7 +4407,7 @@ async function _upsertOddsSnapshots() {
       sampleSkips.push({ reason, key: sampleKey, shape: sampleShape });
     }
   }
-  console.log('SNAPSHOT_ITERATION_BEGIN provider='+provider+' keys='+cacheKeys.length+' cacheMarketCount='+cache.marketCount);
+  console.log('SNAPSHOT_ITERATION_BEGIN provider='+provider+' games='+cache.gameCount+' keys='+cacheKeys.length+' cacheMarketCount='+cache.marketCount);
 
   // Normalize each value into an iterable list of per-outcome entries so we
   // can handle three shapes uniformly:
@@ -4460,23 +4482,27 @@ async function _upsertOddsSnapshots() {
   }
 
   if (!rows.length) {
-    console.log('ODDS_SNAPSHOT_UPSERT_EMPTY provider='+provider+
-      ' reason=no_rows_after_iteration cacheMarketCount='+cache.marketCount+
+    console.log('SNAPSHOT_UPSERT_SKIP reason=no_rows_after_iteration provider='+provider+
+      ' games='+cache.gameCount+
+      ' cacheMarketCount='+cache.marketCount+
       ' seenEntries='+seenEntries+
       ' skipReasons='+JSON.stringify(skipReasons)+
       ' sampleSkips='+JSON.stringify(sampleSkips));
     return { ok:false, reason:'no_rows', rowsUpserted:0 };
   }
 
-  console.log('ODDS_SNAPSHOT_UPSERT provider='+provider+' rows='+rows.length+
+  console.log('SNAPSHOT_UPSERT_READY provider='+provider+' games='+cache.gameCount+
+    ' rows='+rows.length+
     ' seenEntries='+seenEntries+
     ' skipReasons='+JSON.stringify(skipReasons));
   await _logSnapshotSchemaOnce(sb, rows[0]);
   const result = await _upsertSnapshotRowsChunked(sb, rows);
   if (result.ok) {
-    console.log('[snapshot] upserted '+result.rowsUpserted+' odds snapshots in batches of '+SNAPSHOT_UPSERT_BATCH_SIZE);
+    console.log('SNAPSHOT_UPSERT_OK rows='+result.rowsUpserted+' games='+cache.gameCount+' batchSize='+SNAPSHOT_UPSERT_BATCH_SIZE);
   } else {
-    console.error('[snapshot] upsert failed after '+result.rowsUpserted+' rows:', result.error);
+    console.error('SNAPSHOT_UPSERT_FAIL rowsPartial='+result.rowsUpserted+
+      ' code='+(result.code||'?')+
+      ' message='+JSON.stringify(String(result.error||'').slice(0,300)));
   }
   return result;
 }
@@ -4789,9 +4815,14 @@ const pollLiveOddsLoopWithSnapshots = async function() {
   }
   try {
     const r = await _upsertOddsSnapshots();
-    if (r && !r.ok) console.error('[poll] snapshot upsert failed:', r.reason || r.error);
+    if (r && r.ok) {
+      console.log('SNAPSHOT_UPSERT_RESULT ok=true rows='+(r.rowsUpserted||0));
+    } else {
+      console.error('SNAPSHOT_UPSERT_RESULT ok=false reason='+(r && (r.reason||r.error) || 'unknown')+
+        ' code='+(r && r.code || '?')+' rows='+(r && r.rowsUpserted || 0));
+    }
   } catch (upsertErr) {
-    console.error('[poll] snapshot upsert threw:', upsertErr.message);
+    console.error('SNAPSHOT_UPSERT_RESULT ok=false reason=threw message='+JSON.stringify(String(upsertErr && upsertErr.message || upsertErr).slice(0,300)));
   }
 };
 // Recursive setTimeout poller (not setInterval).
