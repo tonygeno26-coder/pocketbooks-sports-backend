@@ -8819,7 +8819,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         combo.legs.forEach(function(leg, legIdx) {
           const ident = _normalizeLegIdentity(leg) || {};
           rrAllLegRows.push({
-            id:                    combo.id + '_leg' + legIdx,
+            id:                    crypto.randomUUID(),
             ticket_id:             combo.id,
             leg_index:             legIdx,
             provider_name:         leg.providerName||'odds-api',
@@ -8974,7 +8974,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       // exact identity tuple grading + SGP will need later.
       var ident = _normalizeLegIdentity(leg) || {};
       return {
-        id: leg.legId || (ticketId+'_leg'+i), ticket_id: ticketId, leg_index: i,
+        id: crypto.randomUUID(), ticket_id: ticketId, leg_index: i,
         provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||null,
         canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
         home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
