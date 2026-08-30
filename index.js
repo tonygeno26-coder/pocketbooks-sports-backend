@@ -433,6 +433,17 @@ const _jobHandlers = {
       if (r && !r.ok) console.error('[jobs] snapshot upsert failed:', r.error);
     } catch(e) { console.error('[jobs] snapshot upsert threw:', e.message); }
     logEvent('info','job:odds_refresh',{ jobId:job.job_id });
+    // In-process poller is the 5s production path. If it is not running
+    // (no provider keys at boot, or poller never started), keep refreshing
+    // via the worker so lastSuccessAt / cacheAgeMs do not freeze after the
+    // single BOOT_odds_refresh job.
+    if (typeof _oddsPollerStarted === 'undefined' || !_oddsPollerStarted) {
+      const delayMs = (typeof LIVE_CACHE_POLL_INTERVAL_MS === 'number' && LIVE_CACHE_POLL_INTERVAL_MS > 0)
+        ? LIVE_CACHE_POLL_INTERVAL_MS : 5000;
+      enqueueJob('odds_refresh', {}, {
+        runAfter: new Date(Date.now() + delayMs).toISOString()
+      });
+    }
   },
   result_refresh: async function(job) {
     const p = job.payload_json||{};
@@ -4770,13 +4781,87 @@ const pollLiveOddsLoopWithSnapshots = async function() {
     console.error('[poll] snapshot upsert threw:', upsertErr.message);
   }
 };
-// Re-register poller with snapshot write.
+// Recursive setTimeout poller (not setInterval).
+// setInterval fires every 5s even when the previous async tick is still
+// running. Overlapping Owls/Odds-API fetches + snapshot upserts exhaust
+// sockets and the loop looks "stopped" (lastSuccessAt frozen, cacheAgeMs
+// climbs). Scheduling the next tick in `finally` serializes runs and
+// guarantees the loop survives a thrown error.
 // Live betting (DK-style) wants 5s refresh so price/score updates feel
 // real-time. Allow env override via LIVE_ODDS_POLL_MS for ops tuning.
 const LIVE_CACHE_POLL_INTERVAL_MS = _envMs('LIVE_ODDS_POLL_MS', 5 * 1000);
 const CACHE_POLL_INTERVAL = LIVE_CACHE_POLL_INTERVAL_MS; // backwards-compat alias
-if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY))
-  setInterval(pollLiveOddsLoopWithSnapshots, LIVE_CACHE_POLL_INTERVAL_MS);
+const POLL_WATCHDOG_STALE_MS = 30 * 1000;
+const POLL_WATCHDOG_CHECK_MS = 10 * 1000;
+
+let _oddsPollTimer = null;
+let _oddsWatchdogTimer = null;
+let _oddsPollGeneration = 0;
+let _oddsPollLastStartedAt = 0;
+let _oddsPollerStarted = false;
+
+function _clearOddsPollTimer() {
+  if (_oddsPollTimer) {
+    clearTimeout(_oddsPollTimer);
+    _oddsPollTimer = null;
+  }
+}
+
+function _scheduleOddsPollTick(delayMs) {
+  _clearOddsPollTimer();
+  _oddsPollTimer = setTimeout(_runOddsPollTick, delayMs);
+}
+
+async function _runOddsPollTick() {
+  _oddsPollTimer = null;
+  const generation = _oddsPollGeneration;
+  _oddsPollLastStartedAt = Date.now();
+  try {
+    await pollLiveOddsLoopWithSnapshots();
+  } catch (tickErr) {
+    console.error('[poll] uncaught tick error:', tickErr && tickErr.message);
+  } finally {
+    if (generation === _oddsPollGeneration) {
+      _scheduleOddsPollTick(LIVE_CACHE_POLL_INTERVAL_MS);
+    }
+  }
+}
+
+function _startOddsPoller(reason) {
+  _oddsPollGeneration++;
+  _oddsPollerStarted = true;
+  _clearOddsPollTimer();
+  console.log('[poll] starting odds poller reason='+(reason||'boot')+
+    ' intervalMs='+LIVE_CACHE_POLL_INTERVAL_MS);
+  _scheduleOddsPollTick(0);
+}
+
+function _oddsPollerWatchdogTick() {
+  try {
+    const ageMs = _oddsPollLastStartedAt ? (Date.now() - _oddsPollLastStartedAt) : Infinity;
+    if (ageMs > POLL_WATCHDOG_STALE_MS) {
+      console.warn('[poll] watchdog restart — last tick started '+ageMs+'ms ago');
+      _startOddsPoller('watchdog_stale');
+    }
+  } catch (wdErr) {
+    console.error('[poll] watchdog error:', wdErr && wdErr.message);
+  } finally {
+    _oddsWatchdogTimer = setTimeout(_oddsPollerWatchdogTick, POLL_WATCHDOG_CHECK_MS);
+  }
+}
+
+function _startOddsPollerWatchdog() {
+  if (_oddsWatchdogTimer) {
+    clearTimeout(_oddsWatchdogTimer);
+    _oddsWatchdogTimer = null;
+  }
+  _oddsWatchdogTimer = setTimeout(_oddsPollerWatchdogTick, POLL_WATCHDOG_CHECK_MS);
+}
+
+if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
+  _startOddsPoller('boot');
+  _startOddsPollerWatchdog();
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -5729,10 +5814,9 @@ async function pollLiveOddsLoop() {
   await _runOddsApiPoll('primary');
 }
 
-// Start poller on boot
-if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
-  pollLiveOddsLoopWithSnapshots(); // immediate — also fires _upsertOddsSnapshots on first tick
-}
+// Boot kick is `_startOddsPoller('boot')` above (setTimeout 0 + watchdog).
+// Do not call pollLiveOddsLoopWithSnapshots() again here — a second
+// overlapping first tick is what the serialized scheduler is meant to prevent.
 
 // ── ODDS VALIDATION HELPERS ───────────────────────────────────────────────────────────────────────────
 // (kept for bets/place validation — now uses LIVE_MARKET_CACHE instead of per-request fetch)

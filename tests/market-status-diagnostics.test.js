@@ -31,6 +31,17 @@ test('split freshness defaults are wired', function() {
   assert(indexSource.includes("LIVE_ODDS_POLL_MS', 5 * 1000"), 'poll default must be 5s');
 });
 
+test('odds poller uses recursive setTimeout plus 30s watchdog', function() {
+  assert(indexSource.includes('function _scheduleOddsPollTick'), 'recursive setTimeout scheduler missing');
+  assert(indexSource.includes('function _runOddsPollTick'), 'poll tick runner missing');
+  assert(indexSource.includes('const POLL_WATCHDOG_STALE_MS = 30 * 1000'), 'watchdog must restart after 30s');
+  assert(indexSource.includes(" _startOddsPoller('watchdog_stale')"), 'watchdog restart reason missing');
+  assert(indexSource.includes('_scheduleOddsPollTick(LIVE_CACHE_POLL_INTERVAL_MS)'), 'next tick must be scheduled from finally');
+  assert(indexSource.includes('} finally {'), 'tick must schedule next run in finally');
+  assert(!/setInterval\(\s*pollLiveOddsLoopWithSnapshots/.test(indexSource),
+    'in-process poller must not use setInterval');
+});
+
 test('/api/markets/status exposes live freshness diagnostics', function() {
   [
     'liveSnapshotTtlMs',
