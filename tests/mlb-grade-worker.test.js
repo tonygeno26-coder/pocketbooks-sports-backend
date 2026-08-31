@@ -148,6 +148,71 @@ test('index.js uses ticket-matching result keys not slug MLB keys', function() {
     'upsert should call _resultSnapshotCanonicalKey');
 });
 
+test('in-process poller grades without ODDS_KEY / host auth', function() {
+  assert(indexSource.includes("GRADE_POLL_SKIP reason=supabase_not_configured"),
+    'poller should skip only when supabase is missing');
+  assert(!indexSource.includes("skip sb='+!!sb+' oddsKey="),
+    'poller must not require ODDS_KEY');
+  assert(indexSource.includes("await _runGradeCore({ body:{ daysBack:3 } }, sb)"),
+    'poller must call _runGradeCore');
+  assert(indexSource.includes('auth=none clubs=ALL'),
+    'poller must advertise unauthenticated all-club grading');
+});
+
+test('ESPN scoreboard is the scores fallback when Odds API is empty', function() {
+  assert(indexSource.includes('function _fetchEspnSportScores'), 'missing ESPN fetch');
+  assert(indexSource.includes('function _fetchScoresForSport'), 'missing scores aggregator');
+  assert(indexSource.includes("source: 'espn'"), 'espn source not returned');
+  assert(indexSource.includes('baseball/mlb'), 'MLB ESPN path missing');
+});
+
+test('poller stamps lastGradeRunAt even when nothing grades', function() {
+  assert(indexSource.includes('let _lastGradeRunAt = null'), 'missing lastGradeRunAt');
+  assert(indexSource.includes('_lastGradeRunAt = new Date().toISOString()'),
+    'poller never stamps lastGradeRunAt');
+  assert(indexSource.includes('GRADE_POLL_START'), 'missing GRADE_POLL_START log');
+  assert(indexSource.includes('GRADE_CORE_SNAPSHOTS'), 'missing snapshot log');
+  assert(indexSource.includes('GRADE_CORE_DONE'), 'missing GRADE_CORE_DONE log');
+});
+
+test('ESPN games convert to ticket-matching Odds-shaped keys', function() {
+  const espnGame = {
+    id: '401234',
+    home: 'New York Yankees',
+    away: 'Boston Red Sox',
+    home_score: 16,
+    away_score: 1,
+    completed: true,
+    canceled: false,
+    commence_time: '2026-08-30T17:35:00Z'
+  };
+  const converted = {
+    id: String(espnGame.id),
+    sport_key: 'baseball_mlb',
+    home_team: espnGame.home,
+    away_team: espnGame.away,
+    commence_time: espnGame.commence_time,
+    completed: true,
+    scores: [
+      { name: espnGame.home, score: String(espnGame.home_score) },
+      { name: espnGame.away, score: String(espnGame.away_score) }
+    ]
+  };
+  assertEq(
+    _resultSnapshotCanonicalKey(converted, 'baseball_mlb'),
+    'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30'
+  );
+  const map = {};
+  const stored = {
+    canonical_game_key: _resultSnapshotCanonicalKey(converted, 'baseball_mlb'),
+    status: 'final', home_score: 16, away_score: 1, home_team: 'New York Yankees',
+    away_team: 'Boston Red Sox'
+  };
+  _gameKeyLookupCandidates(stored.canonical_game_key).forEach(function(k) { map[k] = stored; });
+  const hit = _lookupResultByGameKey(map, 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30');
+  assert(hit, 'ESPN-derived snapshot should match ticket key');
+});
+
 if (fail) {
   console.error('\n' + fail + ' failed, ' + pass + ' passed');
   process.exit(1);
