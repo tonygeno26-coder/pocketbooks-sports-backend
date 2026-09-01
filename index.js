@@ -2789,11 +2789,11 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = 'grade-canonical-key-match';
-  const _BUILD_MARKER = 'grade-canonical-key-match';
-  res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
-    commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
-    buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
+  const _healthMeta = require('./lib/build-info').toHealthPayload();
+  const _gitSha = _healthMeta.gitSha;
+  res.json({ ok:dbOk, status:'ok', uptime, version:process.env.APP_VERSION||_healthMeta.version||'unknown',
+    gitSha:_gitSha, commit:process.env.COMMIT_SHA||_healthMeta.commit,
+    bakedSHA:_gitSha, buildMarker:_gitSha, dbStatus, oddsStatus,
     resultStatus:_lastResultSuccessAt?'healthy':(_mlbGradePollerStarted?'starting':'unknown'),
     queueStatus:'not_implemented',
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
