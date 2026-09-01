@@ -11152,7 +11152,7 @@ app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('ca
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
-  const { clubId, playerId, ticketId, idempotencyKey, reason } = req.body || {};
+  const { clubId, playerId, ticketId, idempotencyKey, reason, force } = req.body || {};
   const now = new Date().toISOString();
   const errors = [];
   if (!ticketId)       errors.push('missing_ticketId');
@@ -11188,14 +11188,20 @@ app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('ca
     if (s === 'canceled' || s === 'voided') return res.json({ ok:true, idempotent:true, ticketId, message:'already_canceled' });
     if (s !== 'active' && s !== 'open') return res.status(400).json({ ok:false, error:'cannot_cancel_settled:status='+s });
 
-    // 3. Game started check via ticket_legs
-    const { data: legs } = await sb.from('ticket_legs').select('scheduled_start').eq('ticket_id', ticketId);
-    const nowMs = Date.now();
-    for (const leg of (legs||[])) {
-      if (!leg.scheduled_start) continue;
-      const ctMs = new Date(leg.scheduled_start).getTime();
-      if (!isNaN(ctMs) && nowMs >= ctMs)
-        return res.status(400).json({ ok:false, error:'game_already_started:'+leg.scheduled_start });
+    // 3. Game started check via ticket_legs.
+    // Players cannot cancel after kickoff. Privileged force=true skips this so
+    // stale smoke/QA tickets can be voided through cancel_bet_tx instead of
+    // being deleted or left active forever.
+    const _forceCancel = _isPrivilegedCancel && (force === true || force === 'true');
+    if (!_forceCancel) {
+      const { data: legs } = await sb.from('ticket_legs').select('scheduled_start').eq('ticket_id', ticketId);
+      const nowMs = Date.now();
+      for (const leg of (legs||[])) {
+        if (!leg.scheduled_start) continue;
+        const ctMs = new Date(leg.scheduled_start).getTime();
+        if (!isNaN(ctMs) && nowMs >= ctMs)
+          return res.status(400).json({ ok:false, error:'game_already_started:'+leg.scheduled_start });
+      }
     }
 
     // 4. Phase I: call cancel_bet_tx RPC (atomic ticket status + canonical ledger)
