@@ -521,8 +521,12 @@ async function _runGradeCore(fakeReq, sb) {
     return _oddsApiSportKey(l.sport || l.league || 'baseball_mlb');
   }))];
   let snapshotsUpserted = 0;
+  let freshSnapRows = [];
   try {
-    snapshotsUpserted = await _refreshResultSnapshots(sports.length ? sports : ['baseball_mlb'], daysBack);
+    const refreshed = await _refreshResultSnapshots(sports.length ? sports : ['baseball_mlb'], daysBack);
+    snapshotsUpserted = (refreshed && typeof refreshed.upserted === 'number')
+      ? refreshed.upserted : (typeof refreshed === 'number' ? refreshed : 0);
+    freshSnapRows = (refreshed && refreshed.rows) || [];
   } catch(_e) { console.warn('GRADE_CORE_REFRESH_FAIL '+_e.message); }
   const uniqueKeys = [...new Set((allLegs||[]).map(function(l){ return l.canonical_game_key||''; }).filter(Boolean))];
   const lookupKeys = [];
@@ -533,20 +537,60 @@ async function _runGradeCore(fakeReq, sb) {
     ? await sb.from('result_snapshots').select('*').in('canonical_game_key',lookupKeys)
     : { data:[], error:null };
   if (sErr) console.warn('GRADE_CORE_SNAPSHOT_LOAD_FAIL '+sErr.message);
+  // Recent snapshots so team-name fallback works when stored ESPN keys
+  // don't overlap ticket_legs.canonical_game_key candidates.
+  const sinceIso = new Date(Date.now() - (Math.max(1, parseInt(daysBack,10)||3)+1)*86400000).toISOString();
+  const { data:recentSnaps, error:rErr } = await sb.from('result_snapshots')
+    .select('*').gte('fetched_at', sinceIso).limit(400);
+  if (rErr) console.warn('GRADE_CORE_SNAPSHOT_RECENT_FAIL '+rErr.message);
   const resultsByKey = {};
-  (snapRows||[]).forEach(function(r){ _indexResultByLookupKeys(resultsByKey, r); });
+  (snapRows||[]).concat(recentSnaps||[]).concat(freshSnapRows).forEach(function(r){
+    _indexResultByLookupKeys(resultsByKey, r);
+  });
+  const espnKeys = _uniqueResultRows(resultsByKey).map(function(r){
+    return r.canonical_game_key || '';
+  }).filter(Boolean);
+  const espnSample = espnKeys.slice(0, 12);
+  console.log('GRADE_KEY_COMPARE espnKeys='+espnKeys.length+
+    ' sample='+JSON.stringify(espnSample)+
+    ' ticketKeys='+uniqueKeys.length);
+  uniqueKeys.slice(0, 24).forEach(function(tk) {
+    const hit = _lookupResultByGameKey(resultsByKey, tk);
+    const hitKey = (hit && hit.canonical_game_key) || '';
+    const hitStatus = hit ? (hit.status || 'unknown') : 'miss';
+    console.log('GRADE_KEY_COMPARE ticketKey='+tk+
+      ' espnHitKey='+hitKey+
+      ' match='+(hit?'true':'false')+
+      ' hitStatus='+hitStatus);
+  });
   const matchedKeys = uniqueKeys.filter(function(k){ return !!_lookupResultByGameKey(resultsByKey, k); });
   const unmatchedSample = uniqueKeys.filter(function(k){ return !_lookupResultByGameKey(resultsByKey, k); }).slice(0, 8);
   console.log('GRADE_CORE_SNAPSHOTS upserted='+snapshotsUpserted+
-    ' dbRows='+(snapRows||[]).length+' uniqueTicketKeys='+uniqueKeys.length+
+    ' dbRows='+(snapRows||[]).length+' recentRows='+(recentSnaps||[]).length+
+    ' freshRows='+freshSnapRows.length+' uniqueTicketKeys='+uniqueKeys.length+
     ' matchedKeys='+matchedKeys.length+' unmatchedSample='+JSON.stringify(unmatchedSample));
+  let skipLogs = 0;
   for (const ticket of tickets) {
     try {
       if (ticket.graded_at) { bumpSkip('already_graded'); continue; }
       const ticketLegs = (allLegs||[]).filter(function(l){ return l.ticket_id===ticket.id; });
       const outcome = _deriveTicketOutcome(ticket, ticketLegs, resultsByKey);
       if (outcome.outcome==='error'||outcome.outcome==='pending') {
-        bumpSkip((outcome.reason||outcome.outcome||'pending').slice(0,80));
+        const reason = (outcome.reason||outcome.outcome||'pending').slice(0,80);
+        bumpSkip(reason);
+        if (skipLogs < 20) {
+          skipLogs++;
+          const leg0 = ticketLegs[0] || {};
+          const hit = _lookupResultForLeg(resultsByKey, leg0);
+          console.log('GRADE_TICKET_SKIP ticketId='+ticket.id+
+            ' ticketKey='+(leg0.canonical_game_key||'')+
+            ' home='+(leg0.home_team||'')+' away='+(leg0.away_team||'')+
+            ' pick='+(leg0.pick||'')+' market='+(leg0.market||'')+
+            ' match='+(hit?'true':'false')+
+            ' espnHitKey='+((hit && hit.canonical_game_key)||'')+
+            ' hitStatus='+(hit?(hit.status||'unknown'):'miss')+
+            ' reason='+reason);
+        }
         continue;
       }
       // GRD-2: recompute profit when pushed legs drop out of a parlay
@@ -578,8 +622,9 @@ async function _runGradeCore(fakeReq, sb) {
       });
       if (gr.ok||gr.idempotent) {
         graded++;
+        _lastGradedAt = new Date().toISOString();
         console.log('GRADE_CORE_GRADED ticketId='+ticket.id+' result='+outcome.outcome+
-          ' clubId='+(ticket.club_id||'null'));
+          ' clubId='+(ticket.club_id||'null')+' lastGradedAt='+_lastGradedAt);
         try {
           await sb.from('audit_events').insert({
             event_type:'ticket_graded_server',
@@ -598,8 +643,8 @@ async function _runGradeCore(fakeReq, sb) {
   }
   console.log('GRADE_CORE_DONE tickets='+tickets.length+' graded='+graded+
     ' skipped='+skipped+' skipReasons='+JSON.stringify(skipReasons)+
-    ' lastResult='+_lastResultSuccessAt);
-  return { graded, skipped, skipReasons:skipReasons, snapshotsUpserted:snapshotsUpserted };
+    ' lastResult='+_lastResultSuccessAt+' lastGradedAt='+_lastGradedAt);
+  return { graded, skipped, skipReasons:skipReasons, snapshotsUpserted:snapshotsUpserted, lastGradedAt:_lastGradedAt };
 }
 
 // ── WORKER LOOP ───────────────────────────────────────────────────────────────────────────
@@ -610,6 +655,7 @@ const MLB_GRADE_POLL_MS = parseInt(process.env.MLB_GRADE_POLL_MS, 10) || 60000;
 let _lastResultSuccessAt = null;
 let _lastGradePollAt = null;
 let _lastGradeRunAt = null;
+let _lastGradedAt = null;
 let _mlbGradePollerStarted = false;
 let _gradePollInFlight = false;
 
@@ -2708,8 +2754,8 @@ app.get('/api/health', async (req, res) => {
   const cache = typeof LIVE_MARKET_CACHE!=='undefined'?LIVE_MARKET_CACHE:null;
   const oddsStatus = cache&&cache.sourceStatus||'unknown';
   const lastOdds   = cache&&cache.lastSuccessAt||null;
-  const _BAKED_SHA = 'grade-espn-fallback';
-  const _BUILD_MARKER = 'grade-espn-fallback';
+  const _BAKED_SHA = 'grade-canonical-key-match';
+  const _BUILD_MARKER = 'grade-canonical-key-match';
   res.json({ ok:dbOk, uptime, version:process.env.APP_VERSION||'unknown',
     commit:process.env.COMMIT_SHA||_BAKED_SHA, bakedSHA:_BAKED_SHA,
     buildMarker:_BUILD_MARKER, dbStatus, oddsStatus,
@@ -2717,6 +2763,7 @@ app.get('/api/health', async (req, res) => {
     queueStatus:'not_implemented',
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
     lastGradePollAt:_lastGradePollAt, lastGradeRunAt:_lastGradeRunAt,
+    lastGradedAt:_lastGradedAt,
     gradePollerStarted:_mlbGradePollerStarted,
     requestId:req.requestId });
 });
@@ -5421,6 +5468,31 @@ function _unhyphenateGameKeyTeams(cKey) {
   return parts.join('|');
 }
 
+// Title-case / spaced team names → hyphen slugs:
+//   "Boston Red Sox" → "boston-red-sox"
+function _hyphenateGameKeyTeams(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return String(cKey);
+  function slug(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, '-');
+  }
+  parts[1] = slug(parts[1]);
+  parts[2] = slug(parts[2]);
+  return parts.join('|');
+}
+
+// baseball_mlb|... → MLB|... so ticket Owls keys match legacy slug snapshots.
+function _collapseSportPrefixOnGameKey(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (!parts[0]) return cKey;
+  const collapsed = (typeof _sportPrefix === 'function') ? _sportPrefix(parts[0]) : parts[0];
+  if (!collapsed || collapsed === parts[0]) return String(cKey);
+  parts[0] = collapsed;
+  return parts.join('|');
+}
+
 function _gameKeyLookupCandidates(cKey) {
   const seen = {};
   const out = [];
@@ -5429,11 +5501,12 @@ function _gameKeyLookupCandidates(cKey) {
     seen[k] = true;
     out.push(k);
   }
-  add(cKey);
-  const expanded = _expandSportPrefixOnGameKey(cKey);
-  add(expanded);
-  add(_unhyphenateGameKeyTeams(cKey));
-  add(_unhyphenateGameKeyTeams(expanded));
+  const prefixes = [cKey, _expandSportPrefixOnGameKey(cKey), _collapseSportPrefixOnGameKey(cKey)];
+  prefixes.forEach(function(p) {
+    add(p);
+    add(_unhyphenateGameKeyTeams(p));
+    add(_hyphenateGameKeyTeams(p));
+  });
   return out;
 }
 
@@ -8180,7 +8253,8 @@ function _resultSnapshotCanonicalKey(game, sport) {
   const sportKey = _oddsApiSportKey((game && game.sport_key) || sport || 'baseball_mlb');
   const away = (game && game.away_team) || '';
   const home = (game && game.home_team) || '';
-  const date = String((game && game.commence_time) || '').slice(0, 10);
+  const date = _isoDateFromValue((game && game.commence_time) || '')
+    || String((game && game.commence_time) || '').slice(0, 10);
   return sportKey + '|' + away + '|' + home + '|' + date;
 }
 
@@ -8227,19 +8301,25 @@ function _lookupResultByTeams(resultsByKey, home, away, dateStr) {
   if (!home && !away) return null;
   const rows = _uniqueResultRows(resultsByKey);
   const date = String(dateStr || '').slice(0, 10);
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    const homeOk = !home || _teamNamesLooselyEqual(row.home_team, home);
-    const awayOk = !away || _teamNamesLooselyEqual(row.away_team, away);
-    if (!homeOk || !awayOk) continue;
-    if (date) {
-      const rowDate = String(row.commence_time || '').slice(0, 10);
-      const keyDate = String(row.canonical_game_key || '').split('|').pop();
-      if (rowDate && rowDate !== date && keyDate !== date) continue;
-    }
-    return row;
+  function dateOk(row) {
+    if (!date) return true;
+    const rowDate = _isoDateFromValue(row.commence_time || '') || String(row.commence_time || '').slice(0, 10);
+    const keyDate = String(row.canonical_game_key || '').split('|').pop();
+    if (rowDate && rowDate !== date && keyDate !== date) return false;
+    return true;
   }
-  return null;
+  function matchOriented(wantHome, wantAway) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const homeOk = !wantHome || _teamNamesLooselyEqual(row.home_team, wantHome);
+      const awayOk = !wantAway || _teamNamesLooselyEqual(row.away_team, wantAway);
+      if (!homeOk || !awayOk) continue;
+      if (!dateOk(row)) continue;
+      return row;
+    }
+    return null;
+  }
+  return matchOriented(home, away) || matchOriented(away, home);
 }
 
 function _lookupResultByGameKey(resultsByKey, cKey) {
@@ -8255,11 +8335,16 @@ function _lookupResultByGameKey(resultsByKey, cKey) {
 }
 
 function _lookupResultForLeg(resultsByKey, leg) {
-  const hit = _lookupResultByGameKey(resultsByKey, (leg && (leg.canonical_game_key || leg.canonicalGameKey)) || '');
+  const cKey = (leg && (leg.canonical_game_key || leg.canonicalGameKey)) || '';
+  const hit = _lookupResultByGameKey(resultsByKey, cKey);
   if (hit) return hit;
   if (!leg) return null;
-  const date = _isoDateFromValue(leg.scheduled_start || leg.scheduledStart || leg.commence_time || '');
-  return _lookupResultByTeams(resultsByKey, leg.home_team || leg.homeTeam, leg.away_team || leg.awayTeam, date);
+  const parts = String(cKey).split('|');
+  const date = _isoDateFromValue(leg.scheduled_start || leg.scheduledStart || leg.commence_time || '')
+    || (parts[3] || '');
+  const home = leg.home_team || leg.homeTeam || parts[2] || '';
+  const away = leg.away_team || leg.awayTeam || parts[1] || '';
+  return _lookupResultByTeams(resultsByKey, home, away, date);
 }
 
 function _espnScoreboardPath(sport) {
@@ -8375,14 +8460,19 @@ async function _fetchScoresForSport(sport, daysBack) {
 async function _refreshResultSnapshots(sports, daysBack) {
   sports = sports && sports.length ? sports : ['baseball_mlb'];
   let upserted = 0;
+  const allRows = [];
   console.log('RESULT_REFRESH_START sports='+sports.join(',')+' daysBack='+(daysBack||3));
   for (let i = 0; i < sports.length; i++) {
     const sport = sports[i];
     try {
       const fetched = await _fetchScoresForSport(sport, daysBack);
       if (Array.isArray(fetched.games) && fetched.games.length) {
-        const n = await _upsertResultSnapshots(fetched.games, sport, fetched.source);
-        upserted += (typeof n === 'number' ? n : 0);
+        const result = await _upsertResultSnapshots(fetched.games, sport, fetched.source);
+        const n = result && typeof result.count === 'number' ? result.count
+          : (typeof result === 'number' ? result : 0);
+        upserted += n;
+        const rows = (result && result.rows) || [];
+        rows.forEach(function(r) { allRows.push(r); });
       }
     } catch (_e) {
       console.warn('RESULT_REFRESH_SPORT_FAIL sport='+sport+' err='+_e.message);
@@ -8390,7 +8480,7 @@ async function _refreshResultSnapshots(sports, daysBack) {
     }
   }
   console.log('RESULT_REFRESH_DONE upserted='+upserted+' lastResult='+_lastResultSuccessAt);
-  return upserted;
+  return { upserted: upserted, rows: allRows };
 }
 
 async function _mlbGradePollTick() {
@@ -8413,7 +8503,8 @@ async function _mlbGradePollTick() {
     console.log('GRADE_POLL_DONE graded='+(r&&r.graded||0)+' skipped='+(r&&r.skipped||0)+
       ' skipReasons='+JSON.stringify((r&&r.skipReasons)||{})+
       ' snapshotsUpserted='+(r&&r.snapshotsUpserted||0)+
-      ' lastResult='+_lastResultSuccessAt+' lastGradeRunAt='+_lastGradeRunAt);
+      ' lastResult='+_lastResultSuccessAt+' lastGradeRunAt='+_lastGradeRunAt+
+      ' lastGradedAt='+_lastGradedAt);
   } catch (e) {
     _lastGradeRunAt = new Date().toISOString();
     console.error('GRADE_POLL_FAIL '+e.message+' lastGradeRunAt='+_lastGradeRunAt);
@@ -8436,8 +8527,8 @@ function _startMlbGradePoller() {
 
 // Upsert result snapshots from Odds API / ESPN scores response
 async function _upsertResultSnapshots(scoresData, sport, source) {
+  if (!Array.isArray(scoresData)) return { count: 0, rows: [] };
   const sb = getSupabase();
-  if (!sb || !Array.isArray(scoresData)) return 0;
   const now = new Date().toISOString();
   const src = source || 'odds-api';
   const rows = scoresData.map(function(game) {
@@ -8474,18 +8565,20 @@ async function _upsertResultSnapshots(scoresData, sport, source) {
       source:src, fetched_at:now
     };
   });
-  if (!rows.length) return 0;
+  if (!rows.length) return { count: 0, rows: [] };
+  if (!sb) return { count: 0, rows: rows };
   try {
     const { error } = await sb.from('result_snapshots').upsert(rows, { onConflict:'canonical_game_key' });
     if (error) {
       console.warn('RESULT_UPSERT_FAIL sport='+sport+' err='+error.message);
-      return 0;
+      return { count: 0, rows: rows };
     }
     const finals = rows.filter(function(r){ return r.status === 'final'; }).length;
     _lastResultSuccessAt = now;
-    console.log('RESULT_UPSERT_OK source='+src+' sport='+sport+' rows='+rows.length+' final='+finals);
-    return rows.length;
-  } catch(e) { console.warn('RESULT_UPSERT_FAIL sport='+sport+' err='+e.message); return 0; }
+    console.log('RESULT_UPSERT_OK source='+src+' sport='+sport+' rows='+rows.length+' final='+finals+
+      ' sampleKeys='+JSON.stringify(rows.slice(0,8).map(function(r){ return r.canonical_game_key; })));
+    return { count: rows.length, rows: rows };
+  } catch(e) { console.warn('RESULT_UPSERT_FAIL sport='+sport+' err='+e.message); return { count: 0, rows: rows }; }
 }
 
 // Derive leg outcome from result snapshot
@@ -11823,7 +11916,7 @@ app.get('/api/grade/status', async (req, res) => {
       .order('created_at',{ ascending:false }).limit(10);
     const { data: active } = await sb.from('tickets')
       .select('id',{ count:'exact' }).in('status',['active','open']);
-    res.json({ enabled:true, lastGradedAt: recent&&recent[0] ? recent[0].created_at : null,
+    res.json({ enabled:true, lastGradedAt: _lastGradedAt || (recent&&recent[0] ? recent[0].created_at : null),
       lastGradeRunAt:_lastGradeRunAt,
       recentGrades: recent||[], activeTicketCount: active ? active.length : 0,
       lastResultSuccessAt:_lastResultSuccessAt, lastGradePollAt:_lastGradePollAt,

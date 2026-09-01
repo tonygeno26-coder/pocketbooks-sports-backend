@@ -72,6 +72,37 @@ function _unhyphenateGameKeyTeams(cKey) {
   return parts.join('|');
 }
 
+function _hyphenateGameKeyTeams(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return String(cKey);
+  function slug(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, '-');
+  }
+  parts[1] = slug(parts[1]);
+  parts[2] = slug(parts[2]);
+  return parts.join('|');
+}
+
+function _sportPrefix(sportKey) {
+  const k = (sportKey||'').toLowerCase();
+  if (k.startsWith('baseball')) return 'MLB';
+  if (k.startsWith('basketball_nba')) return 'NBA';
+  if (k.startsWith('americanfootball_nfl')) return 'NFL';
+  if (k.startsWith('icehockey')) return 'NHL';
+  return k.split('_')[0].toUpperCase();
+}
+
+function _collapseSportPrefixOnGameKey(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (!parts[0]) return cKey;
+  const collapsed = _sportPrefix(parts[0]);
+  if (!collapsed || collapsed === parts[0]) return String(cKey);
+  parts[0] = collapsed;
+  return parts.join('|');
+}
+
 function _gameKeyLookupCandidates(cKey) {
   const seen = {};
   const out = [];
@@ -80,11 +111,12 @@ function _gameKeyLookupCandidates(cKey) {
     seen[k] = true;
     out.push(k);
   }
-  add(cKey);
-  const expanded = _expandSportPrefixOnGameKey(cKey);
-  add(expanded);
-  add(_unhyphenateGameKeyTeams(cKey));
-  add(_unhyphenateGameKeyTeams(expanded));
+  const prefixes = [cKey, _expandSportPrefixOnGameKey(cKey), _collapseSportPrefixOnGameKey(cKey)];
+  prefixes.forEach(function(p) {
+    add(p);
+    add(_unhyphenateGameKeyTeams(p));
+    add(_hyphenateGameKeyTeams(p));
+  });
   return out;
 }
 
@@ -174,9 +206,34 @@ test('poller stamps lastGradeRunAt even when nothing grades', function() {
   assert(indexSource.includes('let _lastGradeRunAt = null'), 'missing lastGradeRunAt');
   assert(indexSource.includes('_lastGradeRunAt = new Date().toISOString()'),
     'poller never stamps lastGradeRunAt');
+  assert(indexSource.includes('let _lastGradedAt = null'), 'missing lastGradedAt');
+  assert(indexSource.includes('_lastGradedAt = new Date().toISOString()'),
+    'must stamp lastGradedAt when a ticket grades');
   assert(indexSource.includes('GRADE_POLL_START'), 'missing GRADE_POLL_START log');
   assert(indexSource.includes('GRADE_CORE_SNAPSHOTS'), 'missing snapshot log');
   assert(indexSource.includes('GRADE_CORE_DONE'), 'missing GRADE_CORE_DONE log');
+  assert(indexSource.includes('GRADE_KEY_COMPARE'), 'must log ticket vs ESPN keys');
+  assert(indexSource.includes('GRADE_TICKET_SKIP'), 'must log skip reason with match/miss');
+});
+
+test('grade core reads ticket_legs.canonical_game_key not tickets', function() {
+  const coreStart = indexSource.indexOf('async function _runGradeCore');
+  const coreEnd = indexSource.indexOf('// ── WORKER LOOP');
+  const core = indexSource.slice(coreStart, coreEnd > coreStart ? coreEnd : coreStart + 8000);
+  assert(core.includes("from('ticket_legs')"), '_runGradeCore must load ticket_legs');
+  assert(core.includes('l.canonical_game_key'), '_runGradeCore must use ticket_legs.canonical_game_key');
+  assert(!/from\('tickets'\)\.select\([^)]*canonical_game_key/.test(core),
+    'tickets table should not be the canonical_game_key source');
+  assert(indexSource.includes('_lookupResultForLeg(resultsByKey, leg)'),
+    'derive outcome must look up via ticket_legs fields');
+  assert(indexSource.includes('leg.home_team || leg.homeTeam'),
+    '_lookupResultForLeg must use ticket_legs home_team');
+  assert(indexSource.includes('leg.away_team || leg.awayTeam'),
+    '_lookupResultForLeg must use ticket_legs away_team');
+  assert(indexSource.includes("const pick     = (leg.pick||'').toLowerCase()"),
+    'grade pick from ticket_legs.pick');
+  assert(indexSource.includes("const market   = (leg.market||'moneyline')"),
+    'grade market from ticket_legs.market');
 });
 
 test('ESPN games convert to ticket-matching Odds-shaped keys', function() {
@@ -245,6 +302,137 @@ test('ticket pick Boston Red Sox matches ESPN Yankees/Red Sox result', function(
   _gameKeyLookupCandidates(key).forEach(function(k) { map[k] = stored; });
   assert(_lookupResultByGameKey(map, key), 'canonical key should hit');
   assertEq(stored.away_team, 'Boston Red Sox');
+});
+
+test('Owls title-case ticket key candidates include hyphenated MLB slug', function() {
+  const ticketKey = 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30';
+  const espnKey = 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30';
+  const legacySlug = 'MLB|boston-red-sox|new-york-yankees|2026-08-30';
+  const cands = _gameKeyLookupCandidates(ticketKey);
+  assert(cands.indexOf(espnKey) >= 0, 'must include ESPN away|home|UTC-date key');
+  assert(cands.indexOf(legacySlug) >= 0, 'must include hyphenated MLB slug, got ' + JSON.stringify(cands));
+});
+
+test('ESPN Yankees/Sox snapshot matches ticket_legs via _lookupResultForLeg', function() {
+  function _isoDateFromValue(v) {
+    if (v == null || v === '') return '';
+    const s = String(v).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+    return '';
+  }
+  function _normTeamToken(s) {
+    return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+  function _teamNamesLooselyEqual(a, b) {
+    const na = _normTeamToken(a), nb = _normTeamToken(b);
+    if (!na || !nb) return false;
+    return na === nb || na.indexOf(nb) >= 0 || nb.indexOf(na) >= 0;
+  }
+  function _uniqueResultRows(resultsByKey) {
+    const out = [], seen = [];
+    Object.keys(resultsByKey || {}).forEach(function(k) {
+      const row = resultsByKey[k];
+      if (!row || seen.indexOf(row) >= 0) return;
+      seen.push(row); out.push(row);
+    });
+    return out;
+  }
+  function _lookupResultByTeams(resultsByKey, home, away, dateStr) {
+    const rows = _uniqueResultRows(resultsByKey);
+    const date = String(dateStr || '').slice(0, 10);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const homeOk = !home || _teamNamesLooselyEqual(row.home_team, home);
+      const awayOk = !away || _teamNamesLooselyEqual(row.away_team, away);
+      if (!homeOk || !awayOk) continue;
+      if (date) {
+        const rowDate = _isoDateFromValue(row.commence_time || '');
+        const keyDate = String(row.canonical_game_key || '').split('|').pop();
+        if (rowDate && rowDate !== date && keyDate !== date) continue;
+      }
+      return row;
+    }
+    return null;
+  }
+  function lookupForLeg(resultsByKey, leg) {
+    const cKey = (leg && (leg.canonical_game_key || leg.canonicalGameKey)) || '';
+    const cands = _gameKeyLookupCandidates(cKey);
+    for (let i = 0; i < cands.length; i++) {
+      if (resultsByKey[cands[i]]) return resultsByKey[cands[i]];
+    }
+    const parts = String(cKey).split('|');
+    const date = _isoDateFromValue(leg.scheduled_start || '') || (parts[3] || '');
+    const home = leg.home_team || parts[2] || '';
+    const away = leg.away_team || parts[1] || '';
+    return _lookupResultByTeams(resultsByKey, home, away, date);
+  }
+  function deriveLeg(leg, result) {
+    if (!result) return { outcome:'error', reason:'result_missing' };
+    if (result.status !== 'final') return { outcome:'pending', reason:'result_not_final', status:result.status };
+    const market = (leg.market||'moneyline').toLowerCase();
+    const pick = (leg.pick||'').toLowerCase();
+    const homeTeam = (result.home_team||'').toLowerCase();
+    const awayTeam = (result.away_team||'').toLowerCase();
+    const homeScore = parseInt(result.home_score,10)||0;
+    const awayScore = parseInt(result.away_score,10)||0;
+    if (market==='moneyline'||market==='h2h') {
+      const pickedHome = pick.includes(homeTeam);
+      const pickedAway = pick.includes(awayTeam);
+      if (result.winner==='home'&&pickedHome) return { outcome:'won' };
+      if (result.winner==='away'&&pickedAway) return { outcome:'won' };
+      return { outcome:'lost' };
+    }
+    if (market==='total'||market==='totals') {
+      const total = homeScore+awayScore;
+      const line = parseFloat(leg.line||0);
+      const pickOver = pick.includes('over');
+      return (pickOver?total>line:total<line) ? { outcome:'won' } : { outcome:'lost' };
+    }
+    return { outcome:'error', reason:'unsupported_market:'+market };
+  }
+
+  const espnKey = _resultSnapshotCanonicalKey({
+    sport_key: 'baseball_mlb',
+    away_team: 'Boston Red Sox',
+    home_team: 'New York Yankees',
+    commence_time: '2026-08-30T17:35Z'
+  }, 'baseball_mlb');
+  assertEq(espnKey, 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30');
+
+  const stored = {
+    canonical_game_key: espnKey, status: 'final',
+    home_team: 'New York Yankees', away_team: 'Boston Red Sox',
+    home_score: 16, away_score: 1, winner: 'home',
+    commence_time: '2026-08-30T17:35Z'
+  };
+  const map = {};
+  _gameKeyLookupCandidates(stored.canonical_game_key).forEach(function(k) { map[k] = stored; });
+
+  const leg = {
+    canonical_game_key: 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30',
+    home_team: 'New York Yankees', away_team: 'Boston Red Sox',
+    pick: 'Boston Red Sox', market: 'moneyline'
+  };
+  const hit = lookupForLeg(map, leg);
+  assert(hit, 'ticket_legs Sox/Yankees key must match ESPN snapshot');
+  assertEq(hit.status, 'final');
+  assertEq(deriveLeg(leg, hit).outcome, 'lost');
+
+  const slugLeg = {
+    canonical_game_key: 'MLB|boston-red-sox|new-york-yankees|2026-08-30',
+    home_team: 'New York Yankees', away_team: 'Boston Red Sox',
+    pick: 'New York Yankees', market: 'moneyline'
+  };
+  const slugHit = lookupForLeg(map, slugLeg);
+  assert(slugHit, 'hyphen slug ticket_legs key must still hit ESPN snapshot');
+  assertEq(deriveLeg(slugLeg, slugHit).outcome, 'won');
+
+  const totalsLeg = {
+    canonical_game_key: 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30',
+    home_team: 'New York Yankees', away_team: 'Boston Red Sox',
+    pick: 'Over 8.5', market: 'total', line: 8.5
+  };
+  assertEq(deriveLeg(totalsLeg, lookupForLeg(map, totalsLeg)).outcome, 'won');
 });
 
 if (fail) {

@@ -58,6 +58,37 @@ function _unhyphenateGameKeyTeams(cKey) {
   return parts.join('|');
 }
 
+function _hyphenateGameKeyTeams(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return String(cKey);
+  function slug(s) {
+    return String(s || '').toLowerCase().replace(/\s+/g, '-');
+  }
+  parts[1] = slug(parts[1]);
+  parts[2] = slug(parts[2]);
+  return parts.join('|');
+}
+
+function _sportPrefix(sportKey) {
+  const k = (sportKey||'').toLowerCase();
+  if (k.startsWith('baseball')) return 'MLB';
+  if (k.startsWith('basketball_nba')) return 'NBA';
+  if (k.startsWith('americanfootball_nfl')) return 'NFL';
+  if (k.startsWith('icehockey')) return 'NHL';
+  return k.split('_')[0].toUpperCase();
+}
+
+function _collapseSportPrefixOnGameKey(cKey) {
+  if (!cKey) return cKey;
+  const parts = String(cKey).split('|');
+  if (!parts[0]) return cKey;
+  const collapsed = _sportPrefix(parts[0]);
+  if (!collapsed || collapsed === parts[0]) return String(cKey);
+  parts[0] = collapsed;
+  return parts.join('|');
+}
+
 function _gameKeyLookupCandidates(cKey) {
   const seen = {};
   const out = [];
@@ -66,11 +97,12 @@ function _gameKeyLookupCandidates(cKey) {
     seen[k] = true;
     out.push(k);
   }
-  add(cKey);
-  const expanded = _expandSportPrefixOnGameKey(cKey);
-  add(expanded);
-  add(_unhyphenateGameKeyTeams(cKey));
-  add(_unhyphenateGameKeyTeams(expanded));
+  const prefixes = [cKey, _expandSportPrefixOnGameKey(cKey), _collapseSportPrefixOnGameKey(cKey)];
+  prefixes.forEach(function(p) {
+    add(p);
+    add(_unhyphenateGameKeyTeams(p));
+    add(_hyphenateGameKeyTeams(p));
+  });
   return out;
 }
 
@@ -133,6 +165,13 @@ test('already-correct Owls key is preserved', function() {
   const cands = _gameKeyLookupCandidates(db);
   assert(cands.indexOf(db) >= 0, 'Owls key must remain a candidate');
   assertEq(cands[0], db, 'original key stays first');
+});
+
+test('Owls Sox/Yankees key also candidates hyphenated MLB slug', function() {
+  const ticket = 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30';
+  const slug = 'MLB|boston-red-sox|new-york-yankees|2026-08-30';
+  const cands = _gameKeyLookupCandidates(ticket);
+  assert(cands.indexOf(slug) >= 0, 'candidates must include ' + slug + ', got ' + JSON.stringify(cands));
 });
 
 test('moneyline To Win suffix is stripped for selection_key', function() {
