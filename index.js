@@ -2031,39 +2031,61 @@ async function _processActiveBettorCharge(sb, clubId, playerId, ticketId, nowMs)
     };
   }
 
-  // Deduct, activate, write ledger
+  // Deduct + activate only after a durable host_diamond_ledger debit exists.
+  // HOST_ACTIVE_BETTOR_CHARGE is a host-diamond event — never write it through
+  // _writeLedgerEntry (player sportsbook LEDGER_EVENT_TYPES rejects it as
+  // invalid_eventType, which previously left a silent .catch warn).
   const ledgerId = 'HAB_'+clubId+'_'+playerId+'_'+weekStart;
   const now = new Date(nowMs||Date.now()).toISOString();
+  const balAfter = host.balance_diamonds - HOST_ACTIVE_BETTOR_FEE;
+
+  const ledgerWrite = await _writeHostDiamondLedger(sb, {
+    ledgerId, clubId, hostActorId:host.host_actor_id,
+    eventType:'HOST_ACTIVE_BETTOR_CHARGE', amount:HOST_ACTIVE_BETTOR_FEE, direction:'debit',
+    balanceBefore:host.balance_diamonds, balanceAfter:balAfter,
+    createdBy:'system', reason:'active_bettor_fee:'+playerId+':'+weekStart,
+    idempotencyKey:ledgerId, metadata:{ playerId, weekStart, ticketId }
+  });
+  if (ledgerWrite && ledgerWrite.idempotent) {
+    // Concurrent first-bet race: ledger already written for this week.
+    // Ensure the weekly_active_bettors row exists so retries don't re-enter.
+    await sb.from('weekly_active_bettors').upsert({
+      club_id:clubId, player_id:playerId, week_start:weekStart,
+      first_ticket_id:ticketId, activated_at:now,
+      charged_diamonds:HOST_ACTIVE_BETTOR_FEE, charge_ledger_id:ledgerId
+    }, { onConflict:'club_id,player_id,week_start' }).then(function(){}, function(){});
+    return { ok:true, charged:false, reason:'already_active_this_week', weekStart, ledgerId };
+  }
+  if (!ledgerWrite || !ledgerWrite.ok) {
+    return {
+      ok:false, error:'host_diamond_ledger_write_failed', httpStatus:503,
+      detail:(ledgerWrite && ledgerWrite.error) || 'ledger_write_failed', weekStart
+    };
+  }
 
   await sb.from('host_diamond_balances')
-    .update({ balance_diamonds: host.balance_diamonds - HOST_ACTIVE_BETTOR_FEE, updated_at:now })
+    .update({ balance_diamonds: balAfter, updated_at:now })
     .eq('club_id', clubId);
 
-  await sb.from('weekly_active_bettors').insert({
+  const { error: wabErr } = await sb.from('weekly_active_bettors').insert({
     club_id:clubId, player_id:playerId, week_start:weekStart,
     first_ticket_id:ticketId, activated_at:now,
     charged_diamonds:HOST_ACTIVE_BETTOR_FEE, charge_ledger_id:ledgerId
   });
+  if (wabErr) {
+    // Unique race after ledger write — treat as already charged this week.
+    if (wabErr.code === '23505') {
+      return { ok:true, charged:false, reason:'already_active_this_week', weekStart, ledgerId };
+    }
+    console.error('[host/active-bettor] weekly_active_bettors insert failed after ledger write:', wabErr.message);
+    return {
+      ok:false, error:'weekly_active_bettor_insert_failed', httpStatus:503,
+      detail:wabErr.message, weekStart, ledgerId
+    };
+  }
 
-  // Write host ledger entry
-  await _writeLedgerEntry({
-    clubId, playerId:host.host_actor_id,
-    eventType:'HOST_ACTIVE_BETTOR_CHARGE', amount:HOST_ACTIVE_BETTOR_FEE,
-    idempotencyKey:ledgerId, createdBy:'system',
-    reason:'active_bettor_fee:'+playerId+':'+weekStart,
-    metadataJson:{ playerId, weekStart, ticketId }
-  }).catch(function(e){ console.warn('[hab] ledger write error:', e.message); });
-
-  // Write host diamond ledger entry for the charge
-  await _writeHostDiamondLedger(sb, {
-    ledgerId, clubId, hostActorId:host.host_actor_id,
-    eventType:'HOST_ACTIVE_BETTOR_CHARGE', amount:HOST_ACTIVE_BETTOR_FEE, direction:'debit',
-    balanceBefore:host.balance_diamonds, balanceAfter:host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE,
-    createdBy:'system', reason:'active_bettor_fee:'+playerId+':'+weekStart,
-    idempotencyKey:ledgerId, metadata:{ playerId, weekStart, ticketId }
-  });
   console.log('[host/active-bettor] CHARGED playerId='+playerId+
-    ' -'+HOST_ACTIVE_BETTOR_FEE+'d week='+weekStart+' balance='+(host.balance_diamonds-HOST_ACTIVE_BETTOR_FEE));
+    ' -'+HOST_ACTIVE_BETTOR_FEE+'d week='+weekStart+' balance='+balAfter);
 
   return {
     ok:true, charged:true, chargedDiamonds:HOST_ACTIVE_BETTOR_FEE,
@@ -2082,6 +2104,12 @@ async function _writeHostDiamondLedger(sb, params) {
   if (!sb) return { ok:false, error:'supabase_not_configured' };
   const { ledgerId, clubId, hostActorId, eventType, amount, direction,
           balanceBefore, balanceAfter, createdBy, reason, idempotencyKey, metadata } = params;
+  if (!VALID_HD_EVENT_TYPES.has(eventType)) {
+    return { ok:false, error:'invalid_host_diamond_eventType:'+eventType };
+  }
+  if (direction !== 'credit' && direction !== 'debit') {
+    return { ok:false, error:'invalid_host_diamond_direction:'+direction };
+  }
   try {
     const { error } = await sb.from('host_diamond_ledger').insert({
       ledger_id:ledgerId, club_id:clubId, host_actor_id:hostActorId,
