@@ -4053,6 +4053,29 @@ const ROLE_RANK = {
   view_only:          0
 };
 
+// club_memberships.role uses host/admin/cohost/staff; JWT + session rows
+// store those strings. Permission checks only understand ROLE_RANK keys.
+// Without this map, role "host" becomes view_only, session_claim_mismatch
+// fires, and /api/host/dashboard never builds the players list.
+const AUTH_ROLE_ALIASES = {
+  host: 'full_admin',
+  admin: 'full_admin',
+  owner: 'owner',
+  cohost: 'settlement_manager',
+  staff: 'risk_viewer',
+  user: 'player',
+  player: 'player',
+  full_admin: 'full_admin',
+  settlement_manager: 'settlement_manager',
+  risk_viewer: 'risk_viewer',
+  view_only: 'view_only'
+};
+function _normalizeAuthRole(role) {
+  var raw = String(role || '').toLowerCase().trim();
+  var mapped = AUTH_ROLE_ALIASES[raw] || raw;
+  return ROLE_RANK[mapped] != null ? mapped : 'view_only';
+}
+
 // -1 = player-self check; >=0 = minimum role rank
 const ACTION_MIN_RANK = {
   place_bet:                  -1,
@@ -4072,7 +4095,7 @@ const ACTION_MIN_RANK = {
   view_risk:                   2,  // = view_host_dashboard
 };
 
-function _getRoleRank(role) { return ROLE_RANK[role] != null ? ROLE_RANK[role] : -99; }
+function _getRoleRank(role) { return ROLE_RANK[_normalizeAuthRole(role)] != null ? ROLE_RANK[_normalizeAuthRole(role)] : -99; }
 
 // ── SESSION TOKEN FUNCTIONS (HS256) ────────────────────────────────────────────────────
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-insecure-secret-change-in-prod';
@@ -4318,8 +4341,8 @@ function requireActor(req) {
       return { error:result.error, status:401, auditEvent:evType };
     }
     const p       = result.payload;
-    const role    = ROLE_RANK[p.role] != null ? p.role : 'view_only';
-    const club    = p.clubId || '';
+    const role    = _normalizeAuthRole(p.role);
+    const club    = p.clubId || p.club_id || '';
     const platRole = p.platformRole || null;
     const jti     = p.jti || null;
 
@@ -4365,7 +4388,7 @@ function requireActor(req) {
           return { error:'expired_token', status:401, auditEvent:'session_expired' };
         }
         // Claim consistency
-        if (memSession.role !== role || memSession.club_id !== club) {
+        if (_normalizeAuthRole(memSession.role) !== role || String(memSession.club_id||'') !== String(club||'')) {
           _writeAuthAudit('session_claim_mismatch', p.sub, club, req.path, { jti, storedRole:memSession.role });
           return { error:'session_claim_mismatch', status:401, auditEvent:'session_claim_mismatch' };
         }
@@ -4384,7 +4407,7 @@ function requireActor(req) {
           _writeAuthAudit('membership_inactive', p.sub, club, req.path, { status:m.status, jti });
           return { error:'membership_inactive', status:401, auditEvent:'membership_inactive' };
         }
-        if (m.role !== role) {
+        if (_normalizeAuthRole(m.role) !== _normalizeAuthRole(role) && m.role !== role) {
           // Role changed in DB — revoke session and reject
           _sessionRevokeByActor(p.sub||p.actorId, club, 'role_changed').catch(()=>{});
           _writeAuthAudit('membership_role_changed', p.sub, club, req.path,
@@ -6705,6 +6728,10 @@ function requirePermissionScoped(action, getTargetPlayerId) {
       + ' path='            + req.path);
     const scope = _checkClubScope(actor, requestedClubId);
     if (!scope.ok) {
+      if (actor.error) {
+        return res.status(actor.status||401).json({ ok:false, error:actor.error,
+          reason:scope.reason, requestedClubId, action });
+      }
       console.log('[auth] CLUB_SCOPE_MISMATCH requestedClub='+(requestedClubId||'?')+' action='+action);
       console.log('BACKEND_CLUB_SCOPE'
         + ' request.clubId='   + (requestedClubId   || '(none)')
