@@ -9997,11 +9997,22 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     if (stats.activeRisk < 0)   warnings.push('activeRisk_negative');
     if (stats.activeBetCount !== active.length) warnings.push('activeBetCount_mismatch');
 
+    // Recently settled (won/lost/push) for Host Bets — last 7 days only.
+    // gradedTickets still carries full graded+canceled history for other UI.
+    var settledCutoffMs = Date.now() - 7 * 86400000;
+    var settledTickets = graded.filter(function(t) {
+      var st = String(t.status || '').toLowerCase();
+      if (st !== 'won' && st !== 'lost' && st !== 'push' && st !== 'pushed') return false;
+      var ts = Date.parse(t.gradedAt || t.graded_at || t.placedAt || t.placed_at || '') || 0;
+      return ts >= settledCutoffMs;
+    });
+
     res.json({
       ok: true, source: 'db', clubId: clubId||null,
       players:        players,
       activeTickets:  active,
       gradedTickets:  graded,
+      settledTickets: settledTickets,
       ledgerEntries:  ledger||[],
       stats,
       summary: {
