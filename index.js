@@ -9845,7 +9845,13 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       if (uname) { p.username = uname; p.playerName = displayNameById[pid] || uname; }
       var enriched = _enrichHostTicket(Object.assign({}, t, { player_username: uname || t.player_username }), legsByTicket[t.id] || []);
 
-      if (s==='canceled'||s==='voided'||s==='deleted') { canceledCount++; return; }
+      // Include void/canceled in gradedTickets so Host Bets can show history.
+      // Stats still exclude them from handle / active risk (unchanged accounting).
+      if (s==='canceled'||s==='voided'||s==='deleted'||s==='cancelled') {
+        canceledCount++;
+        graded.push(enriched);
+        return;
+      }
       if (s==='active'||s==='open') {
         handle+=risk; activeRisk+=risk; hostAtRisk+=profit; activeBetCount++;
         p.openRisk += risk; p.activeBetCount++;
