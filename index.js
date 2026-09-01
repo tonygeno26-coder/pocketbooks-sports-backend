@@ -23,7 +23,7 @@ function _rlCheck(key, maxReqs, windowMs) {
 }
 
 const RATE_LIMIT_CONFIG = {
-  '/api/auth/token':         { maxReqs:10,  windowMs:60000, keyBy:'ip' },
+  '/api/auth/token':         { maxReqs:60,  windowMs:60000, keyBy:'ip' },
   '/api/auth/refresh':       { maxReqs:10,  windowMs:60000, keyBy:'actor' },
   '/api/bets/place':         { maxReqs:30,  windowMs:60000, keyBy:'actor' },
   '/api/bets/cancel':        { maxReqs:30,  windowMs:60000, keyBy:'actor' },
@@ -193,6 +193,11 @@ function _getLiveProviderDiagnostics(nowMs) {
 }
 
 function rateLimitMiddleware(req, res, next) {
+  // Dev/test minting is not rate-limited: /api/dev/host-token is non-prod only,
+  // and /api/auth/token skips the limiter outside production so local/test
+  // workflows are not blocked after a handful of logins.
+  if (req.path === '/api/dev/host-token') return next();
+  if (req.path === '/api/auth/token' && process.env.NODE_ENV !== 'production') return next();
   const cfg = _getRlConfig(req.path);
   if (!cfg) return next();
   const actor  = req._actor&&req._actor.actorId;
@@ -9171,6 +9176,23 @@ app.post('/api/auth/token', requireCanonicalClubId, async (req, res) => {
   const { token, jti } = await issueSessionToken(actorId, finalRole, clubId, 86400, platRole);
   console.log('[auth/token] issued role='+finalRole+(platRole?' [platform_admin]':''));
   res.json({ ok:true, token, jti, actorId, role:finalRole, status:finalStatus, clubId, club_id:clubId, expiresIn:86400 });
+});
+
+// POST /api/dev/host-token — unmetered host mint for local/dev only (actor 16).
+const DEV_HOST_ACTOR_ID = '16';
+const DEV_HOST_CLUB_ID  = 'd616dc2a-95a6-473a-97b1-7da330878479';
+app.post('/api/dev/host-token', async (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ ok:false, error:'not_found' });
+  }
+  const actorId = DEV_HOST_ACTOR_ID;
+  const clubId  = (req.body && req.body.clubId) || DEV_HOST_CLUB_ID;
+  const resolved = await _resolveTokenRole(actorId, clubId, 'host');
+  const finalRole = (resolved && resolved.ok && resolved.role) ? resolved.role : 'host';
+  const finalStatus = (resolved && resolved.membership && resolved.membership.status) || 'active';
+  const { token, jti } = await issueSessionToken(actorId, finalRole, clubId, 86400, null);
+  console.log('[dev/host-token] issued actor='+actorId+' role='+finalRole);
+  res.json({ ok:true, token, jti, actorId, role:finalRole, status:finalStatus, clubId, club_id:clubId, expiresIn:86400, via:'dev-host-token' });
 });
 
 // POST /api/auth/refresh — rotate token (revoke old jti, issue new)
