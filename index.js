@@ -9664,57 +9664,100 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       }
     }
 
-    // Starting balances from club_members (canonical balance table).
-    // Approved members only — hosts must see every player in the club, not
-    // just those with a ticket in this response.
+    // Roster source of truth: club_memberships (active/approved players).
+    // club_members is balance-only and must not be the only membership gate —
+    // a failed users lookup used to 400 the whole handler when actor "16"
+    // was mixed into a uuid .in() list, leaving the UI on one local demo player.
     var memberMap = {};
+    var membershipCount = 0;
+    var playerMemberCount = 0;
+    try {
+      var memQ = sb.from('club_memberships').select('actor_id,role,status');
+      if (clubId) memQ = memQ.eq('club_id', clubId);
+      const { data: memRows, error: memErr } = await memQ;
+      if (memErr) throw memErr;
+      membershipCount = (memRows||[]).length;
+      (memRows||[]).forEach(function(r) {
+        if (!r || r.actor_id == null) return;
+        var st = String(r.status||'').toLowerCase();
+        var role = String(r.role||'player').toLowerCase();
+        if (st !== 'active' && st !== 'approved') return;
+        if (role === 'host' || role === 'admin' || role === 'owner' || role === 'full_admin') return;
+        memberMap[String(r.actor_id)] = {
+          balance_start: null,
+          role: r.role || 'player',
+          status: r.status
+        };
+      });
+      playerMemberCount = Object.keys(memberMap).length;
+    } catch(_e) {
+      console.warn('[host/dashboard] club_memberships fetch error:', _e.message);
+    }
+
+    // Starting balances from club_members (canonical balance table).
     try {
       let plq = sb.from('club_members').select('player_id,balance_start,status');
       if (clubId) plq = plq.eq('club_id', clubId);
-      plq = plq.eq('status', 'approved');
       const { data: plRows, error: mErr } = await plq;
       if (mErr) throw mErr;
       (plRows||[]).forEach(function(r) {
         if (r.player_id == null) return;
-        memberMap[String(r.player_id)] = {
-          balance_start: r.balance_start != null ? parseFloat(r.balance_start) : null
-        };
+        var pid = String(r.player_id);
+        var start = r.balance_start != null ? parseFloat(r.balance_start) : null;
+        if (memberMap[pid]) {
+          memberMap[pid].balance_start = start;
+          return;
+        }
+        // Approved club_members row without a membership still belongs on the roster.
+        if (String(r.status||'').toLowerCase() === 'approved') {
+          memberMap[pid] = { balance_start: start, role: 'player', status: r.status };
+        }
       });
+      playerMemberCount = Object.keys(memberMap).length;
     } catch(_e) { console.warn('[host/dashboard] club_members fetch error:', _e.message); }
 
-    // Username lookup. users has username + display_name (no `name` column).
-    // Prefer users.username over tickets.player_username — the ticket field is
-    // often null or a copy of player_id.
+    // Username lookup. users.id is uuid — never pass Railway numeric actor ids.
     var nameById = {};
     var displayNameById = {};
     var playerIds = [];
     var seenPid = {};
+    Object.keys(memberMap).forEach(function(pid) {
+      if (!seenPid[pid]) { seenPid[pid] = true; playerIds.push(pid); }
+    });
     (tickets||[]).forEach(function(t) {
       var pid = t.player_id != null ? String(t.player_id) : '';
       if (!pid || seenPid[pid]) return;
       seenPid[pid] = true;
       playerIds.push(pid);
     });
-    Object.keys(memberMap).forEach(function(pid) {
-      if (!seenPid[pid]) { seenPid[pid] = true; playerIds.push(pid); }
-    });
-    if (playerIds.length) {
+    var uuidPlayerIds = playerIds.filter(function(pid){ return !!_uuidOrNull(String(pid)); });
+    var usersResolved = 0;
+    if (uuidPlayerIds.length) {
       try {
         const { data: userRows, error: uErr } = await sb.from('users')
           .select('id,username,display_name')
-          .in('id', playerIds);
+          .in('id', uuidPlayerIds);
         if (uErr) {
-          console.warn('[host/dashboard] users lookup failed:', uErr.message);
+          console.warn('[host/dashboard] users lookup failed:', uErr.message,
+            'asked='+uuidPlayerIds.length);
         } else {
           (userRows||[]).forEach(function(u) {
             if (!u || u.id == null) return;
             var id = String(u.id);
             nameById[id] = u.username || u.display_name || '';
             displayNameById[id] = u.display_name || u.username || '';
+            usersResolved++;
           });
         }
-      } catch(_ue) { /* users table shape varies; ticket.player_username is enough */ }
+      } catch(_ue) {
+        console.warn('[host/dashboard] users lookup threw:', _ue && _ue.message);
+      }
     }
+    console.log('[host/dashboard] roster club='+(clubId||'(none)')
+      + ' memberships='+membershipCount
+      + ' playerMembers='+playerMemberCount
+      + ' uuidLookups='+uuidPlayerIds.length
+      + ' usersResolved='+usersResolved);
 
     function _uuidLike(s) {
       return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
@@ -9799,6 +9842,9 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         : null;
       return p;
     }).sort(function(a,b){ return (b.openRisk||0) - (a.openRisk||0); });
+
+    console.log('[host/dashboard] playersOut='+players.length
+      + ' names='+players.map(function(p){ return p.username; }).join(','));
 
     const settledHandle = handle - activeRisk;
     const profit        = rnd(settledGain - settledLoss);
