@@ -9698,6 +9698,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     var memberMap = {};
     var membershipCount = 0;
     var playerMemberCount = 0;
+    var skippedHostIds = {};
     try {
       var memQ = sb.from('club_memberships').select('actor_id,role,status');
       if (clubId) memQ = memQ.eq('club_id', clubId);
@@ -9709,7 +9710,10 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         var st = String(r.status||'').toLowerCase();
         var role = String(r.role||'player').toLowerCase();
         if (st !== 'active' && st !== 'approved') return;
-        if (role === 'host' || role === 'admin' || role === 'owner' || role === 'full_admin') return;
+        if (role === 'host' || role === 'admin' || role === 'owner' || role === 'full_admin') {
+          skippedHostIds[String(r.actor_id)] = true;
+          return;
+        }
         memberMap[String(r.actor_id)] = {
           balance_start: null,
           role: r.role || 'player',
@@ -9731,6 +9735,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         if (r.player_id == null) return;
         var pid = String(r.player_id);
         var start = r.balance_start != null ? parseFloat(r.balance_start) : null;
+        if (skippedHostIds[pid]) return;
         if (memberMap[pid]) {
           memberMap[pid].balance_start = start;
           return;
