@@ -527,8 +527,9 @@ async function _runGradeCore(fakeReq, sb) {
   }))];
   let snapshotsUpserted = 0;
   let freshSnapRows = [];
+  const extraYmds = _pastScoreboardYmdsFromLegs(allLegs, 14);
   try {
-    const refreshed = await _refreshResultSnapshots(sports.length ? sports : ['baseball_mlb'], daysBack);
+    const refreshed = await _refreshResultSnapshots(sports.length ? sports : ['baseball_mlb'], daysBack, extraYmds);
     snapshotsUpserted = (refreshed && typeof refreshed.upserted === 'number')
       ? refreshed.upserted : (typeof refreshed === 'number' ? refreshed : 0);
     freshSnapRows = (refreshed && refreshed.rows) || [];
@@ -544,7 +545,7 @@ async function _runGradeCore(fakeReq, sb) {
   if (sErr) console.warn('GRADE_CORE_SNAPSHOT_LOAD_FAIL '+sErr.message);
   // Recent snapshots so team-name fallback works when stored ESPN keys
   // don't overlap ticket_legs.canonical_game_key candidates.
-  const sinceIso = new Date(Date.now() - (Math.max(1, parseInt(daysBack,10)||3)+1)*86400000).toISOString();
+  const sinceIso = new Date(Date.now() - (Math.max(14, parseInt(daysBack,10)||3)+1)*86400000).toISOString();
   const { data:recentSnaps, error:rErr } = await sb.from('result_snapshots')
     .select('*').gte('fetched_at', sinceIso).limit(400);
   if (rErr) console.warn('GRADE_CORE_SNAPSHOT_RECENT_FAIL '+rErr.message);
@@ -8428,7 +8429,58 @@ function _espnGamesToOddsScores(games, sportKey) {
   return espnScoreboard.espnGamesToOddsScores(games, sportKey);
 }
 
-async function _fetchEspnSportScores(sport, daysBack) {
+function _scoreIdentityKey(g) {
+  const date = String((g && g.commence_time) || '').slice(0, 10);
+  const a = _normTeamToken(g && (g.home_team || g.home));
+  const b = _normTeamToken(g && (g.away_team || g.away));
+  if (!a || !b) return '';
+  return [a, b].sort().join('|') + '|' + date;
+}
+
+function _gameIsFinalScore(g) {
+  if (!g || g.canceled) return false;
+  const scores = g.scores;
+  const hasScores = Array.isArray(scores) && scores.length >= 2 &&
+    scores.every(function(s) { return s && s.score != null && s.score !== ''; });
+  return !!(g.completed && hasScores);
+}
+
+// Odds API wins when it already has a final. ESPN fills games Odds dropped
+// (GRD-7b) and can replace a non-final Odds row when ESPN is actually final.
+function _mergeOddsAndEspnScores(odds, espn) {
+  const byKey = {};
+  function consider(g) {
+    if (!g) return;
+    const key = _scoreIdentityKey(g);
+    if (!key) return;
+    const existing = byKey[key];
+    if (!existing) { byKey[key] = g; return; }
+    if (_gameIsFinalScore(g) && !_gameIsFinalScore(existing)) byKey[key] = g;
+  }
+  (odds || []).forEach(consider);
+  (espn || []).forEach(consider);
+  return Object.keys(byKey).map(function(k) { return byKey[k]; });
+}
+
+function _pastScoreboardYmdsFromLegs(legs, maxLookbackDays) {
+  const now = Date.now();
+  const minMs = now - (Math.max(1, parseInt(maxLookbackDays, 10) || 14) * 86400000);
+  const seen = {};
+  const out = [];
+  (legs || []).forEach(function(l) {
+    const raw = l && (l.scheduled_start || l.scheduledStart || l.commence_time);
+    if (!raw) return;
+    const ms = new Date(raw).getTime();
+    if (!Number.isFinite(ms) || ms > now || ms < minMs) return;
+    const ymd = new Date(ms).toISOString().slice(0, 10).replace(/-/g, '');
+    if (seen[ymd]) return;
+    seen[ymd] = true;
+    out.push(ymd);
+  });
+  return out;
+}
+
+async function _fetchEspnSportScores(sport, daysBack, extraYmds) {
   const sportKey = _oddsApiSportKey(sport);
   const path = _espnScoreboardPath(sportKey);
   if (!path) {
@@ -8436,10 +8488,20 @@ async function _fetchEspnSportScores(sport, daysBack) {
     return [];
   }
   const days = Math.max(1, parseInt(daysBack, 10) || 3);
+  const ymds = [];
+  const seenYmd = {};
+  function addYmd(ymd) {
+    if (!ymd || seenYmd[ymd]) return;
+    seenYmd[ymd] = true;
+    ymds.push(ymd);
+  }
+  for (let i = 0; i <= days; i++) addYmd(_utcYmdDaysAgo(i));
+  (extraYmds || []).forEach(addYmd);
+  if (ymds.length > 12) ymds.length = 12;
   const all = [];
   const seen = {};
-  for (let i = 0; i <= days; i++) {
-    const ymd = _utcYmdDaysAgo(i);
+  for (let i = 0; i < ymds.length; i++) {
+    const ymd = ymds[i];
     const url = 'https://site.api.espn.com/apis/site/v2/sports/'+path+'/scoreboard?dates='+ymd;
     const r = await _httpsGetJson(url, 8000);
     if (r.error || !r.data) {
@@ -8493,39 +8555,37 @@ function _fetchOddsApiScores(sport, daysBack) {
   });
 }
 
-async function _fetchScoresForSport(sport, daysBack) {
+async function _fetchScoresForSport(sport, daysBack, extraYmds) {
   const sportKey = _oddsApiSportKey(sport);
   const odds = await _fetchOddsApiScores(sportKey, daysBack);
-  const oddsFinals = (odds || []).filter(function(g) {
-    return g && g.completed && Array.isArray(g.scores) && g.scores.length >= 2;
-  });
-  if (oddsFinals.length) {
-    console.log('RESULT_SCORES source=odds-api sport='+sportKey+' games='+odds.length+' final='+oddsFinals.length);
-    return { games: odds, source: 'odds-api' };
-  }
-  const espnGames = await _fetchEspnSportScores(sportKey, daysBack);
+  const espnGames = await _fetchEspnSportScores(sportKey, daysBack, extraYmds);
   const converted = _espnGamesToOddsScores(espnGames, sportKey);
-  if (converted.length) {
-    console.log('RESULT_SCORES source=espn sport='+sportKey+' games='+converted.length);
-    return { games: converted, source: 'espn' };
+  const merged = _mergeOddsAndEspnScores(odds || [], converted);
+  const oddsFinals = (odds || []).filter(_gameIsFinalScore).length;
+  const espnFinals = converted.filter(_gameIsFinalScore).length;
+  if (!merged.length) {
+    console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true espnEmpty=true');
+    return { games: [], source: null };
   }
-  if (Array.isArray(odds) && odds.length) {
-    console.log('RESULT_SCORES source=odds-api sport='+sportKey+' games='+odds.length+' final=0 espnEmpty=true');
-    return { games: odds, source: 'odds-api' };
-  }
-  console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true espnEmpty=true');
-  return { games: [], source: null };
+  const source = (odds && odds.length && converted.length) ? 'odds+espn'
+    : (converted.length ? 'espn' : 'odds-api');
+  console.log('RESULT_SCORES source='+source+' sport='+sportKey+
+    ' odds='+(odds||[]).length+' oddsFinal='+oddsFinals+
+    ' espn='+converted.length+' espnFinal='+espnFinals+
+    ' merged='+merged.length);
+  return { games: merged, source: source };
 }
 
-async function _refreshResultSnapshots(sports, daysBack) {
+async function _refreshResultSnapshots(sports, daysBack, extraYmds) {
   sports = sports && sports.length ? sports : ['baseball_mlb'];
   let upserted = 0;
   const allRows = [];
-  console.log('RESULT_REFRESH_START sports='+sports.join(',')+' daysBack='+(daysBack||3));
+  console.log('RESULT_REFRESH_START sports='+sports.join(',')+' daysBack='+(daysBack||3)+
+    ' extraDates='+(extraYmds&&extraYmds.length||0));
   for (let i = 0; i < sports.length; i++) {
     const sport = sports[i];
     try {
-      const fetched = await _fetchScoresForSport(sport, daysBack);
+      const fetched = await _fetchScoresForSport(sport, daysBack, extraYmds);
       if (Array.isArray(fetched.games) && fetched.games.length) {
         const result = await _upsertResultSnapshots(fetched.games, sport, fetched.source);
         const n = result && typeof result.count === 'number' ? result.count
@@ -8938,9 +8998,10 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
           .in('canonical_game_key', lookupKeys);
         (snapRows||[]).forEach(function(r){ _indexResultByLookupKeys(resultsByKey, r); });
         const sports = [...new Set((allLegs||[]).map(function(l){ return _oddsApiSportKey(l.sport||l.league||'baseball_mlb'); }))];
+        const extraYmds = _pastScoreboardYmdsFromLegs(allLegs, 14);
         for (const sport of sports) {
           try {
-            const fetched = await _fetchScoresForSport(sport, daysBack);
+            const fetched = await _fetchScoresForSport(sport, daysBack, extraYmds);
             const scoresData = (fetched && fetched.games) || [];
             if (Array.isArray(scoresData) && scoresData.length) {
               await _upsertResultSnapshots(scoresData, sport, fetched.source);

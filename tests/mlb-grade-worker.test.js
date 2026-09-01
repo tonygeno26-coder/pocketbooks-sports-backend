@@ -194,12 +194,22 @@ test('in-process poller grades without ODDS_KEY / host auth', function() {
 test('ESPN scoreboard is the scores fallback when Odds API is empty', function() {
   assert(indexSource.includes('function _fetchEspnSportScores'), 'missing ESPN fetch');
   assert(indexSource.includes('function _fetchScoresForSport'), 'missing scores aggregator');
-  assert(indexSource.includes("source: 'espn'"), 'espn source not returned');
+  assert(indexSource.includes("converted.length ? 'espn' : 'odds-api'"), 'espn source not returned');
   assert(indexSource.includes('baseball/mlb'), 'MLB ESPN path missing');
   assert(indexSource.includes('RESULT_ESPN_PARSE_EMPTY'), 'must log root keys when ESPN parse is empty');
   assert(indexSource.includes("User-Agent': 'curl/8.7.1'"), 'ESPN fetch must use curl UA (custom UAs are 403)');
   assert(indexSource.includes('_lookupResultForLeg'), 'grade core must match tickets by team name');
   assert(indexSource.includes('espnScoreboard.toPublicScore'), 'scores API must use ESPN public mapper');
+});
+
+test('GRD-7b: ESPN still merges when Odds API already has other finals', function() {
+  assert(indexSource.includes('function _mergeOddsAndEspnScores'), 'missing merge helper');
+  assert(indexSource.includes('_mergeOddsAndEspnScores(odds || [], converted)'),
+    'fetchScoresForSport must merge Odds + ESPN');
+  assert(!/if \(oddsFinals\.length\) \{\s*console\.log\('RESULT_SCORES source=odds-api/.test(indexSource),
+    'must not skip ESPN just because other Odds games are final');
+  assert(indexSource.includes('_pastScoreboardYmdsFromLegs(allLegs, 14)'),
+    'grade core must request ESPN dates for still-active past legs');
 });
 
 test('poller stamps lastGradeRunAt even when nothing grades', function() {
@@ -433,6 +443,77 @@ test('ESPN Yankees/Sox snapshot matches ticket_legs via _lookupResultForLeg', fu
     pick: 'Over 8.5', market: 'total', line: 8.5
   };
   assertEq(deriveLeg(totalsLeg, lookupForLeg(map, totalsLeg)).outcome, 'won');
+});
+
+function _normTeamToken(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+function _scoreIdentityKey(g) {
+  const date = String((g && g.commence_time) || '').slice(0, 10);
+  const a = _normTeamToken(g && (g.home_team || g.home));
+  const b = _normTeamToken(g && (g.away_team || g.away));
+  if (!a || !b) return '';
+  return [a, b].sort().join('|') + '|' + date;
+}
+function _gameIsFinalScore(g) {
+  if (!g || g.canceled) return false;
+  const scores = g.scores;
+  const hasScores = Array.isArray(scores) && scores.length >= 2 &&
+    scores.every(function(s) { return s && s.score != null && s.score !== ''; });
+  return !!(g.completed && hasScores);
+}
+function _mergeOddsAndEspnScores(odds, espn) {
+  const byKey = {};
+  function consider(g) {
+    if (!g) return;
+    const key = _scoreIdentityKey(g);
+    if (!key) return;
+    const existing = byKey[key];
+    if (!existing) { byKey[key] = g; return; }
+    if (_gameIsFinalScore(g) && !_gameIsFinalScore(existing)) byKey[key] = g;
+  }
+  (odds || []).forEach(consider);
+  (espn || []).forEach(consider);
+  return Object.keys(byKey).map(function(k) { return byKey[k]; });
+}
+
+test('GRD-7b merge keeps Odds finals and fills a dropped Owls game from ESPN', function() {
+  const oddsYankees = {
+    home_team: 'New York Yankees', away_team: 'Boston Red Sox',
+    commence_time: '2026-08-30T17:35:00Z', completed: true,
+    scores: [{ name: 'New York Yankees', score: '16' }, { name: 'Boston Red Sox', score: '1' }]
+  };
+  const oddsDroppedLive = {
+    home_team: 'Los Angeles Dodgers', away_team: 'San Francisco Giants',
+    commence_time: '2026-08-30T20:10:00Z', completed: false,
+    scores: []
+  };
+  const espnDroppedFinal = {
+    home_team: 'Los Angeles Dodgers', away_team: 'San Francisco Giants',
+    commence_time: '2026-08-30T20:10:00Z', completed: true,
+    scores: [{ name: 'Los Angeles Dodgers', score: '4' }, { name: 'San Francisco Giants', score: '2' }]
+  };
+  const merged = _mergeOddsAndEspnScores([oddsYankees, oddsDroppedLive], [espnDroppedFinal]);
+  assertEq(merged.length, 2, 'two distinct games');
+  const dodgers = merged.find(function(g) { return g.home_team === 'Los Angeles Dodgers'; });
+  assert(dodgers && dodgers.completed, 'ESPN final must replace Odds non-final for dropped game');
+  assertEq(dodgers.scores[0].score, '4');
+  const yankees = merged.find(function(g) { return g.home_team === 'New York Yankees'; });
+  assert(yankees && yankees.completed, 'unrelated Odds final must be kept');
+});
+
+test('GRD-7b merge does not invent a result when ESPN has no final either', function() {
+  const oddsLive = {
+    home_team: 'Chicago Cubs', away_team: 'St. Louis Cardinals',
+    commence_time: '2026-08-30T18:00:00Z', completed: false, scores: []
+  };
+  const espnUpcoming = {
+    home_team: 'Chicago Cubs', away_team: 'St. Louis Cardinals',
+    commence_time: '2026-08-30T18:00:00Z', completed: false, scores: []
+  };
+  const merged = _mergeOddsAndEspnScores([oddsLive], [espnUpcoming]);
+  assertEq(merged.length, 1);
+  assert(!_gameIsFinalScore(merged[0]), 'must stay unresolved without a final');
 });
 
 if (fail) {

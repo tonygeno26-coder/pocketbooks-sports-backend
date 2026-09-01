@@ -420,8 +420,10 @@ test('2-leg parlay, 1 canceled, 1 wins → pushReduced, 1 wonLeg', function() {
 
 // ---------------------------------------------------------------------------
 // G. Game removed from feed — no snapshot at all → stays pending (GRD-7b)
+// Fetch-path fix: ESPN still merges when Odds/Owls dropped the game.
+// Derive-path stays unresolved unless a final snapshot exists.
 // ---------------------------------------------------------------------------
-console.log('\n-- G. Game removed from feed → stays pending (GRD-7b, not fixed) --');
+console.log('\n-- G. Game removed from feed → stays pending without a snapshot --');
 
 test('no snapshot row → outcome error (result_missing) — unchanged, GRD-7b', function() {
   var results = {};  // no entry for this game's key
