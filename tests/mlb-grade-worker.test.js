@@ -164,6 +164,10 @@ test('ESPN scoreboard is the scores fallback when Odds API is empty', function()
   assert(indexSource.includes('function _fetchScoresForSport'), 'missing scores aggregator');
   assert(indexSource.includes("source: 'espn'"), 'espn source not returned');
   assert(indexSource.includes('baseball/mlb'), 'MLB ESPN path missing');
+  assert(indexSource.includes('RESULT_ESPN_PARSE_EMPTY'), 'must log root keys when ESPN parse is empty');
+  assert(indexSource.includes("User-Agent': 'curl/8.7.1'"), 'ESPN fetch must use curl UA (custom UAs are 403)');
+  assert(indexSource.includes('_lookupResultForLeg'), 'grade core must match tickets by team name');
+  assert(indexSource.includes('espnScoreboard.toPublicScore'), 'scores API must use ESPN public mapper');
 });
 
 test('poller stamps lastGradeRunAt even when nothing grades', function() {
@@ -211,6 +215,36 @@ test('ESPN games convert to ticket-matching Odds-shaped keys', function() {
   _gameKeyLookupCandidates(stored.canonical_game_key).forEach(function(k) { map[k] = stored; });
   const hit = _lookupResultByGameKey(map, 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30');
   assert(hit, 'ESPN-derived snapshot should match ticket key');
+});
+
+test('ticket pick Boston Red Sox matches ESPN Yankees/Red Sox result', function() {
+  const espn = require('../lib/espn-scoreboard');
+  const fixture = {
+    events: [{
+      id: '401816732',
+      date: '2026-08-30T17:35Z',
+      competitions: [{
+        date: '2026-08-30T17:35Z',
+        competitors: [
+          { homeAway: 'home', score: '16', team: { displayName: 'New York Yankees' } },
+          { homeAway: 'away', score: '1', team: { displayName: 'Boston Red Sox' } }
+        ],
+        status: { type: { name: 'STATUS_FINAL', state: 'post', completed: true } }
+      }]
+    }]
+  };
+  const converted = espn.espnGamesToOddsScores(espn.espnScoreboardToGames(fixture), 'baseball_mlb')[0];
+  const key = _resultSnapshotCanonicalKey(converted, 'baseball_mlb');
+  assertEq(key, 'baseball_mlb|Boston Red Sox|New York Yankees|2026-08-30');
+  const stored = {
+    canonical_game_key: key, status: 'final',
+    home_team: converted.home_team, away_team: converted.away_team,
+    home_score: 16, away_score: 1, commence_time: converted.commence_time
+  };
+  const map = {};
+  _gameKeyLookupCandidates(key).forEach(function(k) { map[k] = stored; });
+  assert(_lookupResultByGameKey(map, key), 'canonical key should hit');
+  assertEq(stored.away_team, 'Boston Red Sox');
 });
 
 if (fail) {

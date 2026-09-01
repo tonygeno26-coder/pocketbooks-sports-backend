@@ -3,6 +3,7 @@ const express = require('express');
 const cors    = require('cors');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
+const espnScoreboard = require('./lib/espn-scoreboard');
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE Q: PRODUCTION OPS HARDENING
@@ -7519,20 +7520,12 @@ app.get('/api/scores/:sport', async (req, res) => {
   try {
     const fetched = await _fetchScoresForSport(sport, daysFrom);
     const games = (fetched && fetched.games) || [];
-    const completed = games.filter(function(g){ return g.completed && g.scores && g.scores.length >= 2; });
-    if (!completed.length && fetched && fetched.error) {
+    if (!games.length && fetched && fetched.error) {
       const status = fetched.errorCode === 'OUT_OF_USAGE_CREDITS' ? 402 : 502;
       return res.status(status).json({ error: fetched.error, error_code: fetched.errorCode || null, source: fetched.source || null });
     }
-    res.json(completed.map(function(g) {
-      return {
-        id: g.id, sport: g.sport_title || sport, home: g.home_team, away: g.away_team,
-        commence_time: g.commence_time, completed: g.completed,
-        home_score: parseInt((g.scores.find(function(s){ return s.name === g.home_team; })||{}).score||0, 10),
-        away_score: parseInt((g.scores.find(function(s){ return s.name === g.away_team; })||{}).score||0, 10),
-        last_update: g.last_update || null,
-        source: fetched.source || null
-      };
+    res.json(games.map(function(g) {
+      return espnScoreboard.toPublicScore(g, sport, fetched && fetched.source);
     }));
   } catch (e) {
     res.status(502).json({ error: e.message });
@@ -8207,13 +8200,66 @@ function _indexResultByLookupKeys(resultsByKey, row) {
   }
 }
 
+function _normTeamToken(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function _teamNamesLooselyEqual(a, b) {
+  const na = _normTeamToken(a), nb = _normTeamToken(b);
+  if (!na || !nb) return false;
+  return na === nb || na.indexOf(nb) >= 0 || nb.indexOf(na) >= 0;
+}
+
+function _uniqueResultRows(resultsByKey) {
+  const out = [];
+  const seen = [];
+  Object.keys(resultsByKey || {}).forEach(function(k) {
+    const row = resultsByKey[k];
+    if (!row || typeof row !== 'object') return;
+    if (seen.indexOf(row) >= 0) return;
+    seen.push(row);
+    out.push(row);
+  });
+  return out;
+}
+
+function _lookupResultByTeams(resultsByKey, home, away, dateStr) {
+  if (!home && !away) return null;
+  const rows = _uniqueResultRows(resultsByKey);
+  const date = String(dateStr || '').slice(0, 10);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    const homeOk = !home || _teamNamesLooselyEqual(row.home_team, home);
+    const awayOk = !away || _teamNamesLooselyEqual(row.away_team, away);
+    if (!homeOk || !awayOk) continue;
+    if (date) {
+      const rowDate = String(row.commence_time || '').slice(0, 10);
+      const keyDate = String(row.canonical_game_key || '').split('|').pop();
+      if (rowDate && rowDate !== date && keyDate !== date) continue;
+    }
+    return row;
+  }
+  return null;
+}
+
 function _lookupResultByGameKey(resultsByKey, cKey) {
   if (!resultsByKey) return null;
   const cands = _gameKeyLookupCandidates(cKey);
   for (let i = 0; i < cands.length; i++) {
     if (resultsByKey[cands[i]]) return resultsByKey[cands[i]];
   }
+  const parts = String(cKey || '').split('|');
+  if (parts.length >= 3)
+    return _lookupResultByTeams(resultsByKey, parts[2], parts[1], parts[3] || '');
   return null;
+}
+
+function _lookupResultForLeg(resultsByKey, leg) {
+  const hit = _lookupResultByGameKey(resultsByKey, (leg && (leg.canonical_game_key || leg.canonicalGameKey)) || '');
+  if (hit) return hit;
+  if (!leg) return null;
+  const date = _isoDateFromValue(leg.scheduled_start || leg.scheduledStart || leg.commence_time || '');
+  return _lookupResultByTeams(resultsByKey, leg.home_team || leg.homeTeam, leg.away_team || leg.awayTeam, date);
 }
 
 function _espnScoreboardPath(sport) {
@@ -8234,23 +8280,7 @@ function _utcYmdDaysAgo(n) {
 }
 
 function _espnGamesToOddsScores(games, sportKey) {
-  return (games || []).map(function(g) {
-    const canceled = !!g.canceled;
-    return {
-      id: String(g.id || ''),
-      sport_key: sportKey,
-      home_team: g.home,
-      away_team: g.away,
-      commence_time: g.commence_time,
-      completed: !!g.completed && !canceled,
-      canceled: canceled,
-      status: g.completed ? 'final' : (canceled ? 'canceled' : ''),
-      scores: [
-        { name: g.home, score: g.home_score == null ? null : String(g.home_score) },
-        { name: g.away, score: g.away_score == null ? null : String(g.away_score) }
-      ]
-    };
-  }).filter(function(g) { return g.id && g.home_team && g.away_team; });
+  return espnScoreboard.espnGamesToOddsScores(games, sportKey);
 }
 
 async function _fetchEspnSportScores(sport, daysBack) {
@@ -8272,6 +8302,10 @@ async function _fetchEspnSportScores(sport, daysBack) {
       continue;
     }
     const games = _espnScoreboardToGames(r.data);
+    if (!games.length) {
+      const keys = espnScoreboard.espnRootKeys(r.data);
+      console.warn('RESULT_ESPN_PARSE_EMPTY sport='+sportKey+' dates='+ymd+' keys='+JSON.stringify(keys));
+    }
     let added = 0;
     games.forEach(function(g) {
       if (!g.id || seen[g.id]) return;
@@ -8317,8 +8351,11 @@ function _fetchOddsApiScores(sport, daysBack) {
 async function _fetchScoresForSport(sport, daysBack) {
   const sportKey = _oddsApiSportKey(sport);
   const odds = await _fetchOddsApiScores(sportKey, daysBack);
-  if (Array.isArray(odds) && odds.length) {
-    console.log('RESULT_SCORES source=odds-api sport='+sportKey+' games='+odds.length);
+  const oddsFinals = (odds || []).filter(function(g) {
+    return g && g.completed && Array.isArray(g.scores) && g.scores.length >= 2;
+  });
+  if (oddsFinals.length) {
+    console.log('RESULT_SCORES source=odds-api sport='+sportKey+' games='+odds.length+' final='+oddsFinals.length);
     return { games: odds, source: 'odds-api' };
   }
   const espnGames = await _fetchEspnSportScores(sportKey, daysBack);
@@ -8326,6 +8363,10 @@ async function _fetchScoresForSport(sport, daysBack) {
   if (converted.length) {
     console.log('RESULT_SCORES source=espn sport='+sportKey+' games='+converted.length);
     return { games: converted, source: 'espn' };
+  }
+  if (Array.isArray(odds) && odds.length) {
+    console.log('RESULT_SCORES source=odds-api sport='+sportKey+' games='+odds.length+' final=0 espnEmpty=true');
+    return { games: odds, source: 'odds-api' };
   }
   console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true espnEmpty=true');
   return { games: [], source: null };
@@ -8496,7 +8537,7 @@ function _deriveTicketOutcome(ticket, legs, resultsByKey) {
   const type = (ticket.type||'single').toLowerCase();
   if (!legs.length) return { outcome:'error', reason:'no_legs' };
   const legOutcomes = legs.map(function(leg) {
-    const result = _lookupResultByGameKey(resultsByKey, leg.canonical_game_key||'')||null;
+    const result = _lookupResultForLeg(resultsByKey, leg)||null;
     return Object.assign({ leg:leg.pick }, _deriveLegOutcome(leg, result));
   });
   const pending = legOutcomes.find(function(l){ return l.outcome==='pending'||l.outcome==='error'; });
@@ -11955,7 +11996,8 @@ function _fetchNflScores(daysFrom) {
 function _httpsGetJson(url, timeoutMs) {
   return new Promise(function(resolve) {
     const req2 = require('https').get(url, {
-      headers: { Accept: 'application/json', 'User-Agent': 'PocketBooksSports/1.0' }
+      // ESPN/Akamai 403s custom UAs (PocketBooksSports/1.0, node, Chrome). curl works.
+      headers: { Accept: 'application/json', 'User-Agent': 'curl/8.7.1' }
     }, function(r) {
       let d = '';
       r.on('data', function(c){ d += c; });
@@ -11972,38 +12014,7 @@ function _httpsGetJson(url, timeoutMs) {
 }
 
 function _espnScoreboardToGames(data) {
-  const events = (data && data.events) || [];
-  return events.map(function(e) {
-    const c = (e.competitions || [])[0] || {};
-    const st = (c.status && c.status.type) || {};
-    let home='', away='', homeAbbrev='', awayAbbrev='', homeShort='', awayShort='';
-    let hs = null, as = null;
-    (c.competitors || []).forEach(function(x) {
-      const t = x.team || {};
-      const name = t.displayName || t.name || '';
-      const score = (x.score !== '' && x.score != null) ? parseInt(x.score, 10) : null;
-      if (x.homeAway === 'home') {
-        home = name; homeAbbrev = t.abbreviation || ''; homeShort = t.shortDisplayName || t.name || '';
-        hs = score;
-      } else {
-        away = name; awayAbbrev = t.abbreviation || ''; awayShort = t.shortDisplayName || t.name || '';
-        as = score;
-      }
-    });
-    const statusName = String(st.name || st.state || '');
-    const canceled = /postponed|canceled|cancelled|abandoned/i.test(statusName);
-    return {
-      id: e.id || c.id,
-      home: home, away: away,
-      homeAbbrev: homeAbbrev, awayAbbrev: awayAbbrev,
-      homeShort: homeShort, awayShort: awayShort,
-      completed: !canceled && !!(st.completed || st.name === 'STATUS_FINAL' || st.state === 'post'),
-      canceled: canceled,
-      home_score: hs == null ? 0 : hs,
-      away_score: as == null ? 0 : as,
-      commence_time: c.date || e.date
-    };
-  });
+  return espnScoreboard.espnScoreboardToGames(data);
 }
 
 // Regular season = seasontype=2. Empty slate retries without seasontype, then preseason (1).
