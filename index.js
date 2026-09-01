@@ -4,6 +4,7 @@ const cors    = require('cors');
 const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const espnScoreboard = require('./lib/espn-scoreboard');
+const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE Q: PRODUCTION OPS HARDENING
@@ -12125,6 +12126,80 @@ app.get('/api/grade/status', async (req, res) => {
       containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
       dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
+});
+
+// GET /api/host/unresolved-grading — monitor only. Never auto-grades or voids.
+app.get('/api/host/unresolved-grading', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured', autoGrade:false });
+  const clubId = req._clubId || (req.query && req.query.clubId) || '';
+  try {
+    let tq = sb.from('tickets')
+      .select('id,status,type,player_id,player_username,placed_at,graded_at,grading_source')
+      .in('status', ['active', 'open'])
+      .order('placed_at', { ascending:true })
+      .limit(500);
+    if (clubId) tq = tq.eq('club_id', clubId);
+    const { data: tickets, error: tErr } = await tq;
+    if (tErr) throw tErr;
+
+    const ids = (tickets || []).map(function(t) { return t.id; }).filter(Boolean);
+    const legsByTicket = {};
+    const keys = {};
+    if (ids.length) {
+      const { data: legs, error: lErr } = await sb.from('ticket_legs')
+        .select('ticket_id,leg_index,sport,home_team,away_team,scheduled_start,market,pick,canonical_game_key,provider_game_id,event_name,game_status,leg_result')
+        .in('ticket_id', ids);
+      if (lErr) throw lErr;
+      (legs || []).forEach(function(l) {
+        if (!l || !l.ticket_id) return;
+        if (!legsByTicket[l.ticket_id]) legsByTicket[l.ticket_id] = [];
+        legsByTicket[l.ticket_id].push(l);
+        if (l.canonical_game_key) keys[l.canonical_game_key] = true;
+      });
+    }
+
+    const snapshotsByKey = {};
+    const keyList = Object.keys(keys);
+    if (keyList.length) {
+      const { data: snaps, error: sErr } = await sb.from('result_snapshots')
+        .select('canonical_game_key,status,source,home_score,away_score,home_team,away_team,commence_time,fetched_at')
+        .in('canonical_game_key', keyList);
+      if (sErr) throw sErr;
+      (snaps || []).forEach(function(s) {
+        if (s && s.canonical_game_key) snapshotsByKey[s.canonical_game_key] = s;
+      });
+    }
+
+    const lastAttemptByTicket = {};
+    if (ids.length) {
+      const { data: audits } = await sb.from('audit_events')
+        .select('ticket_id,event_type,created_at')
+        .in('ticket_id', ids)
+        .order('created_at', { ascending:false })
+        .limit(200);
+      (audits || []).forEach(function(a) {
+        if (!a || !a.ticket_id || lastAttemptByTicket[a.ticket_id]) return;
+        lastAttemptByTicket[a.ticket_id] = a.created_at;
+      });
+    }
+
+    const report = unresolvedGradingMonitor.buildReport({
+      tickets: tickets || [],
+      legsByTicket,
+      snapshotsByKey,
+      lastAttemptByTicket,
+      nowMs: Date.now()
+    });
+    report.ok = true;
+    report.clubId = clubId || null;
+    report.lastGradePollAt = _lastGradePollAt || null;
+    report.lastGradeRunAt = _lastGradeRunAt || null;
+    res.json(report);
+  } catch (e) {
+    console.error('[unresolved-grading]', e.message);
+    res.status(500).json({ ok:false, error:e.message, autoGrade:false });
+  }
 });
 // ════════════════════════════════════════════════════════════════════════════
 
