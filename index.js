@@ -8657,44 +8657,74 @@ function _collectPropsForSport(sportShort) {
   return out;
 }
 
+function _filterPropsByGameId(props, gameId) {
+  if (!gameId) return props;
+  var gid = String(gameId);
+  return (props || []).filter(function(p) {
+    if (!p) return false;
+    if (String(p.gameId || '') === gid) return true;
+    if (String(p.canonicalGameKey || '') === gid) return true;
+    return false;
+  });
+}
+
 app.get('/api/props/:sport', async function(req, res) {
   var sport = String(req.params.sport || '').toLowerCase();
   if (PROPS_SUPPORTED_SPORTS.indexOf(sport) < 0) {
     return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
   }
+  var gameId = req.query.gameId ? String(req.query.gameId) : null;
   var now = Date.now();
   var cached = _PROPS_RESPONSE_CACHE[sport];
-  if (cached && (now - cached.at) < PROPS_CACHE_TTL_MS) {
-    res.setHeader('X-Cache', 'HIT');
-    res.setHeader('X-Provider', 'owls_insight');
-    return res.json(cached.data);
-  }
-  var props = [];
+  var fullProps = [];
   var source = 'owls_props_api';
-  if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
-    var fetched = await fetchPropsFromOwlsInsight(sport);
-    if (fetched.ok && fetched.props && fetched.props.length) {
-      props = fetched.props;
+  var cacheHit = false;
+  if (cached && (now - cached.at) < PROPS_CACHE_TTL_MS) {
+    fullProps = cached.data.props || [];
+    source = cached.data.source || source;
+    cacheHit = true;
+  } else {
+    if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
+      var fetched = await fetchPropsFromOwlsInsight(sport);
+      if (fetched.ok && fetched.props && fetched.props.length) {
+        fullProps = fetched.props;
+      } else {
+        fullProps = _collectPropsForSport(sport);
+        source = 'owls_cache_fallback';
+      }
     } else {
-      props = _collectPropsForSport(sport);
+      fullProps = _collectPropsForSport(sport);
       source = 'owls_cache_fallback';
     }
-  } else {
-    props = _collectPropsForSport(sport);
-    source = 'owls_cache_fallback';
+    _PROPS_RESPONSE_CACHE[sport] = {
+      at: now,
+      data: {
+        ok: true,
+        sport: sport,
+        props: fullProps,
+        count: fullProps.length,
+        source: source,
+        updatedAt: new Date().toISOString()
+      }
+    };
   }
+  var outProps = gameId ? _filterPropsByGameId(fullProps, gameId) : fullProps;
   var data = {
     ok: true,
     sport: sport,
-    props: props,
-    count: props.length,
+    props: outProps,
+    count: outProps.length,
     source: source,
     updatedAt: new Date().toISOString()
   };
-  _PROPS_RESPONSE_CACHE[sport] = { at: now, data: data };
-  res.setHeader('X-Cache', 'MISS');
+  if (gameId) {
+    data.gameId = gameId;
+    data.filtered = true;
+  }
+  res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
+  if (gameId) res.setHeader('X-Props-Filter', 'gameId');
   res.json(data);
 });
 
