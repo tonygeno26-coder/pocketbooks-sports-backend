@@ -8663,8 +8663,24 @@ function _filterPropsByGameId(props, gameId) {
   return (props || []).filter(function(p) {
     if (!p) return false;
     if (String(p.gameId || '') === gid) return true;
+    if (String(p.providerGameId || '') === gid) return true;
     if (String(p.canonicalGameKey || '') === gid) return true;
     return false;
+  });
+}
+
+function _normalizeTeamNameForPropsMatch(name) {
+  return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function _filterPropsByTeams(props, home, away) {
+  var h = _normalizeTeamNameForPropsMatch(home);
+  var a = _normalizeTeamNameForPropsMatch(away);
+  if (!h || !a) return [];
+  return (props || []).filter(function(p) {
+    if (!p) return false;
+    return _normalizeTeamNameForPropsMatch(p.home) === h
+      && _normalizeTeamNameForPropsMatch(p.away) === a;
   });
 }
 
@@ -8674,6 +8690,8 @@ app.get('/api/props/:sport', async function(req, res) {
     return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
   }
   var gameId = req.query.gameId ? String(req.query.gameId) : null;
+  var homeTeam = req.query.home ? String(req.query.home) : null;
+  var awayTeam = req.query.away ? String(req.query.away) : null;
   var now = Date.now();
   var cached = _PROPS_RESPONSE_CACHE[sport];
   var fullProps = [];
@@ -8709,6 +8727,11 @@ app.get('/api/props/:sport', async function(req, res) {
     };
   }
   var outProps = gameId ? _filterPropsByGameId(fullProps, gameId) : fullProps;
+  var filterMode = gameId ? 'gameId' : null;
+  if (gameId && outProps.length === 0 && homeTeam && awayTeam) {
+    outProps = _filterPropsByTeams(fullProps, homeTeam, awayTeam);
+    if (outProps.length) filterMode = 'teams';
+  }
   var data = {
     ok: true,
     sport: sport,
@@ -8721,10 +8744,15 @@ app.get('/api/props/:sport', async function(req, res) {
     data.gameId = gameId;
     data.filtered = true;
   }
+  if (filterMode === 'teams') {
+    data.filterMode = 'teams';
+    data.home = homeTeam;
+    data.away = awayTeam;
+  }
   res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
-  if (gameId) res.setHeader('X-Props-Filter', 'gameId');
+  if (filterMode) res.setHeader('X-Props-Filter', filterMode);
   res.json(data);
 });
 
