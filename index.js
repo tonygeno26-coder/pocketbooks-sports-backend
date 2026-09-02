@@ -8287,6 +8287,198 @@ app.get('/api/odds/:sport', async (req, res) => {
   } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
 });
 
+// ── GET /api/props/:sport ───────────────────────────────────────────────────
+// Aggregates player props from the Owls in-memory cache. 60s response cache.
+const _PROPS_RESPONSE_CACHE = Object.create(null);
+const PROPS_CACHE_TTL_MS = 60 * 1000;
+const PROPS_SPORT_TYPES = {
+  mlb: ['Strikeouts', 'Hits', 'Total Bases', 'Home Runs', 'RBIs', 'Runs Scored', 'Walks', 'Stolen Bases'],
+  nba: ['Points', 'Rebounds', 'Assists', '3-Pointers Made', 'Pts + Reb + Ast', 'Steals', 'Blocks'],
+  nfl: ['Passing Yards', 'Rushing Yards', 'Receiving Yards', 'Receptions', 'Anytime TD', 'Passing TDs']
+};
+
+function _americanToImpliedPct(odds) {
+  var o = parseInt(odds, 10);
+  if (!o || isNaN(o)) return 50;
+  if (o > 0) return Math.round(100 / (o / 100 + 1));
+  return Math.round((Math.abs(o) / (Math.abs(o) + 100)) * 100);
+}
+
+function _collectPropsForSport(sportShort) {
+  var allowed = PROPS_SPORT_TYPES[sportShort];
+  if (!allowed) return [];
+  var games = _owlsCacheFlatGamesForSport(sportShort, sportShort.toUpperCase());
+  var out = [];
+  for (var gi = 0; gi < games.length; gi++) {
+    var g = games[gi];
+    var props = Array.isArray(g.props) ? g.props : [];
+    for (var pi = 0; pi < props.length; pi++) {
+      var p = props[pi];
+      if (!p || !p.playerName) continue;
+      if (allowed.indexOf(p.propType) < 0) continue;
+      var base = {
+        gameId: g.id,
+        canonicalGameKey: g.canonicalGameKey || null,
+        home: g.home,
+        away: g.away,
+        scheduledStart: g.scheduledStart || g.time || null,
+        sport: sportShort.toUpperCase(),
+        propType: p.propType,
+        playerName: p.playerName,
+        team: p.team || null,
+        line: p.line
+      };
+      if (typeof p.overOdds === 'number') {
+        out.push(Object.assign({}, base, {
+          side: 'over',
+          odds: p.overOdds,
+          pick: p.playerName + ' Over ' + p.line + ' ' + p.propType
+        }));
+      }
+      if (typeof p.underOdds === 'number') {
+        out.push(Object.assign({}, base, {
+          side: 'under',
+          odds: p.underOdds,
+          pick: p.playerName + ' Under ' + p.line + ' ' + p.propType
+        }));
+      }
+    }
+  }
+  out.sort(function(a, b) {
+    if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
+    if (a.playerName !== b.playerName) return (a.playerName || '').localeCompare(b.playerName || '');
+    return (a.side || '').localeCompare(b.side || '');
+  });
+  return out;
+}
+
+app.get('/api/props/:sport', function(req, res) {
+  var sport = String(req.params.sport || '').toLowerCase();
+  if (!PROPS_SPORT_TYPES[sport]) {
+    return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
+  }
+  var now = Date.now();
+  var cached = _PROPS_RESPONSE_CACHE[sport];
+  if (cached && (now - cached.at) < PROPS_CACHE_TTL_MS) {
+    res.setHeader('X-Cache', 'HIT');
+    res.setHeader('X-Provider', 'owls_insight');
+    return res.json(cached.data);
+  }
+  var props = _collectPropsForSport(sport);
+  var data = {
+    ok: true,
+    sport: sport,
+    props: props,
+    count: props.length,
+    updatedAt: new Date().toISOString()
+  };
+  _PROPS_RESPONSE_CACHE[sport] = { at: now, data: data };
+  res.setHeader('X-Cache', 'MISS');
+  res.setHeader('X-Provider', 'owls_insight');
+  res.json(data);
+});
+
+// ── GET /api/splits/:sport ────────────────────────────────────────────────────
+// Public betting splits (% of handle on each side). 2min cache. Uses recent
+// ticket_legs when available; falls back to moneyline implied probability.
+const _SPLITS_RESPONSE_CACHE = Object.create(null);
+const SPLITS_CACHE_TTL_MS = 2 * 60 * 1000;
+
+async function _aggregateLegSplits(sportShort) {
+  var sb = getSupabase();
+  var byGame = Object.create(null);
+  if (!sb) return byGame;
+  try {
+    var since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    var { data: legs, error } = await sb.from('ticket_legs')
+      .select('canonical_game_key,pick,market,risk_amount,sport,home_team,away_team,provider_game_id')
+      .gte('created_at', since)
+      .limit(5000);
+    if (error || !Array.isArray(legs)) return byGame;
+    var sportU = sportShort.toUpperCase();
+    for (var i = 0; i < legs.length; i++) {
+      var leg = legs[i];
+      if (!leg) continue;
+      var ls = String(leg.sport || '').toUpperCase();
+      if (ls && ls !== sportU && ls.indexOf(sportU) < 0) continue;
+      var gKey = leg.canonical_game_key || leg.provider_game_id || ((leg.away_team || '') + '@' + (leg.home_team || ''));
+      if (!gKey) continue;
+      var bucket = byGame[gKey] || (byGame[gKey] = { homeRisk: 0, awayRisk: 0, overRisk: 0, underRisk: 0, totalRisk: 0 });
+      var risk = parseFloat(leg.risk_amount) || 1;
+      var pick = String(leg.pick || '').toLowerCase();
+      var mkt = String(leg.market || '').toLowerCase();
+      bucket.totalRisk += risk;
+      if (mkt.indexOf('total') >= 0 || pick.indexOf('over') >= 0 || pick.indexOf('under') >= 0) {
+        if (pick.indexOf('over') >= 0) bucket.overRisk += risk;
+        else if (pick.indexOf('under') >= 0) bucket.underRisk += risk;
+      } else if (leg.home_team && pick.indexOf(String(leg.home_team).toLowerCase()) >= 0) {
+        bucket.homeRisk += risk;
+      } else if (leg.away_team && pick.indexOf(String(leg.away_team).toLowerCase()) >= 0) {
+        bucket.awayRisk += risk;
+      }
+    }
+  } catch (_e) { /* non-fatal */ }
+  return byGame;
+}
+
+function _pctPair(a, b) {
+  var tot = (a || 0) + (b || 0);
+  if (tot <= 0) return { a: 50, b: 50 };
+  return { a: Math.round((a / tot) * 100), b: Math.round((b / tot) * 100) };
+}
+
+async function _collectSplitsForSport(sportShort) {
+  var games = _owlsCacheFlatGamesForSport(sportShort, sportShort.toUpperCase());
+  var legMap = await _aggregateLegSplits(sportShort);
+  var out = [];
+  for (var i = 0; i < games.length; i++) {
+    var g = games[i];
+    var gKey = g.canonicalGameKey || g.id;
+    var legs = legMap[gKey] || null;
+    var awML = (Array.isArray(g.moneyline) ? g.moneyline : []).find(function(m){ return m && m.team === g.away; });
+    var hwML = (Array.isArray(g.moneyline) ? g.moneyline : []).find(function(m){ return m && m.team === g.home; });
+    var mlFallback = _pctPair(_americanToImpliedPct(awML && awML.odds), _americanToImpliedPct(hwML && hwML.odds));
+    var ml = legs && (legs.awayRisk + legs.homeRisk) > 0
+      ? _pctPair(legs.awayRisk, legs.homeRisk)
+      : { a: mlFallback.a, b: mlFallback.b };
+    var ov = (Array.isArray(g.totals) ? g.totals : []).find(function(t){ return t && t.name === 'Over'; });
+    var un = (Array.isArray(g.totals) ? g.totals : []).find(function(t){ return t && t.name === 'Under'; });
+    var totFallback = _pctPair(_americanToImpliedPct(ov && ov.odds), _americanToImpliedPct(un && un.odds));
+    var tot = legs && (legs.overRisk + legs.underRisk) > 0
+      ? _pctPair(legs.overRisk, legs.underRisk)
+      : { a: totFallback.a, b: totFallback.b };
+    out.push({
+      gameId: g.id,
+      canonicalGameKey: gKey,
+      home: g.home,
+      away: g.away,
+      moneyline: { awayPct: ml.a, homePct: ml.b },
+      total: { overPct: tot.a, underPct: tot.b },
+      source: legs && legs.totalRisk > 0 ? 'tickets' : 'implied'
+    });
+  }
+  return out;
+}
+
+app.get('/api/splits/:sport', async function(req, res) {
+  var sport = String(req.params.sport || '').toLowerCase();
+  var now = Date.now();
+  var cached = _SPLITS_RESPONSE_CACHE[sport];
+  if (cached && (now - cached.at) < SPLITS_CACHE_TTL_MS) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.json(cached.data);
+  }
+  try {
+    var splits = await _collectSplitsForSport(sport);
+    var data = { ok: true, sport: sport, splits: splits, count: splits.length, updatedAt: new Date().toISOString() };
+    _SPLITS_RESPONSE_CACHE[sport] = { at: now, data: data };
+    res.setHeader('X-Cache', 'MISS');
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Sport catalog metadata ──────────────────────────────────────────────────
 // Every sport/competition the backend is willing to advertise. sortOrder is
 // the DK-style static fallback ordering; /api/sports re-sorts at request
