@@ -3823,6 +3823,85 @@ function _logOwlsUnavailableMarketSkip(payload) {
   }
 }
 
+// Expand nested alternateLines on spread/total outcomes into flat cache entries.
+function _expandOwlsOutcomeAlternates(oc, mt, baseEntry, ck, pushFn) {
+  var altLines = oc.alternateLines || oc.alternate_lines;
+  if (!Array.isArray(altLines) || !altLines.length) return;
+  if (mt !== 'spread' && mt !== 'total') return;
+  altLines.forEach(function(alt) {
+    if (!alt || typeof alt !== 'object') return;
+    var altPoint = alt.point != null ? alt.point
+                 : alt.handicap != null ? alt.handicap
+                 : alt.spread != null ? alt.spread : undefined;
+    if (altPoint == null) return;
+    // Some feeds bundle both sides on one alt row for totals.
+    if (mt === 'total' && (alt.overPrice != null || alt.underPrice != null
+        || alt.over != null || alt.under != null)) {
+      var overP = alt.overPrice != null ? alt.overPrice : alt.over;
+      var underP = alt.underPrice != null ? alt.underPrice : alt.under;
+      if (overP != null) {
+        var overEntry = Object.assign({}, baseEntry, {
+          teamOrSide: 'Over', line: altPoint,
+          odds: _toAmericanOdds(parseFloat(overP) || 0),
+          overUnder: 'Over', isAlternate: true
+        });
+        overEntry.canonicalMarketKey = _buildCanonicalMarketKey({
+          canonicalGameKey: ck, marketType: overEntry.marketType,
+          propType: overEntry.propType, team: overEntry.teamOrSide
+        });
+        overEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+          marketType: overEntry.marketType, team: overEntry.teamOrSide,
+          player: overEntry.playerName, side: overEntry.overUnder || overEntry.teamOrSide,
+          line: overEntry.line
+        });
+        pushFn(overEntry);
+      }
+      if (underP != null) {
+        var underEntry = Object.assign({}, baseEntry, {
+          teamOrSide: 'Under', line: altPoint,
+          odds: _toAmericanOdds(parseFloat(underP) || 0),
+          overUnder: 'Under', isAlternate: true
+        });
+        underEntry.canonicalMarketKey = _buildCanonicalMarketKey({
+          canonicalGameKey: ck, marketType: underEntry.marketType,
+          propType: underEntry.propType, team: underEntry.teamOrSide
+        });
+        underEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+          marketType: underEntry.marketType, team: underEntry.teamOrSide,
+          player: underEntry.playerName, side: underEntry.overUnder || underEntry.teamOrSide,
+          line: underEntry.line
+        });
+        pushFn(underEntry);
+      }
+      return;
+    }
+    var altPrice = alt.price != null ? alt.price
+                 : alt.odds != null ? alt.odds
+                 : alt.american != null ? alt.american : null;
+    if (altPrice == null) return;
+    var altEntry = Object.assign({}, baseEntry, {
+      line: altPoint,
+      odds: _toAmericanOdds(parseFloat(altPrice) || 0),
+      isAlternate: true
+    });
+    altEntry.canonicalMarketKey = _buildCanonicalMarketKey({
+      canonicalGameKey: ck, marketType: altEntry.marketType,
+      propType: altEntry.propType, team: altEntry.teamOrSide
+    });
+    altEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+      marketType: altEntry.marketType, team: altEntry.teamOrSide,
+      player: altEntry.playerName, side: altEntry.overUnder || altEntry.teamOrSide,
+      line: altEntry.line
+    });
+    pushFn(altEntry);
+  });
+}
+
+function _owlsIsAlternateMarketKey(mktKeyLc, mt) {
+  if (mt !== 'spread' && mt !== 'total') return false;
+  return /alternate|(^|_)alt_/.test(mktKeyLc || '');
+}
+
 function _normalizeOwlsResponse(owlsData, sportKey) {
   if (!owlsData) return null;
   // Accept success:true OR no success field (some responses omit it)
@@ -4056,7 +4135,12 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
             line:       entry.line,
           });
 
+          if (_owlsIsAlternateMarketKey(mktKeyLc, mt)) entry.isAlternate = true;
+
           gEntry.markets.push(entry);
+          _expandOwlsOutcomeAlternates(oc, mt, entry, ck, function(altEntry) {
+            gEntry.markets.push(altEntry);
+          });
         });
       });
     });
@@ -8116,6 +8200,8 @@ function _projectOwlsGameToFlat(g, sportLabel) {
   var moneyline = [];
   var spreads   = [];
   var totals    = [];
+  var altSpreads = [];
+  var altTotals  = [];
   // Props: one row per (player, propType, line). Each row carries both
   // over+under odds when the feed supplies them; missing side stays null.
   // Keyed by `propType|player|line` so a Pinnacle entry can overwrite a
@@ -8169,8 +8255,10 @@ function _projectOwlsGameToFlat(g, sportLabel) {
       }
     } else if (mt === 'spread') {
       if (typeof m.line !== 'number') continue;
-      if (_pick(key, m.sportsbook)) {
-        var ex = spreads.findIndex(function(x){ return x.team === side; });
+      var spKey = mt + '|' + side + '|' + m.line;
+      var spTarget = m.isAlternate ? altSpreads : spreads;
+      if (_pick(spKey, m.sportsbook)) {
+        var ex = spTarget.findIndex(function(x){ return x.team === side && x.line === m.line; });
         var rr = {
           team: side, line: m.line, odds: price,
           market: 'spread',
@@ -8178,13 +8266,15 @@ function _projectOwlsGameToFlat(g, sportLabel) {
           providerGameId:   m.providerGameId   || providerGameId,
           scheduledStart:   g.commence_time || null
         };
-        if (ex >= 0) spreads[ex] = rr; else spreads.push(rr);
+        if (ex >= 0) spTarget[ex] = rr; else spTarget.push(rr);
       }
     } else if (mt === 'total') {
       if (typeof m.line !== 'number') continue;
-      // Owls Over/Under outcomes share a line; key by name only.
-      if (_pick(key, m.sportsbook)) {
-        var et = totals.findIndex(function(x){ return x.name === side; });
+      // Owls Over/Under outcomes share a line; key by side + line.
+      var totKey = mt + '|' + side + '|' + m.line;
+      var totTarget = m.isAlternate ? altTotals : totals;
+      if (_pick(totKey, m.sportsbook)) {
+        var et = totTarget.findIndex(function(x){ return x.name === side && x.line === m.line; });
         var rt = {
           name: side, line: m.line, odds: price,
           market: 'total',
@@ -8192,7 +8282,7 @@ function _projectOwlsGameToFlat(g, sportLabel) {
           providerGameId:   m.providerGameId   || providerGameId,
           scheduledStart:   g.commence_time || null
         };
-        if (et >= 0) totals[et] = rt; else totals.push(rt);
+        if (et >= 0) totTarget[et] = rt; else totTarget.push(rt);
       }
     } else if (mt === 'player_prop') {
       // Only surface props that have a player name AND a numeric line.
@@ -8270,6 +8360,8 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     moneyline: moneyline,
     spreads:   spreads,
     totals:    totals,
+    alt_spreads: altSpreads,
+    alt_totals:  altTotals,
     // Player props — array of { propType, playerName, team, line, overOdds,
     // underOdds, marketKey, providerGameId }. Empty when the feed doesn't
     // provide props for this game.
