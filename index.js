@@ -3565,6 +3565,75 @@ console.log('OWLS_SPORT_CATALOG'
   +' enabledList='+JSON.stringify(OWLS_ENABLED_SPORTS));
 
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
+function _mapSportToOwls(key) { return _mapToOwlsSport(key); }
+
+// Cache: { "sport:name" -> canonical }
+const _teamNormCache = new Map();
+
+async function _owlsApiGetJson(path, queryParams) {
+  if (!OWLS_KEY) return null;
+  var qs = '';
+  if (queryParams && typeof queryParams === 'object') {
+    qs = '?' + Object.keys(queryParams).map(function(k) {
+      return encodeURIComponent(k) + '=' + encodeURIComponent(queryParams[k]);
+    }).join('&');
+  }
+  var url = OWLS_BASE_URL + path + qs;
+  return new Promise(function(resolve) {
+    var parsed;
+    try { parsed = new URL(url); } catch(_e) { return resolve(null); }
+    var chunks = [];
+    var req = https.request({
+      hostname: parsed.hostname, port: parsed.port || 443,
+      path: parsed.pathname + parsed.search, method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + OWLS_KEY,
+        Accept: 'application/json',
+        'User-Agent': 'PocketBooksSports/2.0'
+      }
+    }, function(res) {
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        if (res.statusCode !== 200) return resolve(null);
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch(_e) { resolve(null); }
+      });
+    });
+    req.on('error', function() { resolve(null); });
+    req.setTimeout(8000, function() { req.destroy(); resolve(null); });
+  });
+}
+
+async function _normalizeTeamName(name, sport) {
+  const key = sport + ':' + name;
+  if (_teamNormCache.has(key)) return _teamNormCache.get(key);
+  try {
+    const data = await _owlsApiGetJson('/api/v1/normalize', { name: name, sport: sport });
+    const canonical = (data && data.canonical) || name;
+    _teamNormCache.set(key, canonical);
+    setTimeout(function() { _teamNormCache.delete(key); }, 86400000);
+    return canonical;
+  } catch(e) {
+    return name;
+  }
+}
+
+async function _normalizeTeamNames(names, sport) {
+  const uncached = names.filter(function(n) { return !_teamNormCache.has(sport + ':' + n); });
+  if (uncached.length > 0) {
+    try {
+      const data = await _owlsApiGetJson('/api/v1/normalize/batch', {
+        names: uncached.join(','), sport: sport
+      });
+      (data && data.results || []).forEach(function(r) {
+        const cacheKey = sport + ':' + r.input;
+        _teamNormCache.set(cacheKey, r.canonical || r.input);
+        setTimeout(function() { _teamNormCache.delete(cacheKey); }, 86400000);
+      });
+    } catch(e) {}
+  }
+  return names.map(function(n) { return _teamNormCache.get(sport + ':' + n) || n; });
+}
 
 function _owlsMarketType(key) {
   var k = (key||'').toLowerCase();
@@ -5759,7 +5828,13 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   const marketForLookup = _coerceMarketType(market) || market;
   const pick   = String(leg.pick || '');
   const pickClean = _stripToWinSuffix(pick);
-  const pickForLookup = _normalizePickForSnapshotLookup(pickClean);
+  let pickForLookup = _normalizePickForSnapshotLookup(pickClean);
+  const owlsSportForNorm = _mapToOwlsSport(_oddsApiSportKey(leg.sport || leg.league || '')) || 'mlb';
+  const isTeamMarketLookup = marketForLookup === 'moneyline' || marketForLookup === 'spread' ||
+    marketForLookup === 'first_half_moneyline' || marketForLookup === 'first_half_spread';
+  if (isTeamMarketLookup && pickForLookup) {
+    pickForLookup = (await _normalizeTeamName(pickForLookup, owlsSportForNorm)).toLowerCase();
+  }
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
   const bypassOk = !IS_PRODUCTION;
@@ -6966,12 +7041,36 @@ function _sportPrefix(sportKey) {
 function _normalizeMarketKey(key) {
   return key === 'h2h' ? 'moneyline' : key === 'spreads' ? 'spread' : key === 'totals' ? 'total' : key;
 }
-function _buildCKeyFromGame(game) {
-  const sport    = _sportPrefix(game.sport_key);
-  const awayTeam = (game.away_team||'').toLowerCase().replace(/\s+/g,'-');
-  const homeTeam = (game.home_team||'').toLowerCase().replace(/\s+/g,'-');
-  const dateStr  = (game.commence_time||'').slice(0,10);
-  return sport+'|'+awayTeam+'|'+homeTeam+'|'+dateStr;
+function _slugTeamForCKey(name) {
+  return (name || '').toLowerCase().replace(/\s+/g, '-');
+}
+
+function _owlsSportForGame(game) {
+  return _mapToOwlsSport(_oddsApiSportKey(game.sport_key)) || String(game.sport_key || '').toLowerCase();
+}
+
+function _buildCKeyFromGameSync(game) {
+  const sport = _sportPrefix(game.sport_key);
+  const owlsSport = _owlsSportForGame(game);
+  const awayRaw = game.away_team || '';
+  const homeRaw = game.home_team || '';
+  const awayNorm = _teamNormCache.get(owlsSport + ':' + awayRaw) || awayRaw;
+  const homeNorm = _teamNormCache.get(owlsSport + ':' + homeRaw) || homeRaw;
+  const dateStr = (game.commence_time || '').slice(0, 10);
+  return sport + '|' + _slugTeamForCKey(awayNorm) + '|' + _slugTeamForCKey(homeNorm) + '|' + dateStr;
+}
+
+async function _buildCKeyFromGame(game) {
+  const sport = _sportPrefix(game.sport_key);
+  const owlsSport = _owlsSportForGame(game);
+  const awayRaw = game.away_team || '';
+  const homeRaw = game.home_team || '';
+  const [awayNorm, homeNorm] = await Promise.all([
+    awayRaw ? _normalizeTeamName(awayRaw, owlsSport) : '',
+    homeRaw ? _normalizeTeamName(homeRaw, owlsSport) : ''
+  ]);
+  const dateStr = (game.commence_time || '').slice(0, 10);
+  return sport + '|' + _slugTeamForCKey(awayNorm) + '|' + _slugTeamForCKey(homeNorm) + '|' + dateStr;
 }
 
 function _makeEmptyCache() {
@@ -7001,7 +7100,7 @@ function _deriveGameStatus(game) {
   return 'upcoming';
 }
 
-function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
+async function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
   const now = new Date().toISOString();
   // A completed fetch that returned [] is a successful poll (offseason / empty
   // slate). Callers must not pass error/failed fetches here — those should
@@ -7014,10 +7113,21 @@ function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
       sourceStatus:'empty', warnings:['empty_slate']
     };
   }
+  const teamNamesBySport = {};
+  gamesArr.forEach(function(game) {
+    const owlsSport = _owlsSportForGame(game);
+    if (!teamNamesBySport[owlsSport]) teamNamesBySport[owlsSport] = [];
+    const seen = teamNamesBySport[owlsSport];
+    if (game.away_team && seen.indexOf(game.away_team) < 0) seen.push(game.away_team);
+    if (game.home_team && seen.indexOf(game.home_team) < 0) seen.push(game.home_team);
+  });
+  await Promise.all(Object.keys(teamNamesBySport).map(function(sport) {
+    return _normalizeTeamNames(teamNamesBySport[sport], sport);
+  }));
   const byKey = {}, byId = {};
   let marketCount = 0;
   for (const game of gamesArr) {
-    const cKey   = _buildCKeyFromGame(game);
+    const cKey   = await _buildCKeyFromGame(game);
     const gameId = game.id;
     // Compute and stamp game.status so the Live tab can filter on it
     const gameStatus = _deriveGameStatus(game);
@@ -7150,7 +7260,7 @@ async function _runOddsApiPoll(trigger) {
       return false;
     }
     const fetchDurationMs = Date.now() - start;
-    const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+    const newCache = await _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
     LIVE_MARKET_CACHE = newCache;
     console.log('[live cache] updated trigger='+trigger+' games='+newCache.gameCount+
       ' markets='+newCache.marketCount+' sportsOk='+sportsOk+
@@ -7166,8 +7276,8 @@ async function _runOddsApiPoll(trigger) {
 }
 
 // Apply normalized Owls per-sport results to LIVE_MARKET_CACHE (shared by REST poll + WS).
-function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) {
-  const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+async function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) {
+  const newCache = await _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
 
   const overlayByCK = {};
   const overlayByPGI = {};
@@ -7279,7 +7389,7 @@ async function pollLiveOddsLoop() {
         }
       }));
       const fetchDurationMs = Date.now()-start;
-      const applied = _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
+      const applied = await _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
 
       if (applied.ok) {
         console.log('[owls] cache updated games='+applied.gameCount+' markets='+applied.marketCount+
@@ -7381,7 +7491,7 @@ async function _handleOwlsWsOddsUpdate(payload) {
   const start = Date.now();
   try {
     const parsed = _parseOwlsWsOddsPayload(payload);
-    const applied = _applyOwlsResultsToCache(parsed.owlsResults, parsed.allGames, Date.now()-start);
+    const applied = await _applyOwlsResultsToCache(parsed.owlsResults, parsed.allGames, Date.now()-start);
     if (applied.ok) {
       console.log('[owls-ws] odds-update games='+applied.gameCount+' markets='+applied.marketCount);
       try {
@@ -7818,7 +7928,10 @@ app.get('/api/scores/:sport', async (req, res) => {
       return res.status(status).json({ error: fetched.error, error_code: fetched.errorCode || null, source: fetched.source || null });
     }
     res.json(games.map(function(g) {
-      return espnScoreboard.toPublicScore(g, sport, fetched && fetched.source);
+      const pub = espnScoreboard.toPublicScore(g, sport, fetched && fetched.source);
+      if (g.homeLogoUrl) pub.homeLogoUrl = g.homeLogoUrl;
+      if (g.awayLogoUrl) pub.awayLogoUrl = g.awayLogoUrl;
+      return pub;
     }));
   } catch (e) {
     res.status(502).json({ error: e.message });
@@ -8126,9 +8239,9 @@ app.get('/api/odds/:sport', async (req, res) => {
     const games = await fetchOdds(sport);
     if (games === null) { return res.status(503).json({ error: 'ODDS_API_KEY not configured on server.' }); }
     if (games && games._error) { return res.status(402).json({ error: games._message, error_code: games._error }); }
-    const formatted = (Array.isArray(games) ? games : []).slice(0,20).map(g => {
+    const formatted = await Promise.all((Array.isArray(games) ? games : []).slice(0,20).map(async function(g) {
       const status = _deriveGameStatus(g);
-      const canonicalGameKey = _buildCKeyFromGame(g);
+      const canonicalGameKey = await _buildCKeyFromGame(g);
       const baseMeta = {
         canonicalGameKey,
         providerGameId: g.id || null,
@@ -8152,7 +8265,7 @@ app.get('/api/odds/:sport', async (req, res) => {
         // contract uniform.
         props: []
       };
-    });
+    }));
     formatted.sort(_compareGamesForBoard);
     res.json(formatted);
   } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
@@ -8484,7 +8597,7 @@ function _indexResultByLookupKeys(resultsByKey, row) {
     resultsByKey[k] = row;
   });
   if (row.away_team && row.home_team) {
-    const slug = _buildCKeyFromGame({
+    const slug = _buildCKeyFromGameSync({
       sport_key: row.sport || 'baseball_mlb',
       away_team: row.away_team,
       home_team: row.home_team,
@@ -8639,6 +8752,45 @@ function _pastScoreboardYmdsFromLegs(legs, maxLookbackDays) {
   return out;
 }
 
+async function _fetchOwlsScores(sport) {
+  try {
+    const owlsSport = _mapSportToOwls(_oddsApiSportKey(sport));
+    if (!owlsSport || !OWLS_KEY) return null;
+    const data = await _owlsApiGetJson('/api/v1/scores/' + owlsSport);
+    return (data && data.data && data.data.sports && data.data.sports[owlsSport]) || [];
+  } catch(e) {
+    return null;
+  }
+}
+
+function _owlsScoresToOddsScores(owlsGames, sportKey) {
+  return (owlsGames || []).map(function(g) {
+    const homeTeam = (g.home && g.home.team && (g.home.team.displayName || g.home.team.name)) || '';
+    const awayTeam = (g.away && g.away.team && (g.away.team.displayName || g.away.team.name)) || '';
+    const homeScore = g.home && g.home.score;
+    const awayScore = g.away && g.away.score;
+    const state = String((g.status && g.status.state) || '').toLowerCase();
+    const completed = state === 'post';
+    const status = completed ? 'final' : (state === 'in' ? 'live' : 'upcoming');
+    return {
+      id: String(g.id || ''),
+      sport_key: sportKey,
+      home_team: homeTeam,
+      away_team: awayTeam,
+      commence_time: g.date || g.commence_time || null,
+      completed: completed,
+      canceled: false,
+      status: status,
+      homeLogoUrl: (g.home && g.home.team && g.home.team.logoUrl) || null,
+      awayLogoUrl: (g.away && g.away.team && g.away.team.logoUrl) || null,
+      scores: [
+        { name: homeTeam, score: homeScore != null ? String(homeScore) : null },
+        { name: awayTeam, score: awayScore != null ? String(awayScore) : null }
+      ]
+    };
+  }).filter(function(g) { return g.id && g.home_team && g.away_team; });
+}
+
 async function _fetchEspnSportScores(sport, daysBack, extraYmds) {
   const sportKey = _oddsApiSportKey(sport);
   const path = _espnScoreboardPath(sportKey);
@@ -8717,20 +8869,31 @@ function _fetchOddsApiScores(sport, daysBack) {
 async function _fetchScoresForSport(sport, daysBack, extraYmds) {
   const sportKey = _oddsApiSportKey(sport);
   const odds = await _fetchOddsApiScores(sportKey, daysBack);
-  const espnGames = await _fetchEspnSportScores(sportKey, daysBack, extraYmds);
-  const converted = _espnGamesToOddsScores(espnGames, sportKey);
-  const merged = _mergeOddsAndEspnScores(odds || [], converted);
+  let supplemental = [];
+  let supplementalSource = 'espn';
+  const owlsRaw = await _fetchOwlsScores(sportKey);
+  if (owlsRaw && owlsRaw.length) {
+    supplemental = _owlsScoresToOddsScores(owlsRaw, sportKey);
+    supplementalSource = 'owls';
+    console.log('RESULT_OWLS_OK sport='+sportKey+' games='+supplemental.length);
+  } else {
+    const espnGames = await _fetchEspnSportScores(sportKey, daysBack, extraYmds);
+    supplemental = _espnGamesToOddsScores(espnGames, sportKey);
+    console.log('RESULT_OWLS_EMPTY sport='+sportKey+' espnFallback=true espnGames='+supplemental.length);
+  }
+  const merged = _mergeOddsAndEspnScores(odds || [], supplemental);
   const oddsFinals = (odds || []).filter(_gameIsFinalScore).length;
-  const espnFinals = converted.filter(_gameIsFinalScore).length;
+  const supFinals = supplemental.filter(_gameIsFinalScore).length;
   if (!merged.length) {
-    console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true espnEmpty=true');
+    console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true supplementalEmpty=true');
     return { games: [], source: null };
   }
-  const source = (odds && odds.length && converted.length) ? 'odds+espn'
-    : (converted.length ? 'espn' : 'odds-api');
+  const source = (odds && odds.length && supplemental.length)
+    ? ('odds+' + supplementalSource)
+    : (supplemental.length ? supplementalSource : 'odds-api');
   console.log('RESULT_SCORES source='+source+' sport='+sportKey+
     ' odds='+(odds||[]).length+' oddsFinal='+oddsFinals+
-    ' espn='+converted.length+' espnFinal='+espnFinals+
+    ' supplemental='+supplemental.length+' supFinal='+supFinals+
     ' merged='+merged.length);
   return { games: merged, source: source };
 }
