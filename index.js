@@ -7374,8 +7374,10 @@ async function pollLiveOddsLoop() {
     if (quotaBlocked && ODDS_PROVIDER !== 'owls_insight') {
       console.warn('[poll] Odds API quota blocked — trying Owls Insight fallback');
     }
-    // WebSocket provides real-time updates — skip REST fetch while connected.
-    if (OWLS_USE_WEBSOCKET && _owlsWsConnected) {
+    // WebSocket provides real-time updates — skip REST fetch while connected
+    // only when the cache already has games (fresh deploy / empty cache still
+    // needs a REST bootstrap).
+    if (OWLS_USE_WEBSOCKET && _owlsWsConnected && LIVE_MARKET_CACHE.gameCount > 0) {
       return;
     }
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
@@ -8241,11 +8243,17 @@ app.get('/api/odds/:sport', async (req, res) => {
     // If Owls cache has no games for this sport but Odds API is configured,
     // fall back to the Odds API so the lobby never shows "No games available"
     // when the Owls poller is stale or not covering this sport.
-    if (flat.length === 0 && ODDS_KEY) {
+    if (flat.length === 0 && ODDS_KEY && !_oddsApiQuotaBlocked()) {
       console.log('[odds] owls-cache empty for sport='+sportShort+' — falling back to odds-api');
       res.setHeader('X-Provider', 'odds_api_fallback');
       // fall through to legacy Odds API path below
     } else {
+      if (flat.length === 0 && _oddsApiQuotaBlocked()) {
+        console.warn('[odds] owls-cache empty and odds-api quota blocked for sport='+sportShort+
+          ' — returning empty slate');
+        res.setHeader('X-Provider', 'owls_insight');
+        res.setHeader('X-Source-Status', 'quota_blocked');
+      }
       return res.json(flat.slice(0, 50));
     }
   }
@@ -8977,9 +8985,12 @@ function _owlsScoresToOddsScores(owlsGames, sportKey) {
     const awayTeam = (g.away && g.away.team && (g.away.team.displayName || g.away.team.name)) || '';
     const homeScore = g.home && g.home.score;
     const awayScore = g.away && g.away.score;
-    const state = String((g.status && g.status.state) || '').toLowerCase();
-    const completed = state === 'post';
-    const status = completed ? 'final' : (state === 'in' ? 'live' : 'upcoming');
+    const state = String((g.status && g.status.state) || g.status || '').toLowerCase();
+    const statusName = String((g.status && g.status.name) || '').toUpperCase();
+    const completed = g.completed === true || state === 'post' || state === 'final' ||
+      state === 'completed' || state === 'closed' ||
+      statusName === 'STATUS_FINAL' || statusName === 'STATUS_FULL_TIME';
+    const status = completed ? 'final' : (state === 'in' || state === 'live' ? 'live' : 'upcoming');
     return {
       id: String(g.id || ''),
       sport_key: sportKey,
@@ -9077,18 +9088,24 @@ function _fetchOddsApiScores(sport, daysBack) {
 async function _fetchScoresForSport(sport, daysBack, extraYmds) {
   const sportKey = _oddsApiSportKey(sport);
   const odds = await _fetchOddsApiScores(sportKey, daysBack);
-  let supplemental = [];
-  let supplementalSource = 'espn';
   const owlsRaw = await _fetchOwlsScores(sportKey);
-  if (owlsRaw && owlsRaw.length) {
-    supplemental = _owlsScoresToOddsScores(owlsRaw, sportKey);
-    supplementalSource = 'owls';
-    console.log('RESULT_OWLS_OK sport='+sportKey+' games='+supplemental.length);
-  } else {
-    const espnGames = await _fetchEspnSportScores(sportKey, daysBack, extraYmds);
-    supplemental = _espnGamesToOddsScores(espnGames, sportKey);
-    console.log('RESULT_OWLS_EMPTY sport='+sportKey+' espnFallback=true espnGames='+supplemental.length);
+  const owlsScores = (owlsRaw && owlsRaw.length)
+    ? _owlsScoresToOddsScores(owlsRaw, sportKey) : [];
+  if (owlsScores.length) {
+    console.log('RESULT_OWLS_OK sport='+sportKey+' games='+owlsScores.length+
+      ' finals='+owlsScores.filter(_gameIsFinalScore).length);
   }
+  const espnGames = await _fetchEspnSportScores(sportKey, daysBack, extraYmds);
+  const espnScores = _espnGamesToOddsScores(espnGames, sportKey);
+  if (!owlsScores.length) {
+    console.log('RESULT_OWLS_EMPTY sport='+sportKey+' espnFallback=true espnGames='+espnScores.length);
+  } else if (espnScores.length) {
+    console.log('RESULT_ESPN_MERGE sport='+sportKey+' espnGames='+espnScores.length+
+      ' espnFinals='+espnScores.filter(_gameIsFinalScore).length);
+  }
+  // Always merge Owls + ESPN so Owls slate presence does not block ESPN finals
+  // (GRD-7b). Prefer whichever source has a completed scoreboard row.
+  const supplemental = _mergeOddsAndEspnScores(owlsScores, espnScores);
   const merged = _mergeOddsAndEspnScores(odds || [], supplemental);
   const oddsFinals = (odds || []).filter(_gameIsFinalScore).length;
   const supFinals = supplemental.filter(_gameIsFinalScore).length;
@@ -9096,6 +9113,9 @@ async function _fetchScoresForSport(sport, daysBack, extraYmds) {
     console.warn('RESULT_SCORES source=none sport='+sportKey+' oddsEmpty=true supplementalEmpty=true');
     return { games: [], source: null };
   }
+  let supplementalSource = 'espn';
+  if (owlsScores.length && espnScores.length) supplementalSource = 'owls+espn';
+  else if (owlsScores.length) supplementalSource = 'owls';
   const source = (odds && odds.length && supplemental.length)
     ? ('odds+' + supplementalSource)
     : (supplemental.length ? supplementalSource : 'odds-api');

@@ -194,7 +194,7 @@ test('in-process poller grades without ODDS_KEY / host auth', function() {
 test('ESPN scoreboard is the scores fallback when Odds API is empty', function() {
   assert(indexSource.includes('function _fetchEspnSportScores'), 'missing ESPN fetch');
   assert(indexSource.includes('function _fetchScoresForSport'), 'missing scores aggregator');
-  assert(indexSource.includes("converted.length ? 'espn' : 'odds-api'"), 'espn source not returned');
+  assert(indexSource.includes('RESULT_ESPN_MERGE'), 'must always fetch ESPN alongside Owls');
   assert(indexSource.includes('baseball/mlb'), 'MLB ESPN path missing');
   assert(indexSource.includes('RESULT_ESPN_PARSE_EMPTY'), 'must log root keys when ESPN parse is empty');
   assert(indexSource.includes("User-Agent': 'curl/8.7.1'"), 'ESPN fetch must use curl UA (custom UAs are 403)');
@@ -204,8 +204,10 @@ test('ESPN scoreboard is the scores fallback when Odds API is empty', function()
 
 test('GRD-7b: ESPN still merges when Odds API already has other finals', function() {
   assert(indexSource.includes('function _mergeOddsAndEspnScores'), 'missing merge helper');
-  assert(indexSource.includes('_mergeOddsAndEspnScores(odds || [], converted)'),
-    'fetchScoresForSport must merge Odds + ESPN');
+  assert(indexSource.includes('_mergeOddsAndEspnScores(owlsScores, espnScores)'),
+    'fetchScoresForSport must merge Owls + ESPN');
+  assert(indexSource.includes('_mergeOddsAndEspnScores(odds || [], supplemental)'),
+    'fetchScoresForSport must merge Odds + supplemental');
   assert(!/if \(oddsFinals\.length\) \{\s*console\.log\('RESULT_SCORES source=odds-api/.test(indexSource),
     'must not skip ESPN just because other Odds games are final');
   assert(indexSource.includes('_pastScoreboardYmdsFromLegs(allLegs, 14)'),
@@ -514,6 +516,23 @@ test('GRD-7b merge does not invent a result when ESPN has no final either', func
   const merged = _mergeOddsAndEspnScores([oddsLive], [espnUpcoming]);
   assertEq(merged.length, 1);
   assert(!_gameIsFinalScore(merged[0]), 'must stay unresolved without a final');
+});
+
+test('Owls non-final slate still picks up ESPN final for same game', function() {
+  const owlsLive = {
+    home_team: 'Texas Rangers', away_team: 'Athletics',
+    commence_time: '2026-09-02T00:05:00Z', completed: false,
+    scores: [{ name: 'Texas Rangers', score: '8' }, { name: 'Athletics', score: '5' }]
+  };
+  const espnFinal = {
+    home_team: 'Texas Rangers', away_team: 'Athletics',
+    commence_time: '2026-09-02T00:05:00Z', completed: true,
+    scores: [{ name: 'Texas Rangers', score: '8' }, { name: 'Athletics', score: '5' }]
+  };
+  const merged = _mergeOddsAndEspnScores([owlsLive], [espnFinal]);
+  assertEq(merged.length, 1);
+  assert(_gameIsFinalScore(merged[0]), 'ESPN final must win over Owls non-final');
+  assertEq(merged[0].scores[0].score, '8');
 });
 
 if (fail) {
