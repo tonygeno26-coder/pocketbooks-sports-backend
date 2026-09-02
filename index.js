@@ -3749,7 +3749,8 @@ function _owlsPropType(key) {
   if (k==='pitcher_earned_runs')                                     return 'Earned Runs';
   if (k==='pitcher_walks')                                           return 'Walks Allowed';
   if (k==='pitcher_hits_allowed')                                    return 'Hits Allowed';
-  if (k==='batter_hits' || k==='player_hits')                        return 'Hits';
+  if (k==='batter_hits' || k==='player_hits' || k==='player_to_record_a_hit'
+      || k==='to_record_a_hit' || k==='record_a_hit')                return 'Hits';
   if (k==='batter_total_bases')                                      return 'Total Bases';
   if (k==='batter_home_runs' || k==='player_home_runs')              return 'Home Runs';
   if (k==='batter_rbis' || k==='player_rbis')                        return 'RBIs';
@@ -8429,13 +8430,27 @@ app.get('/api/odds/:sport', async (req, res) => {
 });
 
 // ── GET /api/props/:sport ───────────────────────────────────────────────────
-// Aggregates player props from the Owls in-memory cache. 60s response cache.
+// Fetches player props from Owls /api/v1/{sport}/props. 60s response cache.
 const _PROPS_RESPONSE_CACHE = Object.create(null);
 const PROPS_CACHE_TTL_MS = 60 * 1000;
-const PROPS_SPORT_TYPES = {
-  mlb: ['Strikeouts', 'Hits', 'Total Bases', 'Home Runs', 'RBIs', 'Runs Scored', 'Walks', 'Stolen Bases'],
-  nba: ['Points', 'Rebounds', 'Assists', '3-Pointers Made', 'Pts + Reb + Ast', 'Steals', 'Blocks'],
-  nfl: ['Passing Yards', 'Rushing Yards', 'Receiving Yards', 'Receptions', 'Anytime TD', 'Passing TDs']
+const PROPS_SUPPORTED_SPORTS = ['mlb', 'nba', 'nfl', 'nhl', 'ncaab', 'ncaaf', 'wnba'];
+const _OWLS_PROP_BOOK_PRIORITY = ['pinnacle', 'fanduel', 'draftkings', 'caesars', 'betmgm'];
+const _OWLS_PROP_CATEGORY_LABELS = {
+  hits: 'Hits', runs: 'Runs Scored', rbis: 'RBIs', home_runs: 'Home Runs',
+  stolen_bases: 'Stolen Bases', total_bases: 'Total Bases',
+  strikeouts_pitcher: 'Strikeouts', strikeouts_batter: 'Strikeouts',
+  walks: 'Walks', earned_runs: 'Earned Runs', outs_recorded: 'Pitching Outs',
+  hits_allowed: 'Hits Allowed', hits_runs_rbis: 'Hits + Runs + RBIs',
+  points: 'Points', rebounds: 'Rebounds', assists: 'Assists',
+  threes_made: '3-Pointers Made', steals: 'Steals', blocks: 'Blocks',
+  pts_rebs: 'Pts + Reb', pts_asts: 'Pts + Ast', rebs_asts: 'Reb + Ast',
+  pts_rebs_asts: 'Pts + Reb + Ast',
+  passing_yards: 'Passing Yards', passing_tds: 'Passing TDs',
+  rushing_yards: 'Rushing Yards', rushing_tds: 'Rushing TDs',
+  receiving_yards: 'Receiving Yards', receptions: 'Receptions',
+  touchdowns: 'Anytime TD',
+  goals: 'Goals', hockey_assists: 'Assists', hockey_points: 'Points',
+  shots_on_goal: 'Shots on Goal'
 };
 
 function _americanToImpliedPct(odds) {
@@ -8445,9 +8460,114 @@ function _americanToImpliedPct(odds) {
   return Math.round((Math.abs(o) / (Math.abs(o) + 100)) * 100);
 }
 
+function _owlsPropCategoryLabel(category) {
+  var k = String(category || '').toLowerCase();
+  if (_OWLS_PROP_CATEGORY_LABELS[k]) return _OWLS_PROP_CATEGORY_LABELS[k];
+  var mapped = _owlsPropType(k);
+  if (mapped) return mapped;
+  return k.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+}
+
+function _owlsPropBookRank(bookKey) {
+  var idx = _OWLS_PROP_BOOK_PRIORITY.indexOf(String(bookKey || '').toLowerCase());
+  return idx >= 0 ? idx : _OWLS_PROP_BOOK_PRIORITY.length;
+}
+
+function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
+  if (!owlsData || owlsData.success === false) return [];
+  var games = Array.isArray(owlsData.data) ? owlsData.data : [];
+  var out = [];
+  var sportLabel = String(sportShort || '').toUpperCase();
+  for (var gi = 0; gi < games.length; gi++) {
+    var game = games[gi];
+    if (!game) continue;
+    var home = game.homeTeam || game.home_team || '';
+    var away = game.awayTeam || game.away_team || '';
+    var gameId = game.gameId || game.id || null;
+    var books = Array.isArray(game.books) ? game.books.slice() : [];
+    books.sort(function(a, b) {
+      return _owlsPropBookRank(a && a.key) - _owlsPropBookRank(b && b.key);
+    });
+    var bestByKey = Object.create(null);
+    for (var bi = 0; bi < books.length; bi++) {
+      var book = books[bi];
+      var bookKey = (book && book.key) || 'unknown';
+      var props = Array.isArray(book && book.props) ? book.props : [];
+      for (var pi = 0; pi < props.length; pi++) {
+        var prop = props[pi];
+        if (!prop || !prop.playerName) continue;
+        var line = prop.line;
+        if (typeof line !== 'number' || isNaN(line)) continue;
+        var propType = _owlsPropCategoryLabel(prop.category || prop.propType || prop.market);
+        var dedupeKey = String(prop.playerName).toLowerCase() + '|' + propType + '|' + line;
+        if (bestByKey[dedupeKey] && _owlsPropBookRank(bestByKey[dedupeKey].bookKey) <= _owlsPropBookRank(bookKey)) continue;
+        bestByKey[dedupeKey] = {
+          bookKey: bookKey,
+          propType: propType,
+          playerName: prop.playerName,
+          team: prop.team || prop.playerTeam || null,
+          line: line,
+          overOdds: (typeof prop.overPrice === 'number') ? prop.overPrice
+            : ((typeof prop.overOdds === 'number') ? prop.overOdds : null),
+          underOdds: (typeof prop.underPrice === 'number') ? prop.underPrice
+            : ((typeof prop.underOdds === 'number') ? prop.underOdds : null)
+        };
+      }
+    }
+    Object.keys(bestByKey).forEach(function(key) {
+      var p = bestByKey[key];
+      var base = {
+        gameId: gameId,
+        canonicalGameKey: game.canonicalGameKey || null,
+        home: home,
+        away: away,
+        scheduledStart: game.commenceTime || game.commence_time || game.startTime || null,
+        sport: sportLabel,
+        propType: p.propType,
+        playerName: p.playerName,
+        team: p.team,
+        line: p.line
+      };
+      if (typeof p.overOdds === 'number') {
+        out.push(Object.assign({}, base, {
+          side: 'over',
+          odds: p.overOdds,
+          pick: p.playerName + ' Over ' + p.line + ' ' + p.propType
+        }));
+      }
+      if (typeof p.underOdds === 'number') {
+        out.push(Object.assign({}, base, {
+          side: 'under',
+          odds: p.underOdds,
+          pick: p.playerName + ' Under ' + p.line + ' ' + p.propType
+        }));
+      }
+    });
+  }
+  out.sort(function(a, b) {
+    if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
+    if (a.playerName !== b.playerName) return (a.playerName || '').localeCompare(b.playerName || '');
+    return (a.side || '').localeCompare(b.side || '');
+  });
+  return out;
+}
+
+async function fetchPropsFromOwlsInsight(sportShort) {
+  if (!OWLS_KEY) return { ok: false, error: 'owls_insight_not_configured' };
+  var owlsSport = _mapToOwlsSport(sportShort);
+  if (!owlsSport) return { ok: false, error: 'unsupported_sport:' + sportShort };
+  var path = '/api/v1/' + owlsSport + '/props';
+  var data = await _owlsApiGetJson(path, { books: OWLS_BOOKS });
+  if (!data) {
+    console.warn('[owls-props] fetch failed sport=' + sportShort + ' url=' + path);
+    return { ok: false, error: 'owls_props_fetch_failed', url: OWLS_BASE_URL + path };
+  }
+  var props = _normalizeOwlsPropsApiResponse(data, sportShort);
+  console.log('[owls-props] fetch ok sport=' + sportShort + ' url=' + path + ' props=' + props.length);
+  return { ok: true, props: props, url: OWLS_BASE_URL + path };
+}
+
 function _collectPropsForSport(sportShort) {
-  var allowed = PROPS_SPORT_TYPES[sportShort];
-  if (!allowed) return [];
   var games = _owlsCacheFlatGamesForSport(sportShort, sportShort.toUpperCase());
   var out = [];
   for (var gi = 0; gi < games.length; gi++) {
@@ -8456,7 +8576,6 @@ function _collectPropsForSport(sportShort) {
     for (var pi = 0; pi < props.length; pi++) {
       var p = props[pi];
       if (!p || !p.playerName) continue;
-      if (allowed.indexOf(p.propType) < 0) continue;
       var base = {
         gameId: g.id,
         canonicalGameKey: g.canonicalGameKey || null,
@@ -8493,9 +8612,9 @@ function _collectPropsForSport(sportShort) {
   return out;
 }
 
-app.get('/api/props/:sport', function(req, res) {
+app.get('/api/props/:sport', async function(req, res) {
   var sport = String(req.params.sport || '').toLowerCase();
-  if (!PROPS_SPORT_TYPES[sport]) {
+  if (PROPS_SUPPORTED_SPORTS.indexOf(sport) < 0) {
     return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
   }
   var now = Date.now();
@@ -8505,17 +8624,32 @@ app.get('/api/props/:sport', function(req, res) {
     res.setHeader('X-Provider', 'owls_insight');
     return res.json(cached.data);
   }
-  var props = _collectPropsForSport(sport);
+  var props = [];
+  var source = 'owls_props_api';
+  if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
+    var fetched = await fetchPropsFromOwlsInsight(sport);
+    if (fetched.ok && fetched.props && fetched.props.length) {
+      props = fetched.props;
+    } else {
+      props = _collectPropsForSport(sport);
+      source = 'owls_cache_fallback';
+    }
+  } else {
+    props = _collectPropsForSport(sport);
+    source = 'owls_cache_fallback';
+  }
   var data = {
     ok: true,
     sport: sport,
     props: props,
     count: props.length,
+    source: source,
     updatedAt: new Date().toISOString()
   };
   _PROPS_RESPONSE_CACHE[sport] = { at: now, data: data };
   res.setHeader('X-Cache', 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
+  res.setHeader('X-Props-Source', source);
   res.json(data);
 });
 
