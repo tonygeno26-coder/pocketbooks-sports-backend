@@ -3580,6 +3580,32 @@ console.log('OWLS_SPORT_CATALOG'
   +' provider=owls'
   +' enabledList='+JSON.stringify(OWLS_ENABLED_SPORTS));
 
+// Sports the live-odds poller fetches — defined early so boot-time REST
+// bootstrap (_triggerImmediateOddsRefresh) can read CACHE_SPORTS safely.
+const _CACHE_SPORTS_BASE = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
+const _CACHE_SPORT_KEY_BY_SHORT = {
+  mlb:'baseball_mlb', nba:'basketball_nba', wnba:'basketball_wnba',
+  nfl:'americanfootball_nfl', nhl:'icehockey_nhl',
+  ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf', ncaabaseball:'baseball_ncaa',
+  mma:'mma_mixed_martial_arts', boxing:'boxing_boxing',
+  nascar:'nascar', f1:'formula1',
+  soccer:'soccer',
+  soccer_epl:'soccer_epl', soccer_ucl:'soccer_uefa_champs_league',
+  soccer_mls:'soccer_usa_mls', soccer_worldcup:'soccer_fifa_world_cup',
+  soccer_euros:'soccer_uefa_european_championship',
+  soccer_laliga:'soccer_spain_la_liga', soccer_seriea:'soccer_italy_serie_a',
+  soccer_bundesliga:'soccer_germany_bundesliga', soccer_ligue1:'soccer_france_ligue_one',
+  cricket:'cricket', cricket_ipl:'cricket_ipl', cricket_t20:'cricket_international_t20',
+  rugby:'rugbyunion_six_nations', rugby_league:'rugbyleague', afl:'aussierules_afl',
+  tennis:'tennis', tennis_atp:'tennis_atp', tennis_wta:'tennis_wta',
+  golf_pga:'golf_pga_championship', golf_liv:'golf_liv', golf_european:'golf_european_tour',
+  table_tennis:'table_tennis',
+  cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
+};
+const CACHE_SPORTS = (ODDS_PROVIDER === 'owls_insight')
+  ? OWLS_SAFE_SPORTS.map(function(s){ return _CACHE_SPORT_KEY_BY_SHORT[s] || s; })
+  : _CACHE_SPORTS_BASE;
+
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 function _mapSportToOwls(key) { return _mapToOwlsSport(key); }
 
@@ -4068,25 +4094,41 @@ async function fetchOddsFromOwlsInsight(sportKey) {
   if (!owlsSport) return { ok:false, error:'unsupported_sport:'+sportKey };
   var url = OWLS_BASE_URL+'/api/v1/'+owlsSport+'/odds?books='+OWLS_BOOKS+'&alternates='+OWLS_ALTERNATES;
   return new Promise(function(resolve){
-    var parsed; try { parsed = new URL(url); } catch(_){return resolve({ok:false,error:'invalid_url'});}
+    var parsed; try { parsed = new URL(url); } catch(_){
+      console.warn('[owls-rest] fetch invalid url sport='+sportKey+' url='+parsedPathForLog(url));
+      return resolve({ok:false,error:'invalid_url'});
+    }
+    var reqPath = parsed.pathname+parsed.search;
     var driver = parsed.protocol==='https:' ? https : require('http');
     var chunks = [];
     var req = driver.request({
       hostname:parsed.hostname, port:parsed.port||(parsed.protocol==='https:'?443:80),
-      path:parsed.pathname+parsed.search, method:'GET',
+      path:reqPath, method:'GET',
       headers:{ 'Authorization':'Bearer '+OWLS_KEY, 'Accept':'application/json' }
     }, function(res){
       res.on('data',function(c){chunks.push(c);});
       res.on('end',function(){
         var body = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode===401||res.statusCode===403)
-          return resolve({ok:false,error:'owls_insight_unauthorized',status:res.statusCode});
-        if (res.statusCode===429)
-          return resolve({ok:false,error:'provider_rate_limited',status:429});
-        if (res.statusCode>=500)
-          return resolve({ok:false,error:'owls_insight_server_error',status:res.statusCode});
-        if (res.statusCode!==200)
-          return resolve({ok:false,error:'owls_insight_http_error',status:res.statusCode});
+        var bodyPreview = body.slice(0, 160).replace(/\s+/g, ' ');
+        if (res.statusCode===401||res.statusCode===403) {
+          console.warn('[owls-rest] fetch unauthorized sport='+sportKey+' status='+res.statusCode+
+            ' url='+reqPath+' body='+bodyPreview);
+          return resolve({ok:false,error:'owls_insight_unauthorized',status:res.statusCode,url:reqPath});
+        }
+        if (res.statusCode===429) {
+          console.warn('[owls-rest] fetch rate-limited sport='+sportKey+' status=429 url='+reqPath);
+          return resolve({ok:false,error:'provider_rate_limited',status:429,url:reqPath});
+        }
+        if (res.statusCode>=500) {
+          console.warn('[owls-rest] fetch server error sport='+sportKey+' status='+res.statusCode+
+            ' url='+reqPath+' body='+bodyPreview);
+          return resolve({ok:false,error:'owls_insight_server_error',status:res.statusCode,url:reqPath});
+        }
+        if (res.statusCode!==200) {
+          console.warn('[owls-rest] fetch http error sport='+sportKey+' status='+res.statusCode+
+            ' url='+reqPath+' body='+bodyPreview);
+          return resolve({ok:false,error:'owls_insight_http_error',status:res.statusCode,url:reqPath});
+        }
         try {
           var data = JSON.parse(body);
           // ─ Safe debug: log first event shape (no API key logged) ─
@@ -4115,14 +4157,42 @@ async function fetchOddsFromOwlsInsight(sportKey) {
               console.log('[owls][debug] sport='+sportKey+' NO EVENTS in response. topKeys='+JSON.stringify(Object.keys(data||{})));
             }
           } catch(_de) { console.warn('[owls][debug] log error:',_de.message); }
-          resolve(_normalizeOwlsResponse(data, sportKey) || {ok:false,error:'normalize_failed'});
-        } catch(_e) { resolve({ok:false,error:'json_parse_error',detail:_e.message}); }
+          var normalized = _normalizeOwlsResponse(data, sportKey) || {ok:false,error:'normalize_failed',url:reqPath};
+          if (normalized.ok) {
+            var gameCount = Array.isArray(normalized.games) ? normalized.games.length : 0;
+            console.log('[owls-rest] fetch ok sport='+sportKey+' status=200 url='+reqPath+' games='+gameCount);
+          } else {
+            console.warn('[owls-rest] fetch normalize failed sport='+sportKey+' status=200 url='+reqPath+
+              ' error='+(normalized.error||'unknown')+' body='+bodyPreview);
+          }
+          resolve(normalized);
+        } catch(_e) {
+          console.warn('[owls-rest] fetch json parse error sport='+sportKey+' url='+reqPath+
+            ' detail='+_e.message+' body='+bodyPreview);
+          resolve({ok:false,error:'json_parse_error',detail:_e.message,url:reqPath});
+        }
       });
     });
-    req.setTimeout(10000,function(){req.destroy();resolve({ok:false,error:'timeout'});});
-    req.on('error',function(e){resolve({ok:false,error:e.message});});
+    req.setTimeout(10000,function(){
+      console.warn('[owls-rest] fetch timeout sport='+sportKey+' url='+reqPath);
+      req.destroy();
+      resolve({ok:false,error:'timeout',url:reqPath});
+    });
+    req.on('error',function(e){
+      console.warn('[owls-rest] fetch network error sport='+sportKey+' url='+reqPath+' detail='+e.message);
+      resolve({ok:false,error:e.message,url:reqPath});
+    });
     req.end();
   });
+}
+
+function parsedPathForLog(url) {
+  try {
+    var u = new URL(url);
+    return u.pathname + u.search;
+  } catch(_e) {
+    return String(url || '').replace(/\/\/[^/]+/, '//***');
+  }
 }
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -6415,9 +6485,12 @@ if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
   if (OWLS_USE_WEBSOCKET) {
     setTimeout(function(){ _initOwlsWebSocket(); }, 0);
   }
-  // Immediate REST bootstrap — do not wait for poller timer or WS push.
-  _triggerImmediateOddsRefresh('boot_immediate').catch(function(e) {
-    console.error('[poll] boot immediate refresh error:', e && e.message);
+  // Immediate REST bootstrap — defer until module init finishes (CACHE_SPORTS,
+  // LIVE_MARKET_CACHE, etc.) so the poll path cannot hit TDZ errors.
+  setImmediate(function() {
+    _triggerImmediateOddsRefresh('boot_immediate').catch(function(e) {
+      console.error('[poll] boot immediate refresh error:', e && e.message);
+    });
   });
 } else {
   console.error('[poll] startup keyPresent=false keyMasked=MISSING provider='+ODDS_PROVIDER+
@@ -7016,41 +7089,6 @@ requirePermission = function(action, getTargetPlayerId) {
 
 // ODDS_TOLERANCE_PTS removed — RISK-9: exact-match odds required; no tolerance window allowed.
 const CACHE_STALE_THRESHOLD = 5 * 60 * 1000; // 5min stale threshold
-// Sports the live-odds poller actually fetches. Owls polls use these keys;
-// the Odds API legacy path also accepts them. When ODDS_PROVIDER=owls_insight,
-// we expand to every sport listed in OWLS_SAFE_SPORTS (mapped to the canonical
-// Odds-API-style key for downstream consistency).
-const _CACHE_SPORTS_BASE = ['baseball_mlb','basketball_nba','americanfootball_nfl','icehockey_nhl'];
-const _CACHE_SPORT_KEY_BY_SHORT = {
-  // US major
-  mlb:'baseball_mlb', nba:'basketball_nba', wnba:'basketball_wnba',
-  nfl:'americanfootball_nfl', nhl:'icehockey_nhl',
-  // US college
-  ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf', ncaabaseball:'baseball_ncaa',
-  // Combat
-  mma:'mma_mixed_martial_arts', boxing:'boxing_boxing',
-  // Motorsports
-  nascar:'nascar', f1:'formula1',
-  // Soccer competitions — all share the unified-odds 'soccer' provider path
-  soccer:'soccer',
-  soccer_epl:'soccer_epl', soccer_ucl:'soccer_uefa_champs_league',
-  soccer_mls:'soccer_usa_mls', soccer_worldcup:'soccer_fifa_world_cup',
-  soccer_euros:'soccer_uefa_european_championship',
-  soccer_laliga:'soccer_spain_la_liga', soccer_seriea:'soccer_italy_serie_a',
-  soccer_bundesliga:'soccer_germany_bundesliga', soccer_ligue1:'soccer_france_ligue_one',
-  // Other international team
-  cricket:'cricket', cricket_ipl:'cricket_ipl', cricket_t20:'cricket_international_t20',
-  rugby:'rugbyunion_six_nations', rugby_league:'rugbyleague', afl:'aussierules_afl',
-  // Individual
-  tennis:'tennis', tennis_atp:'tennis_atp', tennis_wta:'tennis_wta',
-  golf_pga:'golf_pga_championship', golf_liv:'golf_liv', golf_european:'golf_european_tour',
-  table_tennis:'table_tennis',
-  // Esports
-  cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
-};
-const CACHE_SPORTS = (ODDS_PROVIDER === 'owls_insight')
-  ? OWLS_SAFE_SPORTS.map(function(s){ return _CACHE_SPORT_KEY_BY_SHORT[s] || s; })
-  : _CACHE_SPORTS_BASE;
 
 function _sportPrefix(sportKey) {
   const k = (sportKey||'').toLowerCase();
@@ -7310,21 +7348,35 @@ async function _runOwlsRestPoll(trigger) {
   const start = Date.now();
   const allGames = [];
   const owlsResults = [];
+  const sportErrors = [];
   try {
+    console.log('[owls-rest] poll start trigger='+trigger+' sports='+CACHE_SPORTS.length+
+      ' list='+JSON.stringify(CACHE_SPORTS));
     await Promise.all(CACHE_SPORTS.map(async function(sport) {
       const result = await fetchOddsFromOwlsInsight(sport);
       if (result && result.ok && Array.isArray(result.games)) {
         owlsResults.push(result);
         result.games.forEach(function(g){ allGames.push(g); });
+      } else if (result && result.ok) {
+        sportErrors.push(sport+':games_not_array');
+        console.warn('[owls-rest] skip sport='+sport+' trigger='+trigger+
+          ' reason=games_not_array type='+typeof (result && result.games));
       } else if (result && !result.ok) {
+        sportErrors.push(sport+':'+(result.error||'unknown'));
         console.warn('[owls-rest] fetch error sport='+sport+': '+(result.error||'unknown')+
-          ' trigger='+trigger);
+          ' status='+(result.status||'?')+' url='+(result.url||'?')+' trigger='+trigger);
         _recordLiveDiagnosticEvent('provider_unhealthy', {
           phase:'provider_poll', sport, reason:result.error||'owls_fetch_error', trigger
         });
+      } else {
+        sportErrors.push(sport+':null_result');
+        console.warn('[owls-rest] skip sport='+sport+' trigger='+trigger+' reason=null_result');
       }
     }));
     const fetchDurationMs = Date.now()-start;
+    console.log('[owls-rest] poll collected trigger='+trigger+' sportsOk='+owlsResults.length+
+      ' games='+allGames.length+' errors='+sportErrors.length+
+      (sportErrors.length ? ' detail='+JSON.stringify(sportErrors) : ''));
     const applied = await _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
     if (applied.ok) {
       console.log('[owls-rest] cache updated trigger='+trigger+' games='+applied.gameCount+
@@ -7383,6 +7435,13 @@ async function _triggerImmediateOddsRefresh(trigger) {
 
 // Apply normalized Owls per-sport results to LIVE_MARKET_CACHE (shared by REST poll + WS).
 async function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) {
+  if ((!allGames || !allGames.length) && owlsResults && owlsResults.length) {
+    for (const r of owlsResults) {
+      if (r && Array.isArray(r.games)) {
+        r.games.forEach(function(g){ allGames.push(g); });
+      }
+    }
+  }
   const newCache = await _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
 
   const overlayByCK = {};
