@@ -8557,14 +8557,59 @@ async function fetchPropsFromOwlsInsight(sportShort) {
   var owlsSport = _mapToOwlsSport(sportShort);
   if (!owlsSport) return { ok: false, error: 'unsupported_sport:' + sportShort };
   var path = '/api/v1/' + owlsSport + '/props';
-  var data = await _owlsApiGetJson(path, { books: OWLS_BOOKS });
-  if (!data) {
-    console.warn('[owls-props] fetch failed sport=' + sportShort + ' url=' + path);
-    return { ok: false, error: 'owls_props_fetch_failed', url: OWLS_BASE_URL + path };
-  }
-  var props = _normalizeOwlsPropsApiResponse(data, sportShort);
-  console.log('[owls-props] fetch ok sport=' + sportShort + ' url=' + path + ' props=' + props.length);
-  return { ok: true, props: props, url: OWLS_BASE_URL + path };
+  var url = OWLS_BASE_URL + path + '?books=' + encodeURIComponent(OWLS_BOOKS);
+  return new Promise(function(resolve) {
+    var parsed;
+    try { parsed = new URL(url); } catch (_e) {
+      return resolve({ ok: false, error: 'invalid_url', url: url });
+    }
+    var reqPath = parsed.pathname + parsed.search;
+    var driver = parsed.protocol === 'https:' ? https : require('http');
+    var chunks = [];
+    var req = driver.request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: reqPath,
+      method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + OWLS_KEY,
+        Accept: 'application/json',
+        'User-Agent': 'PocketBooksSports/2.0'
+      }
+    }, function(res) {
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString('utf8');
+        var bodyPreview = body.slice(0, 160).replace(/\s+/g, ' ');
+        if (res.statusCode !== 200) {
+          console.warn('[owls-props] fetch http error sport=' + sportShort + ' status=' + res.statusCode +
+            ' url=' + reqPath + ' body=' + bodyPreview);
+          return resolve({ ok: false, error: 'owls_props_http_error', status: res.statusCode, url: url });
+        }
+        try {
+          var data = JSON.parse(body);
+          var props = _normalizeOwlsPropsApiResponse(data, sportShort);
+          console.log('[owls-props] fetch ok sport=' + sportShort + ' url=' + reqPath +
+            ' games=' + (Array.isArray(data.data) ? data.data.length : 0) + ' props=' + props.length);
+          resolve({ ok: true, props: props, url: url });
+        } catch (_e) {
+          console.warn('[owls-props] fetch json parse error sport=' + sportShort + ' url=' + reqPath +
+            ' detail=' + _e.message + ' body=' + bodyPreview);
+          resolve({ ok: false, error: 'owls_props_json_error', url: url });
+        }
+      });
+    });
+    req.on('error', function(e) {
+      console.warn('[owls-props] fetch network error sport=' + sportShort + ' url=' + reqPath + ' detail=' + e.message);
+      resolve({ ok: false, error: 'owls_props_network_error', url: url });
+    });
+    req.setTimeout(15000, function() {
+      req.destroy();
+      console.warn('[owls-props] fetch timeout sport=' + sportShort + ' url=' + reqPath);
+      resolve({ ok: false, error: 'owls_props_timeout', url: url });
+    });
+    req.end();
+  });
 }
 
 function _collectPropsForSport(sportShort) {
