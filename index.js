@@ -5,6 +5,7 @@ const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const espnScoreboard = require('./lib/espn-scoreboard');
 const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
+const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
 // PHASE Q: PRODUCTION OPS HARDENING
@@ -3460,6 +3461,11 @@ console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
   ' hasOwlsBase='+(!!process.env.OWLS_INSIGHT_BASE_URL));
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
 const OWLS_ALTERNATES    = process.env.OWLS_INSIGHT_ALTERNATES === 'true';
+// WebSocket real-time feed (opt-in — default false so production keeps REST polling).
+const OWLS_USE_WEBSOCKET     = process.env.OWLS_USE_WEBSOCKET === 'true';
+const OWLS_WS_FALLBACK_POLL_MS = 30 * 1000;
+const OWLS_WS_RECONNECT_MS     = 5 * 1000;
+const OWLS_WS_CONNECTED_POLL_MS = 5 * 60 * 1000; // slow heartbeat while WS is live
 
 // Owls Insight v1 unified-odds supported sport keys. The unified
 // /api/v1/{sport}/odds endpoint covers a broader catalog than we previously
@@ -6235,6 +6241,13 @@ const CACHE_POLL_INTERVAL = LIVE_CACHE_POLL_INTERVAL_MS; // backwards-compat ali
 const POLL_WATCHDOG_STALE_MS = 30 * 1000;
 const POLL_WATCHDOG_CHECK_MS = 10 * 1000;
 
+function _getOddsPollIntervalMs() {
+  if (OWLS_USE_WEBSOCKET && ODDS_PROVIDER === 'owls_insight') {
+    return _owlsWsConnected ? OWLS_WS_CONNECTED_POLL_MS : OWLS_WS_FALLBACK_POLL_MS;
+  }
+  return LIVE_CACHE_POLL_INTERVAL_MS;
+}
+
 let _oddsPollTimer = null;
 let _oddsWatchdogTimer = null;
 let _oddsPollGeneration = 0;
@@ -6263,7 +6276,7 @@ async function _runOddsPollTick() {
     console.error('[poll] uncaught tick error:', tickErr && tickErr.message);
   } finally {
     if (generation === _oddsPollGeneration) {
-      _scheduleOddsPollTick(LIVE_CACHE_POLL_INTERVAL_MS);
+      _scheduleOddsPollTick(_getOddsPollIntervalMs());
     }
   }
 }
@@ -6305,6 +6318,9 @@ function _startOddsPollerWatchdog() {
 if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
   _startOddsPoller('boot');
   _startOddsPollerWatchdog();
+  if (OWLS_USE_WEBSOCKET) {
+    setTimeout(function(){ _initOwlsWebSocket(); }, 0);
+  }
 } else {
   console.error('[poll] startup keyPresent=false keyMasked=MISSING provider='+ODDS_PROVIDER+
     ' pollerScheduled=false reason=no_api_key');
@@ -7047,6 +7063,10 @@ function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
 
 // Single shared cache instance — replaced atomically
 let LIVE_MARKET_CACHE = _makeEmptyCache();
+// Owls WebSocket connection state (only used when OWLS_USE_WEBSOCKET=true).
+let _owlsWsSocket = null;
+let _owlsWsConnected = false;
+let _owlsWsReconnectTimer = null;
 // Rate-limit for Odds API fallback when Owls is unavailable: max 1 poll/min
 let _oddsApiFallbackLastRun = 0;
 const _ODDS_API_FALLBACK_INTERVAL_MS = 60 * 1000;
@@ -7145,6 +7165,64 @@ async function _runOddsApiPoll(trigger) {
   return false;
 }
 
+// Apply normalized Owls per-sport results to LIVE_MARKET_CACHE (shared by REST poll + WS).
+function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) {
+  const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+
+  const overlayByCK = {};
+  const overlayByPGI = {};
+  let overlayMarketCount = 0;
+  for (const r of owlsResults) {
+    const byCK = r.marketsByCanonicalKey || {};
+    const byPGI = r.marketsByProviderGameId || {};
+    for (const ck of Object.keys(byCK)) {
+      const list = byCK[ck] || [];
+      if (!overlayByCK[ck]) overlayByCK[ck] = [];
+      for (const e of list) overlayByCK[ck].push(e);
+      overlayMarketCount += list.length;
+    }
+    for (const pgi of Object.keys(byPGI)) {
+      const list = byPGI[pgi] || [];
+      if (!overlayByPGI[pgi]) overlayByPGI[pgi] = [];
+      for (const e of list) overlayByPGI[pgi].push(e);
+    }
+  }
+
+  const gameById = {};
+  let cKeyFallbackHits = 0;
+  for (const g of allGames) if (g && g.id) gameById[g.id] = g;
+  for (const ck of Object.keys(overlayByCK)) {
+    for (const e of overlayByCK[ck]) {
+      if (!e.cKey) e.cKey = ck;
+      const g = e.providerGameId ? gameById[e.providerGameId] : null;
+      if (g) {
+        if (!e.commenceTime) e.commenceTime = g.commence_time || null;
+        if (!e.sport)        e.sport        = g.sport_key     || null;
+        if (!e.gameId)       e.gameId       = g.id            || null;
+      } else if (e.providerGameId) {
+        cKeyFallbackHits++;
+      }
+    }
+  }
+  if (cKeyFallbackHits > 0) {
+    console.log('OWLS_ENRICH_CKEY_FALLBACK count='+cKeyFallbackHits+
+      ' reason=providerGameId_not_in_gameById (cKey still set from map key)');
+  }
+
+  newCache.marketsByCanonicalKey   = overlayByCK;
+  newCache.marketsByProviderGameId = overlayByPGI;
+  newCache.marketCount             = overlayMarketCount;
+
+  console.log(`OWLS_CACHE_SNAPSHOTS_READY games=${newCache.gameCount} markets=${overlayMarketCount}`);
+
+  if (owlsResults.length > 0) {
+    LIVE_MARKET_CACHE = newCache;
+    return { ok:true, gameCount:newCache.gameCount, marketCount:overlayMarketCount,
+      sourceStatus:newCache.sourceStatus };
+  }
+  return { ok:false };
+}
+
 // Poll live odds and atomically replace cache
 async function pollLiveOddsLoop() {
   const cacheAgeMs = _getLiveCacheAgeMs();
@@ -7169,6 +7247,10 @@ async function pollLiveOddsLoop() {
   if (ODDS_PROVIDER === 'owls_insight' || (quotaBlocked && OWLS_KEY)) {
     if (quotaBlocked && ODDS_PROVIDER !== 'owls_insight') {
       console.warn('[poll] Odds API quota blocked — trying Owls Insight fallback');
+    }
+    // WebSocket provides real-time updates — skip REST fetch while connected.
+    if (OWLS_USE_WEBSOCKET && _owlsWsConnected) {
+      return;
     }
     if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
     const start = Date.now();
@@ -7197,79 +7279,11 @@ async function pollLiveOddsLoop() {
         }
       }));
       const fetchDurationMs = Date.now()-start;
-      const newCache = _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
+      const applied = _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
 
-      // ── Owls overlay: replace the empty bookmaker-derived market maps
-      //    with the normalizer's flat per-outcome maps. _upsertOddsSnapshots
-      //    detects this shape via the lack of `outcomes[]` on each entry.
-      const overlayByCK = {};
-      const overlayByPGI = {};
-      let overlayMarketCount = 0;
-      for (const r of owlsResults) {
-        const byCK = r.marketsByCanonicalKey || {};
-        const byPGI = r.marketsByProviderGameId || {};
-        for (const ck of Object.keys(byCK)) {
-          const list = byCK[ck] || [];
-          if (!overlayByCK[ck]) overlayByCK[ck] = [];
-          for (const e of list) overlayByCK[ck].push(e);
-          overlayMarketCount += list.length;
-        }
-        for (const pgi of Object.keys(byPGI)) {
-          const list = byPGI[pgi] || [];
-          if (!overlayByPGI[pgi]) overlayByPGI[pgi] = [];
-          for (const e of list) overlayByPGI[pgi].push(e);
-        }
-      }
-
-      // Enrich each Owls entry with the game-level fields _upsertOddsSnapshots
-      // wants but the normalizer didn't stamp (commenceTime, sport_key). We
-      // index games-by-id so the per-outcome enrichment is O(N) overall.
-      //
-      // CRITICAL: e.cKey is always set from the overlay map key, even when
-      // the game lookup misses. Previously this was gated on `if (g)`, which
-      // meant any provider_game_id ↔ normalizer-id mismatch caused
-      // _buildSnapshotRow() to return null on every outcome (cKey gate at
-      // line ~3640) — silently producing zero rows. The map key `ck` IS the
-      // canonical key by definition; using it as a fallback is safe.
-      const gameById = {};
-      let cKeyFallbackHits = 0;
-      for (const g of allGames) if (g && g.id) gameById[g.id] = g;
-      for (const ck of Object.keys(overlayByCK)) {
-        for (const e of overlayByCK[ck]) {
-          // Always-on: canonical key from the map key. Source of truth.
-          if (!e.cKey) e.cKey = ck;
-          const g = e.providerGameId ? gameById[e.providerGameId] : null;
-          if (g) {
-            if (!e.commenceTime) e.commenceTime = g.commence_time || null;
-            if (!e.sport)        e.sport        = g.sport_key     || null;
-            if (!e.gameId)       e.gameId       = g.id            || null;
-          } else if (e.providerGameId) {
-            cKeyFallbackHits++;
-          }
-        }
-      }
-      if (cKeyFallbackHits > 0) {
-        console.log('OWLS_ENRICH_CKEY_FALLBACK count='+cKeyFallbackHits+
-          ' reason=providerGameId_not_in_gameById (cKey still set from map key)');
-      }
-
-      // Overlay the maps onto the new cache. We keep newCache.games (the
-      // raw normalized game list — used by the projection layer and the
-      // Live tab) but the marketsByCanonicalKey + marketsByProviderGameId
-      // come from the normalizer.
-      newCache.marketsByCanonicalKey   = overlayByCK;
-      newCache.marketsByProviderGameId = overlayByPGI;
-      newCache.marketCount             = overlayMarketCount;
-
-      // eslint-disable-next-line no-console
-      console.log(`OWLS_CACHE_SNAPSHOTS_READY games=${newCache.gameCount} markets=${overlayMarketCount}`);
-
-      // Successful sport fetches (including empty slates) update lastSuccessAt.
-      // Only skip the replace when every sport failed — that is not an empty slate.
-      if (owlsResults.length > 0) {
-        LIVE_MARKET_CACHE = newCache;
-        console.log('[owls] cache updated games='+newCache.gameCount+' markets='+overlayMarketCount+
-          ' sportsOk='+owlsResults.length+' sourceStatus='+newCache.sourceStatus+
+      if (applied.ok) {
+        console.log('[owls] cache updated games='+applied.gameCount+' markets='+applied.marketCount+
+          ' sportsOk='+owlsResults.length+' sourceStatus='+applied.sourceStatus+
           ' fetch='+fetchDurationMs+'ms');
         return;
       }
@@ -7304,6 +7318,150 @@ async function pollLiveOddsLoop() {
   }
   // Default provider: The Odds API
   await _runOddsApiPoll('primary');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// OWLS INSIGHT WEBSOCKET (real-time odds-update feed)
+// ════════════════════════════════════════════════════════════════════════════
+
+// Map Owls short sport key → canonical cache sport key for normalization.
+function _owlsWsSportKey(sport) {
+  if (!sport) return 'unknown';
+  const s = String(sport).toLowerCase();
+  return _CACHE_SPORT_KEY_BY_SHORT[s] || s;
+}
+
+// Parse odds-update WebSocket payload into normalized per-sport results.
+// WS payloads may mirror the REST /odds response ({ data, success, meta })
+// or wrap multiple sports ({ sports: { mlb: {...}, nba: {...} } }).
+function _parseOwlsWsOddsPayload(payload) {
+  const owlsResults = [];
+  const allGames = [];
+  if (!payload) return { owlsResults, allGames };
+
+  function _ingest(sportRaw, owlsData) {
+    if (!owlsData) return;
+    const sportKey = _owlsWsSportKey(sportRaw);
+    const wrapped = (owlsData.data || owlsData.events || Array.isArray(owlsData))
+      ? owlsData : { data: owlsData };
+    const normalized = _normalizeOwlsResponse(wrapped, sportKey);
+    if (normalized && normalized.ok) {
+      owlsResults.push(normalized);
+      normalized.games.forEach(function(g){ allGames.push(g); });
+    }
+  }
+
+  if (payload.sports && typeof payload.sports === 'object' && !Array.isArray(payload.sports)) {
+    Object.keys(payload.sports).forEach(function(sport){ _ingest(sport, payload.sports[sport]); });
+    return { owlsResults, allGames };
+  }
+
+  if (payload.sport && (payload.data || payload.events || payload.success !== undefined)) {
+    _ingest(payload.sport, payload);
+    return { owlsResults, allGames };
+  }
+
+  const sportGuess = payload.sport_key || payload.sport ||
+    (payload.meta && payload.meta.sport) || 'unknown';
+  _ingest(sportGuess, payload);
+  return { owlsResults, allGames };
+}
+
+function _setOwlsWsProviderHealthy() {
+  LIVE_MARKET_CACHE = Object.assign({}, LIVE_MARKET_CACHE, { sourceStatus:'healthy' });
+}
+
+function _rescheduleOddsPollForWsState() {
+  if (typeof _scheduleOddsPollTick === 'function' && _oddsPollerStarted) {
+    _scheduleOddsPollTick(_getOddsPollIntervalMs());
+  }
+}
+
+async function _handleOwlsWsOddsUpdate(payload) {
+  const start = Date.now();
+  try {
+    const parsed = _parseOwlsWsOddsPayload(payload);
+    const applied = _applyOwlsResultsToCache(parsed.owlsResults, parsed.allGames, Date.now()-start);
+    if (applied.ok) {
+      console.log('[owls-ws] odds-update games='+applied.gameCount+' markets='+applied.marketCount);
+      try {
+        const r = await _upsertOddsSnapshots();
+        if (r && r.ok) {
+          console.log('SNAPSHOT_UPSERT_RESULT source=owls-ws ok=true rows='+(r.rowsUpserted||0));
+        } else {
+          console.error('SNAPSHOT_UPSERT_RESULT source=owls-ws ok=false reason='+
+            (r && (r.reason||r.error) || 'unknown'));
+        }
+      } catch (upsertErr) {
+        console.error('[owls-ws] snapshot upsert error:', upsertErr && upsertErr.message);
+      }
+    }
+  } catch (e) {
+    console.error('[owls-ws] odds-update error:', e.message);
+  }
+}
+
+function _scheduleOwlsWsReconnect() {
+  if (_owlsWsReconnectTimer) return;
+  _owlsWsReconnectTimer = setTimeout(function() {
+    _owlsWsReconnectTimer = null;
+    if (!OWLS_USE_WEBSOCKET || !OWLS_KEY) return;
+    console.log('[owls-ws] attempting reconnect');
+    _initOwlsWebSocket();
+  }, OWLS_WS_RECONNECT_MS);
+}
+
+function _initOwlsWebSocket() {
+  if (!OWLS_USE_WEBSOCKET || !OWLS_KEY || ODDS_PROVIDER !== 'owls_insight') return;
+  if (_owlsWsSocket) {
+    try { _owlsWsSocket.removeAllListeners(); _owlsWsSocket.disconnect(); } catch(_e) {}
+    _owlsWsSocket = null;
+  }
+
+  console.log('[owls-ws] connecting url='+OWLS_BASE_URL+' useWebSocket='+OWLS_USE_WEBSOCKET);
+  const socket = socketIoClient(OWLS_BASE_URL, {
+    query: { apiKey: OWLS_KEY },
+    transports: ['websocket'],
+    reconnection: true,
+    reconnectionDelay: OWLS_WS_RECONNECT_MS,
+    reconnectionDelayMax: OWLS_WS_RECONNECT_MS
+  });
+  _owlsWsSocket = socket;
+
+  socket.on('connect', function() {
+    _owlsWsConnected = true;
+    console.log('[owls-ws] connected id='+socket.id);
+    _setOwlsWsProviderHealthy();
+    _rescheduleOddsPollForWsState();
+  });
+
+  socket.on('disconnect', function(reason) {
+    _owlsWsConnected = false;
+    console.log('[owls-ws] disconnected reason='+reason+' — REST fallback every '+
+      OWLS_WS_FALLBACK_POLL_MS+'ms');
+    _rescheduleOddsPollForWsState();
+  });
+
+  socket.on('connect_error', function(err) {
+    console.error('[owls-ws] connect error:', err && err.message);
+    _scheduleOwlsWsReconnect();
+  });
+
+  socket.on('error', function(err) {
+    console.error('[owls-ws] error:', err && (err.message || String(err)));
+    _scheduleOwlsWsReconnect();
+  });
+
+  socket.on('odds-update', function(payload) {
+    _handleOwlsWsOddsUpdate(payload);
+  });
+
+  // Not yet handled — subscribe when product needs these feeds:
+  //   player-props-update    — player props from Pinnacle
+  //   draftkings-props-update — DraftKings props
+  //   fanduel-props-update   — FanDuel props
+  //   esports-update         — CS2, Valorant, LoL, Dota 2
+  //   pinnacle-realtime      — sharp odds feed
 }
 
 // Boot kick is `_startOddsPoller('boot')` above (setTimeout 0 + watchdog).
