@@ -6334,7 +6334,10 @@ const POLL_WATCHDOG_CHECK_MS = 10 * 1000;
 
 function _getOddsPollIntervalMs() {
   if (OWLS_USE_WEBSOCKET && ODDS_PROVIDER === 'owls_insight') {
-    return _owlsWsConnected ? OWLS_WS_CONNECTED_POLL_MS : OWLS_WS_FALLBACK_POLL_MS;
+    // Keep REST polling at fallback cadence until cache has games — WS
+    // connect alone must not stretch the interval to 5m on a fresh deploy.
+    return (_owlsWsConnected && LIVE_MARKET_CACHE.gameCount > 0)
+      ? OWLS_WS_CONNECTED_POLL_MS : OWLS_WS_FALLBACK_POLL_MS;
   }
   return LIVE_CACHE_POLL_INTERVAL_MS;
 }
@@ -6412,6 +6415,10 @@ if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
   if (OWLS_USE_WEBSOCKET) {
     setTimeout(function(){ _initOwlsWebSocket(); }, 0);
   }
+  // Immediate REST bootstrap — do not wait for poller timer or WS push.
+  _triggerImmediateOddsRefresh('boot_immediate').catch(function(e) {
+    console.error('[poll] boot immediate refresh error:', e && e.message);
+  });
 } else {
   console.error('[poll] startup keyPresent=false keyMasked=MISSING provider='+ODDS_PROVIDER+
     ' pollerScheduled=false reason=no_api_key');
@@ -7193,6 +7200,8 @@ let LIVE_MARKET_CACHE = _makeEmptyCache();
 let _owlsWsSocket = null;
 let _owlsWsConnected = false;
 let _owlsWsReconnectTimer = null;
+let _owlsWsEmptyCacheFallbackTimer = null;
+const OWLS_WS_EMPTY_CACHE_FALLBACK_MS = 30 * 1000;
 // Rate-limit for Odds API fallback when Owls is unavailable: max 1 poll/min
 let _oddsApiFallbackLastRun = 0;
 const _ODDS_API_FALLBACK_INTERVAL_MS = 60 * 1000;
@@ -7291,6 +7300,87 @@ async function _runOddsApiPoll(trigger) {
   return false;
 }
 
+// Owls REST fetch — always hits the API (never skipped for WS). Shared by
+// boot bootstrap, admin refresh, WS empty-cache fallback, and poll ticks.
+async function _runOwlsRestPoll(trigger) {
+  if (!OWLS_KEY) {
+    console.warn('[owls-rest] OWLS_INSIGHT_API_KEY not set — skipping trigger='+trigger);
+    return { ok:false, reason:'no_owls_key', trigger };
+  }
+  const start = Date.now();
+  const allGames = [];
+  const owlsResults = [];
+  try {
+    await Promise.all(CACHE_SPORTS.map(async function(sport) {
+      const result = await fetchOddsFromOwlsInsight(sport);
+      if (result && result.ok && Array.isArray(result.games)) {
+        owlsResults.push(result);
+        result.games.forEach(function(g){ allGames.push(g); });
+      } else if (result && !result.ok) {
+        console.warn('[owls-rest] fetch error sport='+sport+': '+(result.error||'unknown')+
+          ' trigger='+trigger);
+        _recordLiveDiagnosticEvent('provider_unhealthy', {
+          phase:'provider_poll', sport, reason:result.error||'owls_fetch_error', trigger
+        });
+      }
+    }));
+    const fetchDurationMs = Date.now()-start;
+    const applied = await _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
+    if (applied.ok) {
+      console.log('[owls-rest] cache updated trigger='+trigger+' games='+applied.gameCount+
+        ' markets='+applied.marketCount+' sportsOk='+owlsResults.length+
+        ' sourceStatus='+applied.sourceStatus+' fetch='+fetchDurationMs+'ms');
+      return { ok:true, gameCount:applied.gameCount, marketCount:applied.marketCount,
+        sourceStatus:applied.sourceStatus, trigger };
+    }
+    console.warn('[owls-rest] all sports failed trigger='+trigger+' — lastSuccessfulPollAt unchanged');
+    _recordLiveDiagnosticEvent('provider_unhealthy', {
+      phase:'provider_poll', reason:'owls_all_sports_failed', trigger
+    });
+    return { ok:false, reason:'owls_all_sports_failed', trigger };
+  } catch(e) {
+    console.error('[owls-rest] poll error trigger='+trigger+':', e.message);
+    _recordLiveDiagnosticEvent('provider_unhealthy', {
+      phase:'provider_poll', reason:'owls_poll_error', trigger
+    });
+    return { ok:false, reason:'owls_poll_error', error:e.message, trigger };
+  }
+}
+
+// Immediate REST poll + snapshot upsert (boot, admin refresh, WS fallback).
+async function _triggerImmediateOddsRefresh(trigger) {
+  let pollResult;
+  if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
+    pollResult = await _runOwlsRestPoll(trigger);
+  } else {
+    const ok = await _runOddsApiPoll(trigger);
+    const cache = LIVE_MARKET_CACHE;
+    pollResult = { ok, gameCount:cache.gameCount, marketCount:cache.marketCount,
+      sourceStatus:cache.sourceStatus, trigger };
+  }
+  try {
+    const r = await _upsertOddsSnapshots();
+    if (r && r.ok) {
+      console.log('SNAPSHOT_UPSERT_RESULT source='+trigger+' ok=true rows='+(r.rowsUpserted||0));
+    } else {
+      console.error('SNAPSHOT_UPSERT_RESULT source='+trigger+' ok=false reason='+
+        (r && (r.reason||r.error) || 'unknown'));
+    }
+  } catch (upsertErr) {
+    console.error('SNAPSHOT_UPSERT_RESULT source='+trigger+' ok=false reason=threw message='+
+      JSON.stringify(String(upsertErr && upsertErr.message || upsertErr).slice(0,300)));
+  }
+  const cache = LIVE_MARKET_CACHE;
+  return {
+    ok:!!pollResult.ok,
+    gameCount:cache.gameCount,
+    marketCount:cache.marketCount,
+    updatedAt:cache.updatedAt,
+    sourceStatus:cache.sourceStatus,
+    trigger
+  };
+}
+
 // Apply normalized Owls per-sport results to LIVE_MARKET_CACHE (shared by REST poll + WS).
 async function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) {
   const newCache = await _buildCacheFromGames(allGames, LIVE_MARKET_CACHE, fetchDurationMs);
@@ -7380,53 +7470,8 @@ async function pollLiveOddsLoop() {
     if (OWLS_USE_WEBSOCKET && _owlsWsConnected && LIVE_MARKET_CACHE.gameCount > 0) {
       return;
     }
-    if (!OWLS_KEY) { console.warn('[live cache] OWLS_INSIGHT_API_KEY not set — skipping poll'); return; }
-    const start = Date.now();
-    const allGames = [];
-    // Per-sport normalized results so we can also harvest the
-    // marketsByCanonicalKey + marketsByProviderGameId that the normalizer
-    // already built. Previously _buildCacheFromGames was called on Owls
-    // games but its bookmaker-iterating loop produces an empty market map
-    // for Owls' flat shape — so the snapshot upsert silently wrote zero
-    // rows. Now we keep the normalizer's maps and overlay them onto the
-    // freshly-built cache after the fact.
-    const owlsResults = [];
-    try {
-      await Promise.all(CACHE_SPORTS.map(async function(sport) {
-        const result = await fetchOddsFromOwlsInsight(sport);
-        if (result && result.ok && Array.isArray(result.games)) {
-          owlsResults.push(result);
-          result.games.forEach(function(g){ allGames.push(g); });
-        } else if (result && !result.ok) {
-          console.warn('[owls] fetch error sport='+sport+': '+(result.error||'unknown'));
-          _recordLiveDiagnosticEvent('provider_unhealthy', {
-            phase:'provider_poll',
-            sport,
-            reason:result.error||'owls_fetch_error'
-          });
-        }
-      }));
-      const fetchDurationMs = Date.now()-start;
-      const applied = await _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
-
-      if (applied.ok) {
-        console.log('[owls] cache updated games='+applied.gameCount+' markets='+applied.marketCount+
-          ' sportsOk='+owlsResults.length+' sourceStatus='+applied.sourceStatus+
-          ' fetch='+fetchDurationMs+'ms');
-        return;
-      }
-      console.warn('[owls] all sports failed — lastSuccessfulPollAt unchanged');
-      _recordLiveDiagnosticEvent('provider_unhealthy', {
-        phase:'provider_poll',
-        reason:'owls_all_sports_failed'
-      });
-    } catch(e) {
-      console.error('[owls] poll error:', e.message);
-      _recordLiveDiagnosticEvent('provider_unhealthy', {
-        phase:'provider_poll',
-        reason:'owls_poll_error'
-      });
-    }
+    const restResult = await _runOwlsRestPoll('poll_tick');
+    if (restResult.ok) return;
     // Owls failed or returned empty. Fall through to the Odds API path when:
     //   (a) the cache is empty (fresh deploy / first poll), OR
     //   (b) the cache is populated but stale (older than PREGAME_SNAPSHOT_TTL_MS)
@@ -7505,6 +7550,29 @@ function _rescheduleOddsPollForWsState() {
   }
 }
 
+function _clearOwlsWsEmptyCacheFallback() {
+  if (_owlsWsEmptyCacheFallbackTimer) {
+    clearTimeout(_owlsWsEmptyCacheFallbackTimer);
+    _owlsWsEmptyCacheFallbackTimer = null;
+  }
+}
+
+function _scheduleOwlsWsEmptyCacheFallback() {
+  _clearOwlsWsEmptyCacheFallback();
+  if (!OWLS_USE_WEBSOCKET || ODDS_PROVIDER !== 'owls_insight' || !OWLS_KEY) return;
+  _owlsWsEmptyCacheFallbackTimer = setTimeout(async function() {
+    _owlsWsEmptyCacheFallbackTimer = null;
+    if (!_owlsWsConnected || LIVE_MARKET_CACHE.gameCount > 0) return;
+    console.warn('[owls-ws] connected but cache still empty after '+
+      OWLS_WS_EMPTY_CACHE_FALLBACK_MS+'ms — running REST bootstrap');
+    try {
+      await _triggerImmediateOddsRefresh('ws_empty_cache_fallback');
+    } catch (e) {
+      console.error('[owls-ws] empty-cache fallback error:', e && e.message);
+    }
+  }, OWLS_WS_EMPTY_CACHE_FALLBACK_MS);
+}
+
 async function _handleOwlsWsOddsUpdate(payload) {
   const start = Date.now();
   try {
@@ -7561,10 +7629,12 @@ function _initOwlsWebSocket() {
     console.log('[owls-ws] connected id='+socket.id);
     _setOwlsWsProviderHealthy();
     _rescheduleOddsPollForWsState();
+    _scheduleOwlsWsEmptyCacheFallback();
   });
 
   socket.on('disconnect', function(reason) {
     _owlsWsConnected = false;
+    _clearOwlsWsEmptyCacheFallback();
     console.log('[owls-ws] disconnected reason='+reason+' — REST fallback every '+
       OWLS_WS_FALLBACK_POLL_MS+'ms');
     _rescheduleOddsPollForWsState();
@@ -10233,6 +10303,18 @@ app.post('/api/markets/refresh', requirePermissionScoped('force_market_refresh')
     console.log('[live cache] forced refresh: games='+cache.gameCount+' markets='+cache.marketCount);
     res.json({ ok:true, gameCount:cache.gameCount, marketCount:cache.marketCount,
                updatedAt:cache.updatedAt, sourceStatus:cache.sourceStatus });
+  } catch(e) {
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// POST /api/odds/refresh — immediate REST bootstrap (admin; not rate-limited)
+app.post('/api/odds/refresh', requirePermissionScoped('force_market_refresh'), async (req, res) => {
+  try {
+    const summary = await _triggerImmediateOddsRefresh('admin_refresh');
+    console.log('[live cache] admin odds refresh: games='+summary.gameCount+
+      ' markets='+summary.marketCount+' sourceStatus='+summary.sourceStatus);
+    res.json(summary);
   } catch(e) {
     res.status(500).json({ ok:false, error:e.message });
   }
