@@ -7188,7 +7188,7 @@ async function _buildCacheFromGames(gamesArr, prevCache, fetchDurationMs) {
   const byKey = {}, byId = {};
   let marketCount = 0;
   for (const game of gamesArr) {
-    const cKey   = await _buildCKeyFromGame(game);
+    const cKey   = _buildCKeyFromGameSync(game);
     const gameId = game.id;
     // Compute and stamp game.status so the Live tab can filter on it
     const gameStatus = _deriveGameStatus(game);
@@ -7377,7 +7377,11 @@ async function _runOwlsRestPoll(trigger) {
     console.log('[owls-rest] poll collected trigger='+trigger+' sportsOk='+owlsResults.length+
       ' games='+allGames.length+' errors='+sportErrors.length+
       (sportErrors.length ? ' detail='+JSON.stringify(sportErrors) : ''));
+    const applyStart = Date.now();
     const applied = await _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs);
+    console.log('[owls-rest] cache apply trigger='+trigger+' ok='+!!applied.ok+
+      ' games='+(applied.gameCount||0)+' markets='+(applied.marketCount||0)+
+      ' applyMs='+(Date.now()-applyStart));
     if (applied.ok) {
       console.log('[owls-rest] cache updated trigger='+trigger+' games='+applied.gameCount+
         ' markets='+applied.marketCount+' sportsOk='+owlsResults.length+
