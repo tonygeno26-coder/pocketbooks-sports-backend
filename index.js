@@ -9019,6 +9019,110 @@ app.get('/api/splits/:sport', async function(req, res) {
   }
 });
 
+// ── GET /api/value-bets/:sport ────────────────────────────────────────────────
+// Owls EV scanner — positive expected value opportunities. 2min cache.
+const _VALUE_BETS_CACHE = Object.create(null);
+const VALUE_BETS_CACHE_TTL_MS = 2 * 60 * 1000;
+
+async function fetchEvFromOwlsInsight(sportKey, opts) {
+  opts = opts || {};
+  if (!OWLS_KEY) return { ok: false, error: 'owls_insight_not_configured' };
+  var owlsSport = _mapToOwlsSport(sportKey);
+  if (!owlsSport) return { ok: false, error: 'unsupported_sport:' + sportKey };
+  var minEv = opts.minEv != null ? opts.minEv : 0;
+  var url = OWLS_BASE_URL + '/api/v1/' + owlsSport + '/ev?min_ev=' + encodeURIComponent(minEv);
+  return new Promise(function(resolve) {
+    var parsed;
+    try { parsed = new URL(url); } catch (_e) { return resolve({ ok: false, error: 'invalid_url' }); }
+    var reqPath = parsed.pathname + parsed.search;
+    var driver = parsed.protocol === 'https:' ? https : require('http');
+    var chunks = [];
+    var req = driver.request({
+      hostname: parsed.hostname, port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: reqPath, method: 'GET',
+      headers: { Authorization: 'Bearer ' + OWLS_KEY, Accept: 'application/json' }
+    }, function(res) {
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString('utf8');
+        if (res.statusCode !== 200) {
+          return resolve({ ok: false, error: 'owls_ev_http_error', status: res.statusCode });
+        }
+        try {
+          var data = JSON.parse(body);
+          resolve({ ok: true, data: data });
+        } catch (_pe) {
+          resolve({ ok: false, error: 'owls_ev_parse_error' });
+        }
+      });
+    });
+    req.on('error', function(e) { resolve({ ok: false, error: e.message }); });
+    req.end();
+  });
+}
+
+function _normalizeOwlsEvResponse(owlsData, sportKey) {
+  var bets = [];
+  if (!owlsData || !owlsData.success) return bets;
+  var rows = owlsData.data;
+  if (!rows) return bets;
+  var events = Array.isArray(rows) ? rows : (Array.isArray(rows.events) ? rows.events : Object.values(rows));
+  events.forEach(function(ev) {
+    if (!ev) return;
+    var opps = ev.opportunities || ev.ev || [];
+    if (!Array.isArray(opps)) opps = [];
+    opps.forEach(function(o) {
+      if (!o) return;
+      bets.push({
+        eventId: ev.eventId || ev.id || null,
+        sport: sportKey,
+        away: ev.awayTeam || ev.away || null,
+        home: ev.homeTeam || ev.home || null,
+        matchup: (ev.awayTeam || ev.away || '') + ' @ ' + (ev.homeTeam || ev.home || ''),
+        team: o.team || o.side || null,
+        pick: o.team || o.side || null,
+        side: o.side || null,
+        market: o.market || 'h2h',
+        book: o.book || null,
+        bookPrice: o.bookPrice != null ? o.bookPrice : o.odds,
+        odds: o.bookPrice != null ? o.bookPrice : o.odds,
+        evPct: o.evPct != null ? o.evPct : o.ev,
+        edgePp: o.edgePp != null ? o.edgePp : null,
+        fairPrice: o.fairPrice != null ? o.fairPrice : null
+      });
+    });
+  });
+  bets.sort(function(a, b) { return (b.evPct || 0) - (a.evPct || 0); });
+  return bets;
+}
+
+app.get('/api/value-bets/:sport', async function(req, res) {
+  var sport = String(req.params.sport || '').toLowerCase();
+  var minEv = parseFloat(req.query.min_ev || req.query.minEv || '0') || 0;
+  var now = Date.now();
+  var cacheKey = sport + ':' + minEv;
+  var cached = _VALUE_BETS_CACHE[cacheKey];
+  if (cached && (now - cached.at) < VALUE_BETS_CACHE_TTL_MS) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.json(cached.data);
+  }
+  try {
+    var result = await fetchEvFromOwlsInsight(sport, { minEv: minEv });
+    if (!result.ok) {
+      return res.status(result.status === 401 || result.status === 403 ? 503 : 502).json({
+        ok: false, sport: sport, error: result.error, bets: [], count: 0
+      });
+    }
+    var bets = _normalizeOwlsEvResponse(result.data, sport);
+    var data = { ok: true, sport: sport, bets: bets, count: bets.length, updatedAt: new Date().toISOString() };
+    _VALUE_BETS_CACHE[cacheKey] = { at: now, data: data };
+    res.setHeader('X-Cache', 'MISS');
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message, bets: [], count: 0 });
+  }
+});
+
 // ── Sport catalog metadata ──────────────────────────────────────────────────
 // Every sport/competition the backend is willing to advertise. sortOrder is
 // the DK-style static fallback ordering; /api/sports re-sorts at request
@@ -11077,6 +11181,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       hostAtRisk:     rnd(hostAtRisk),
       settledGain:    rnd(settledGain),
       settledLoss:    rnd(settledLoss),
+      playersOwe:     rnd(settledLoss),
+      hostOwes:       rnd(settledGain),
       profit:         profit,
       holdPct:        holdPct,
       activeBetCount: activeBetCount,
