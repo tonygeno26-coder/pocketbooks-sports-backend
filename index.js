@@ -2597,17 +2597,31 @@ function getSupabase() {
   if (_supabase) return _supabase;
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) return null;
+  const envCheck = {
+    hasUrl: !!url,
+    hasServiceKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+    hasAnonKey: !!process.env.SUPABASE_ANON_KEY,
+    hasDatabaseUrl: !!process.env.DATABASE_URL,
+  };
+  if (!url || !key) {
+    console.error('[supabase] client init skipped — missing env');
+    console.error('[supabase] env check:', envCheck);
+    return null;
+  }
   try {
     const { createClient } = require('@supabase/supabase-js');
     const clientOpts = { auth: { persistSession: false, autoRefreshToken: false } };
-    if (typeof globalThis.WebSocket === 'undefined') {
-      clientOpts.global = { WebSocket: require('ws') };
+    // Node < 22 has no native WebSocket; @supabase/realtime-js requires transport: ws
+    const nodeMajor = parseInt(String(process.versions && process.versions.node || '99').split('.')[0], 10);
+    if (nodeMajor < 22 || typeof globalThis.WebSocket === 'undefined') {
+      clientOpts.realtime = { transport: require('ws') };
     }
     _supabase = createClient(url, key, clientOpts);
     console.log('[supabase] client initialised — mirror writes enabled');
   } catch(e) {
-    console.warn('[supabase] client init failed:', e.message);
+    console.error('[supabase] client init failed:', e.message);
+    console.error('[supabase] stack:', e.stack);
+    console.error('[supabase] env check:', envCheck);
   }
   return _supabase;
 }
