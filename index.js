@@ -2600,9 +2600,11 @@ function getSupabase() {
   if (!url || !key) return null;
   try {
     const { createClient } = require('@supabase/supabase-js');
-    _supabase = createClient(url, key, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    const clientOpts = { auth: { persistSession: false, autoRefreshToken: false } };
+    if (typeof globalThis.WebSocket === 'undefined') {
+      clientOpts.global = { WebSocket: require('ws') };
+    }
+    _supabase = createClient(url, key, clientOpts);
     console.log('[supabase] client initialised — mirror writes enabled');
   } catch(e) {
     console.warn('[supabase] client init failed:', e.message);
