@@ -3482,6 +3482,9 @@ const OWLS_USE_WEBSOCKET     = process.env.OWLS_USE_WEBSOCKET === 'true';
 const OWLS_WS_FALLBACK_POLL_MS = 30 * 1000;
 const OWLS_WS_RECONNECT_MS     = 5 * 1000;
 const OWLS_WS_CONNECTED_POLL_MS = 5 * 60 * 1000; // slow heartbeat while WS is live
+// While WS is connected, still run REST when cache age exceeds this (WS-only
+// updates can stall / deliver empty snapshots without refreshing lastSuccessAt).
+const OWLS_WS_STALE_REST_MS = _envMs('OWLS_WS_STALE_REST_MS', 90 * 1000);
 
 // Owls Insight v1 unified-odds supported sport keys. The unified
 // /api/v1/{sport}/odds endpoint covers a broader catalog than we previously
@@ -6489,9 +6492,10 @@ const POLL_WATCHDOG_CHECK_MS = 10 * 1000;
 
 function _getOddsPollIntervalMs() {
   if (OWLS_USE_WEBSOCKET && ODDS_PROVIDER === 'owls_insight') {
-    // Keep REST polling at fallback cadence until cache has games — WS
-    // connect alone must not stretch the interval to 5m on a fresh deploy.
-    return (_owlsWsConnected && LIVE_MARKET_CACHE.gameCount > 0)
+    // Stretch to 5m heartbeat only when WS is connected AND the live cache is
+    // still fresh. Empty/stale cache (or connection-limit fallback) keeps the
+    // faster REST cadence so lastSuccessAt cannot freeze.
+    return _shouldSkipOwlsRestWhileWsConnected()
       ? OWLS_WS_CONNECTED_POLL_MS : OWLS_WS_FALLBACK_POLL_MS;
   }
   return LIVE_CACHE_POLL_INTERVAL_MS;
@@ -6502,6 +6506,7 @@ let _oddsWatchdogTimer = null;
 let _oddsPollGeneration = 0;
 let _oddsPollLastStartedAt = 0;
 let _oddsPollerStarted = false;
+let _oddsWatchdogRefreshAt = 0;
 
 function _clearOddsPollTimer() {
   if (_oddsPollTimer) {
@@ -6545,9 +6550,23 @@ function _startOddsPoller(reason) {
 function _oddsPollerWatchdogTick() {
   try {
     const ageMs = _oddsPollLastStartedAt ? (Date.now() - _oddsPollLastStartedAt) : Infinity;
+    const cacheAgeMs = _getLiveCacheAgeMs();
+    const cacheStale = !Number.isFinite(cacheAgeMs) || cacheAgeMs > OWLS_WS_STALE_REST_MS;
     if (ageMs > POLL_WATCHDOG_STALE_MS) {
       console.warn('[poll] watchdog restart — last tick started '+ageMs+'ms ago');
       _startOddsPoller('watchdog_stale');
+    }
+    // Restarting the poller alone is not enough when WS is "connected" and the
+    // tick skips REST — force a real REST refresh so lastSuccessAt advances.
+    const now = Date.now();
+    if (cacheStale && (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) &&
+        (now - _oddsWatchdogRefreshAt >= OWLS_WS_FALLBACK_POLL_MS)) {
+      _oddsWatchdogRefreshAt = now;
+      console.warn('[poll] watchdog stale cache ageMs='+cacheAgeMs+
+        ' — triggering immediate REST refresh');
+      _triggerImmediateOddsRefresh('watchdog_stale').catch(function(e) {
+        console.error('[poll] watchdog refresh error:', e && e.message);
+      });
     }
   } catch (wdErr) {
     console.error('[poll] watchdog error:', wdErr && wdErr.message);
@@ -7324,7 +7343,20 @@ let _owlsWsSocket = null;
 let _owlsWsConnected = false;
 let _owlsWsReconnectTimer = null;
 let _owlsWsEmptyCacheFallbackTimer = null;
+let _owlsWsForceRestFallback = false; // Connection limit / empty WS → prefer REST
+let _owlsWsEmptySnapshotRestAt = 0;
 const OWLS_WS_EMPTY_CACHE_FALLBACK_MS = 30 * 1000;
+
+// True only when WS is connected, cache has games, and cache is still fresh.
+// Otherwise REST must keep polling so lastSuccessAt / cacheAgeMs cannot freeze.
+function _shouldSkipOwlsRestWhileWsConnected() {
+  if (!OWLS_USE_WEBSOCKET || !_owlsWsConnected) return false;
+  if (_owlsWsForceRestFallback) return false;
+  if (!LIVE_MARKET_CACHE || !LIVE_MARKET_CACHE.gameCount) return false;
+  const age = _getLiveCacheAgeMs();
+  if (!Number.isFinite(age) || age > OWLS_WS_STALE_REST_MS) return false;
+  return true;
+}
 // Rate-limit for Odds API fallback when Owls is unavailable: max 1 poll/min
 let _oddsApiFallbackLastRun = 0;
 const _ODDS_API_FALLBACK_INTERVAL_MS = 60 * 1000;
@@ -7579,6 +7611,14 @@ async function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) 
 
   console.log(`OWLS_CACHE_SNAPSHOTS_READY games=${newCache.gameCount} markets=${overlayMarketCount}`);
 
+  // Never clobber a populated live cache with an empty snapshot (WS often
+  // reconnects with games=0/markets=0 while REST already has a full slate).
+  if (newCache.gameCount === 0 && LIVE_MARKET_CACHE.gameCount > 0) {
+    console.warn('[owls-cache] refusing empty snapshot overwrite — keeping live cache games='+
+      LIVE_MARKET_CACHE.gameCount+' markets='+LIVE_MARKET_CACHE.marketCount);
+    return { ok:false, reason:'empty_snapshot_refused', gameCount:0, marketCount:0 };
+  }
+
   if (owlsResults.length > 0) {
     LIVE_MARKET_CACHE = newCache;
     return { ok:true, gameCount:newCache.gameCount, marketCount:overlayMarketCount,
@@ -7612,10 +7652,10 @@ async function pollLiveOddsLoop() {
     if (quotaBlocked && ODDS_PROVIDER !== 'owls_insight') {
       console.warn('[poll] Odds API quota blocked — trying Owls Insight fallback');
     }
-    // WebSocket provides real-time updates — skip REST fetch while connected
-    // only when the cache already has games (fresh deploy / empty cache still
-    // needs a REST bootstrap).
-    if (OWLS_USE_WEBSOCKET && _owlsWsConnected && LIVE_MARKET_CACHE.gameCount > 0) {
+    // WebSocket provides real-time updates — skip REST only while connected
+    // AND the live cache is still fresh with games. Empty/stale cache must
+    // keep REST polling even if the socket reports connected.
+    if (_shouldSkipOwlsRestWhileWsConnected()) {
       return;
     }
     const restResult = await _runOwlsRestPoll('poll_tick');
@@ -7710,9 +7750,13 @@ function _scheduleOwlsWsEmptyCacheFallback() {
   if (!OWLS_USE_WEBSOCKET || ODDS_PROVIDER !== 'owls_insight' || !OWLS_KEY) return;
   _owlsWsEmptyCacheFallbackTimer = setTimeout(async function() {
     _owlsWsEmptyCacheFallbackTimer = null;
-    if (!_owlsWsConnected || LIVE_MARKET_CACHE.gameCount > 0) return;
-    console.warn('[owls-ws] connected but cache still empty after '+
-      OWLS_WS_EMPTY_CACHE_FALLBACK_MS+'ms — running REST bootstrap');
+    if (!_owlsWsConnected) return;
+    const age = _getLiveCacheAgeMs();
+    const needsRest = !LIVE_MARKET_CACHE.gameCount ||
+      !Number.isFinite(age) || age > OWLS_WS_STALE_REST_MS;
+    if (!needsRest) return;
+    console.warn('[owls-ws] connected but cache empty/stale after '+
+      OWLS_WS_EMPTY_CACHE_FALLBACK_MS+'ms ageMs='+age+' — running REST bootstrap');
     try {
       await _triggerImmediateOddsRefresh('ws_empty_cache_fallback');
     } catch (e) {
@@ -7739,6 +7783,20 @@ async function _handleOwlsWsOddsUpdate(payload) {
       } catch (upsertErr) {
         console.error('[owls-ws] snapshot upsert error:', upsertErr && upsertErr.message);
       }
+    } else if (applied.reason === 'empty_snapshot_refused') {
+      // WS delivered an empty slate while REST cache is populated — keep REST
+      // hot so lastSuccessAt cannot freeze behind a "connected" socket.
+      const now = Date.now();
+      if (now - _owlsWsEmptySnapshotRestAt >= OWLS_WS_FALLBACK_POLL_MS) {
+        _owlsWsEmptySnapshotRestAt = now;
+        console.warn('[owls-ws] empty snapshot ignored — triggering REST refresh');
+        try {
+          await _triggerImmediateOddsRefresh('ws_empty_snapshot_fallback');
+        } catch (e) {
+          console.error('[owls-ws] empty-snapshot REST fallback error:', e && e.message);
+        }
+      }
+      _rescheduleOddsPollForWsState();
     }
   } catch (e) {
     console.error('[owls-ws] odds-update error:', e.message);
@@ -7774,6 +7832,7 @@ function _initOwlsWebSocket() {
 
   socket.on('connect', function() {
     _owlsWsConnected = true;
+    _owlsWsForceRestFallback = false;
     console.log('[owls-ws] connected id='+socket.id);
     _setOwlsWsProviderHealthy();
     _rescheduleOddsPollForWsState();
@@ -7789,7 +7848,18 @@ function _initOwlsWebSocket() {
   });
 
   socket.on('connect_error', function(err) {
-    console.error('[owls-ws] connect error:', err && err.message);
+    const msg = (err && err.message) || String(err || '');
+    console.error('[owls-ws] connect error:', msg);
+    if (/connection limit/i.test(msg)) {
+      _owlsWsForceRestFallback = true;
+      _owlsWsConnected = false;
+      console.warn('[owls-ws] Connection limit reached — forcing aggressive REST polling every '+
+        OWLS_WS_FALLBACK_POLL_MS+'ms (WS slot unavailable)');
+      _rescheduleOddsPollForWsState();
+      _triggerImmediateOddsRefresh('ws_connection_limit').catch(function(e) {
+        console.error('[owls-ws] connection-limit REST fallback error:', e && e.message);
+      });
+    }
     _scheduleOwlsWsReconnect();
   });
 

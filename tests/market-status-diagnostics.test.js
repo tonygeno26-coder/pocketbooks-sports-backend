@@ -51,10 +51,26 @@ test('odds poller uses recursive setTimeout plus 30s watchdog', function() {
   assert(indexSource.includes('function _runOddsPollTick'), 'poll tick runner missing');
   assert(indexSource.includes('const POLL_WATCHDOG_STALE_MS = 30 * 1000'), 'watchdog must restart after 30s');
   assert(indexSource.includes(" _startOddsPoller('watchdog_stale')"), 'watchdog restart reason missing');
-  assert(indexSource.includes('_scheduleOddsPollTick(LIVE_CACHE_POLL_INTERVAL_MS)'), 'next tick must be scheduled from finally');
+  assert(indexSource.includes("_triggerImmediateOddsRefresh('watchdog_stale')"),
+    'watchdog must trigger a real REST refresh on stale cache');
+  assert(indexSource.includes('_scheduleOddsPollTick(_getOddsPollIntervalMs())'),
+    'next tick must be scheduled from finally with dynamic interval');
   assert(indexSource.includes('} finally {'), 'tick must schedule next run in finally');
   assert(!/setInterval\(\s*pollLiveOddsLoopWithSnapshots/.test(indexSource),
     'in-process poller must not use setInterval');
+});
+
+test('WS connected does not freeze REST when cache empty/stale', function() {
+  assert(indexSource.includes('function _shouldSkipOwlsRestWhileWsConnected'),
+    'WS skip helper missing');
+  assert(indexSource.includes('OWLS_WS_STALE_REST_MS'),
+    'WS stale REST threshold missing');
+  assert(indexSource.includes("reason:'empty_snapshot_refused'"),
+    'empty snapshot overwrite guard missing');
+  assert(indexSource.includes('Connection limit reached'),
+    'connection-limit REST fallback log missing');
+  assert(indexSource.includes("_triggerImmediateOddsRefresh('ws_connection_limit')"),
+    'connection-limit must trigger REST refresh');
 });
 
 test('/api/markets/status exposes live freshness diagnostics', function() {
