@@ -3510,18 +3510,22 @@ const OWLS_SPORT_MAP = {
   // ── Motorsports ──
   nascar:'nascar',                      nascar_cup:'nascar',
   formula1:'f1',                        f1:'f1',
-  // ── Soccer (multi-competition; /api/odds/soccer combines OWLS_SOCCER_TAB_KEYS) ──
-  // Generic `soccer` is not a real Owls feed — tab leagues are polled individually.
-  soccer:'soccer_epl',
-  soccer_epl:'soccer_epl',              epl:'soccer_epl',           premier_league:'soccer_epl',
-  soccer_uefa_champs_league:'soccer_ucl', ucl:'soccer_ucl',         champions_league:'soccer_ucl',
-  soccer_usa_mls:'soccer_mls',          mls:'soccer_mls',
-  soccer_fifa_world_cup:'soccer_worldcup', worldcup:'soccer_worldcup', world_cup:'soccer_worldcup',
-  soccer_uefa_european_championship:'soccer_euros', euros:'soccer_euros',
-  soccer_spain_la_liga:'soccer_laliga', laliga:'soccer_laliga',     la_liga:'soccer_laliga',
-  soccer_italy_serie_a:'soccer_seriea', serie_a:'soccer_seriea',    seriea:'soccer_seriea',
-  soccer_germany_bundesliga:'soccer_bundesliga', bundesliga:'soccer_bundesliga',
-  soccer_france_ligue_one:'soccer_ligue1', ligue1:'soccer_ligue1',  ligue_one:'soccer_ligue1',
+  // ── Soccer (Owls v1 path key is exactly `soccer`; leagues are event fields) ──
+  // /api/odds/soccer serves the combined soccer feed. Aliases map to that key.
+  soccer:'soccer',
+  soccer_epl:'soccer',                  epl:'soccer',               premier_league:'soccer',
+  soccer_england_premier_league:'soccer',
+  soccer_uefa_champs_league:'soccer',   ucl:'soccer',               champions_league:'soccer',
+  soccer_usa_mls:'soccer',              mls:'soccer',
+  soccer_fifa_world_cup:'soccer',       worldcup:'soccer',          world_cup:'soccer',
+  soccer_uefa_european_championship:'soccer', euros:'soccer',
+  soccer_spain_la_liga:'soccer',        laliga:'soccer',            la_liga:'soccer',
+  soccer_italy_serie_a:'soccer',        serie_a:'soccer',           seriea:'soccer',
+  soccer_germany_bundesliga:'soccer',   bundesliga:'soccer',
+  soccer_france_ligue_one:'soccer',     ligue1:'soccer',            ligue_one:'soccer',
+  // legacy short keys previously invented as Owls path segments → still map
+  soccer_ucl:'soccer', soccer_mls:'soccer', soccer_worldcup:'soccer', soccer_euros:'soccer',
+  soccer_laliga:'soccer', soccer_seriea:'soccer', soccer_bundesliga:'soccer', soccer_ligue1:'soccer',
   // ── Other international team sports ──
   cricket:'cricket',
   cricket_ipl:'cricket_ipl',            ipl:'cricket_ipl',
@@ -3529,9 +3533,9 @@ const OWLS_SPORT_MAP = {
   rugbyunion_six_nations:'rugby',       rugby_union:'rugby',     rugby:'rugby',
   rugbyleague:'rugby_league',           rugby_league:'rugby_league', nrl:'rugby_league',
   aussierules_afl:'afl',                afl:'afl',
-  // ── Individual sports ──
-  tennis:'tennis',                      atp:'tennis_atp',          wta:'tennis_wta',
-  tennis_atp:'tennis_atp',              tennis_wta:'tennis_wta',
+  // ── Individual sports (Owls v1 path key is exactly `tennis`; ATP/WTA are leagues) ──
+  tennis:'tennis',                      atp:'tennis',              wta:'tennis',
+  tennis_atp:'tennis',                  tennis_wta:'tennis',
   golf_pga_championship:'golf_pga',     pga:'golf_pga',            pga_tour:'golf_pga',
   golf_masters_tournament:'golf_pga',
   golf_us_open:'golf_pga',              golf_the_open_championship:'golf_pga',
@@ -3547,24 +3551,25 @@ const OWLS_SPORT_MAP = {
   rocketleague:'rocketleague',          rl:'rocketleague'
 };
 
-// Soccer lobby tab: major leagues fetched from Owls and combined for /api/odds/soccer.
-// Owls path segments (short keys) — aliases like soccer_spain_la_liga map via OWLS_SPORT_MAP.
+// Soccer lobby tab: Owls exposes a single `/api/v1/soccer/odds` feed (all leagues).
+// Poll that exact path key once; /api/odds/soccer serves the combined cache.
 const OWLS_SOCCER_TAB_KEYS = [
-  'soccer_epl',
-  'soccer_laliga',
-  'soccer_bundesliga',
-  'soccer_seriea',
-  'soccer_ligue1',
-  'soccer_ucl'
+  'soccer'
+];
+
+// Tennis lobby tab: Owls exposes a single `/api/v1/tennis/odds` feed (ATP+WTA+…).
+const OWLS_TENNIS_TAB_KEYS = [
+  'tennis'
 ];
 
 // The exhaustive list of short keys this backend is willing to surface when
-// OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped), plus
-// the unified `soccer` tab key (not an Owls path — leagues via OWLS_SOCCER_TAB_KEYS).
+// OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped).
+// Soccer and tennis Owls path keys are included via the map values.
 const OWLS_ALL_SPORTS = (function(){
   var seen = {}, out = [];
   Object.values(OWLS_SPORT_MAP).forEach(function(v){ if (v && !seen[v]) { seen[v]=true; out.push(v); } });
   if (!seen.soccer) { seen.soccer = true; out.push('soccer'); }
+  if (!seen.tennis) { seen.tennis = true; out.push('tennis'); }
   return out;
 })();
 
@@ -3606,22 +3611,25 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf', ncaabaseball:'baseball_ncaa',
   mma:'mma_mixed_martial_arts', boxing:'boxing_boxing',
   nascar:'nascar', f1:'formula1',
-  // Generic soccer expands to OWLS_SOCCER_TAB_KEYS in CACHE_SPORTS (not a single feed).
-  soccer:'soccer_epl',
-  soccer_epl:'soccer_epl', soccer_ucl:'soccer_uefa_champs_league',
-  soccer_mls:'soccer_usa_mls', soccer_worldcup:'soccer_fifa_world_cup',
-  soccer_euros:'soccer_uefa_european_championship',
-  soccer_laliga:'soccer_spain_la_liga', soccer_seriea:'soccer_italy_serie_a',
-  soccer_bundesliga:'soccer_germany_bundesliga', soccer_ligue1:'soccer_france_ligue_one',
+  // Soccer/tennis: Owls path keys are exactly `soccer` and `tennis` (docs sports list).
+  soccer:'soccer',
+  soccer_epl:'soccer', soccer_ucl:'soccer', soccer_mls:'soccer',
+  soccer_worldcup:'soccer', soccer_euros:'soccer',
+  soccer_laliga:'soccer', soccer_seriea:'soccer',
+  soccer_bundesliga:'soccer', soccer_ligue1:'soccer',
+  soccer_uefa_champs_league:'soccer', soccer_usa_mls:'soccer',
+  soccer_fifa_world_cup:'soccer', soccer_uefa_european_championship:'soccer',
+  soccer_spain_la_liga:'soccer', soccer_italy_serie_a:'soccer',
+  soccer_germany_bundesliga:'soccer', soccer_france_ligue_one:'soccer',
   cricket:'cricket', cricket_ipl:'cricket_ipl', cricket_t20:'cricket_international_t20',
   rugby:'rugbyunion_six_nations', rugby_league:'rugbyleague', afl:'aussierules_afl',
-  tennis:'tennis', tennis_atp:'tennis_atp', tennis_wta:'tennis_wta',
+  tennis:'tennis', tennis_atp:'tennis', tennis_wta:'tennis',
   golf_pga:'golf_pga_championship', golf_liv:'golf_liv', golf_european:'golf_european_tour',
   table_tennis:'table_tennis',
   cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
-// Build Owls poll list: expand `soccer` → tab leagues, and always include those
-// leagues so /api/odds/soccer can serve from cache without Odds API fallback.
+// Build Owls poll list: always include soccer + tennis so lobby tabs can serve
+// from cache (Owls path keys are single feeds, not per-league segments).
 const CACHE_SPORTS = (function() {
   if (ODDS_PROVIDER !== 'owls_insight') return _CACHE_SPORTS_BASE;
   var seen = {}, out = [];
@@ -3631,9 +3639,11 @@ const CACHE_SPORTS = (function() {
   }
   OWLS_SAFE_SPORTS.forEach(function(s) {
     if (s === 'soccer') OWLS_SOCCER_TAB_KEYS.forEach(addShort);
+    else if (s === 'tennis') OWLS_TENNIS_TAB_KEYS.forEach(addShort);
     else addShort(s);
   });
   OWLS_SOCCER_TAB_KEYS.forEach(addShort);
+  OWLS_TENNIS_TAB_KEYS.forEach(addShort);
   return out;
 })();
 
@@ -3646,6 +3656,19 @@ function _isSoccerCacheSportKey(gameSportKey) {
   if (g === 'soccer' || g.indexOf('soccer_') === 0 || g.indexOf('soccer') === 0) return true;
   for (var i = 0; i < OWLS_SOCCER_TAB_KEYS.length; i++) {
     var short = OWLS_SOCCER_TAB_KEYS[i];
+    var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+    if (g === short || g === full) return true;
+  }
+  return false;
+}
+
+function _isTennisCacheSportKey(gameSportKey) {
+  var g = String(gameSportKey || '').toLowerCase();
+  if (!g) return false;
+  if (g === 'tennis' || g.indexOf('tennis_') === 0) return true;
+  if (g === 'atp' || g === 'wta') return true;
+  for (var i = 0; i < OWLS_TENNIS_TAB_KEYS.length; i++) {
+    var short = OWLS_TENNIS_TAB_KEYS[i];
     var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
     if (g === short || g === full) return true;
   }
@@ -8544,20 +8567,23 @@ function _compareGamesForBoard(a, b) {
 }
 
 // Project ALL Owls cache games matching a sport key into the flat shape.
-// For sport=soccer, combine every soccer league in OWLS_SOCCER_TAB_KEYS (and
-// any other soccer_* keys present in cache).
+// For sport=soccer, combine the soccer feed (and any soccer_* keys in cache).
+// For sport=tennis, combine the tennis feed (ATP/WTA share Owls path `tennis`).
 function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
   var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
   if (!cache || !Array.isArray(cache.games) || !cache.games.length) return [];
   var short = String(requestedSport||'').toLowerCase();
   var full  = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
   var combineSoccer = (short === 'soccer');
+  var combineTennis = (short === 'tennis');
   var out = [];
   var seenIds = {};
   for (var i = 0; i < cache.games.length; i++) {
     var g = cache.games[i];
     if (combineSoccer) {
       if (!_isSoccerCacheSportKey(g.sport_key)) continue;
+    } else if (combineTennis) {
+      if (!_isTennisCacheSportKey(g.sport_key)) continue;
     } else if (!_isMatchingSport(g.sport_key, short, full)) {
       continue;
     }
@@ -8588,6 +8614,9 @@ app.get('/api/odds/:sport', async (req, res) => {
     if (sportShort === 'soccer') {
       res.setHeader('X-Soccer-Leagues', OWLS_SOCCER_TAB_KEYS.join(','));
     }
+    if (sportShort === 'tennis') {
+      res.setHeader('X-Tennis-Keys', OWLS_TENNIS_TAB_KEYS.join(','));
+    }
     if (cache && cache.updatedAt) {
       res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
     }
@@ -8596,6 +8625,7 @@ app.get('/api/odds/:sport', async (req, res) => {
     console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+
       ' live='+flat.filter(function(g){return g.status==='live';}).length+
       (sportShort === 'soccer' ? ' leagues='+OWLS_SOCCER_TAB_KEYS.join('+') : '')+
+      (sportShort === 'tennis' ? ' keys='+OWLS_TENNIS_TAB_KEYS.join('+') : '')+
       ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
     return res.json(flat.slice(0, 50));
   }
@@ -9476,6 +9506,12 @@ app.get('/api/sports', (req, res) => {
       ODDS_PROVIDER === 'owls_insight') {
     enabledSet.soccer = true;
   }
+  // Unified tennis tab (Owls path key `tennis` covers ATP/WTA).
+  if (enabledSet.tennis || OWLS_TENNIS_TAB_KEYS.some(function(k){ return !!enabledSet[k]; }) ||
+      enabledSet.tennis_atp || enabledSet.tennis_wta ||
+      ODDS_PROVIDER === 'owls_insight') {
+    enabledSet.tennis = true;
+  }
   // Roll league game counts into the unified soccer tab for lobby badges.
   const soccerRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
   for (let si = 0; si < OWLS_SOCCER_TAB_KEYS.length; si++) {
@@ -9500,6 +9536,30 @@ app.get('/api/sports', (req, res) => {
   }
   if (soccerRollup.games > 0 || enabledSet.soccer) {
     counts.soccer = soccerRollup;
+  }
+  // Roll tennis_* cache keys into the unified tennis tab.
+  const tennisRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
+  for (let ti = 0; ti < OWLS_TENNIS_TAB_KEYS.length; ti++) {
+    const tc = counts[OWLS_TENNIS_TAB_KEYS[ti]];
+    if (!tc) continue;
+    tennisRollup.games += tc.games;
+    tennisRollup.markets += tc.markets;
+    tennisRollup.live += tc.live;
+    tennisRollup.upcoming += tc.upcoming;
+    tennisRollup.final += tc.final;
+  }
+  for (const ck in counts) {
+    if (ck === 'tennis' || OWLS_TENNIS_TAB_KEYS.indexOf(ck) >= 0) continue;
+    if (!_isTennisCacheSportKey(ck)) continue;
+    const tc = counts[ck];
+    tennisRollup.games += tc.games;
+    tennisRollup.markets += tc.markets;
+    tennisRollup.live += tc.live;
+    tennisRollup.upcoming += tc.upcoming;
+    tennisRollup.final += tc.final;
+  }
+  if (tennisRollup.games > 0 || enabledSet.tennis) {
+    counts.tennis = tennisRollup;
   }
 
   const allKeys = {};
