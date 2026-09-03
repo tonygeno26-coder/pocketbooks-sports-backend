@@ -14810,6 +14810,112 @@ app.get('/api/admin/audit/:id', async (req, res) => {
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+
+// ══ LEDGER INTEGRITY CHECK (hourly, read-only — never auto-fix) ═══════════════
+async function _runLedgerBalanceCheck(opts) {
+  opts = opts || {};
+  const sb = getSupabase();
+  if (!sb) return { ok:false, error:'supabase_not_configured', results:[] };
+  const clubFilter = opts.clubId || null;
+  let mq = sb.from('club_members').select('club_id,player_id,balance_start,status');
+  if (clubFilter) mq = mq.eq('club_id', clubFilter);
+  const { data: members, error: mErr } = await mq;
+  if (mErr) throw mErr;
+  const results = [];
+  let mismatchCount = 0, okCount = 0;
+  for (const m of (members||[])) {
+    const clubId = m.club_id;
+    const playerId = m.player_id;
+    if (!clubId || !playerId) continue;
+    const start = m.balance_start != null ? parseFloat(m.balance_start) : 0;
+    const { data: ledgerRows } = await sb.from('ledger_entries')
+      .select('type,amount,balance_after,created_at')
+      .eq('club_id', clubId).eq('player_id', playerId)
+      .order('created_at', { ascending:true });
+    let placed = 0, won = 0, canceled = 0, other = 0;
+    (ledgerRows||[]).forEach(function(r){
+      const typ = String(r.type||'').toLowerCase();
+      const amt = parseFloat(r.amount)||0;
+      if (typ === 'bet_placed') placed += Math.abs(amt);
+      else if (typ === 'bet_won') won += Math.abs(amt);
+      else if (typ === 'bet_canceled' || typ === 'bet_cancelled') canceled += Math.abs(amt);
+      else other += amt; // signed
+    });
+    // Prompt formula: balance_start + bet_won + bet_canceled - bet_placed
+    // (bet_placed stored negative in ledger_entries; we use abs above)
+    const expectedLedger = Math.round((start + won + canceled - placed + other)*100)/100;
+    const ledgerAvail = _deriveBalanceFromLedgerEntries(start, ledgerRows||[]);
+
+    const { data: tix } = await sb.from('tickets')
+      .select('status,risk_amount,potential_profit')
+      .eq('club_id', clubId).eq('player_id', playerId);
+    let openRisk=0, settledGains=0, settledLosses=0;
+    (tix||[]).forEach(function(t){
+      const s=String(t.status||'').toLowerCase();
+      const r=parseFloat(t.risk_amount)||0;
+      const p=parseFloat(t.potential_profit)||0;
+      if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
+      if (s==='active'||s==='open') openRisk+=r;
+      else if (s==='won') settledGains+=p;
+      else if (s==='lost') settledLosses+=r;
+    });
+    const derivedTickets = Math.round((start - openRisk - settledLosses + settledGains)*100)/100;
+    const compareTo = ledgerAvail != null ? ledgerAvail : expectedLedger;
+    const diff = Math.round((compareTo - derivedTickets)*100)/100;
+    const status = Math.abs(diff) > 0.01 ? 'MISMATCH' : 'OK';
+    if (status === 'MISMATCH') mismatchCount++; else okCount++;
+    console.log('[balance-check] player='+playerId
+      +' expected_ledger='+compareTo.toFixed(2)
+      +' derived_tickets='+derivedTickets.toFixed(2)
+      +' diff='+diff.toFixed(2)
+      +' STATUS='+status);
+    results.push({
+      clubId, playerId, balanceStart: start,
+      expectedLedger: compareTo, ledgerFromEntries: ledgerAvail,
+      derivedTickets, diff, status,
+      components: { placed, won, canceled, other, openRisk, settledGains, settledLosses },
+      ledgerEntryCount: (ledgerRows||[]).length
+    });
+  }
+  return {
+    ok: true,
+    checkedAt: new Date().toISOString(),
+    playerCount: results.length,
+    okCount, mismatchCount,
+    results
+  };
+}
+
+async function _balanceCheckTick() {
+  try {
+    const r = await _runLedgerBalanceCheck();
+    console.log('[balance-check] hourly complete players='+(r.playerCount||0)
+      +' ok='+(r.okCount||0)+' mismatch='+(r.mismatchCount||0));
+  } catch(e) {
+    console.error('[balance-check] hourly failed:', e.message||e);
+  }
+}
+
+function _startHourlyBalanceCheck() {
+  const HOUR_MS = 60 * 60 * 1000;
+  console.log('[balance-check] scheduling hourly ledger integrity check');
+  setInterval(function(){ _balanceCheckTick(); }, HOUR_MS);
+  // First run ~90s after boot so boot traffic settles
+  setTimeout(function(){ _balanceCheckTick(); }, 90000);
+}
+
+// GET /api/admin/balance-check — on-demand read-only integrity check
+app.get('/api/admin/balance-check', async (req, res) => {
+  try {
+    const clubId = (req.query && req.query.clubId) || null;
+    const report = await _runLedgerBalanceCheck({ clubId });
+    res.json(report);
+  } catch(e) {
+    console.error('[balance-check] on-demand error:', e.message||e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 try {
   require('./admin-diamonds-routes')({
     app, requireActor, ROLE_RANK, getSupabase, _getWeekStart,
@@ -14846,6 +14952,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log('╚══════════════════════════════════════════════════╝\n');
   console.log(`✅ Server running on port ${PORT}`);
   _startCryptoScanner();
+  _startHourlyBalanceCheck();
   telegramBot.startTelegramBot();
   dailyAudit.startScheduler({ getSupabase: getSupabase });
   _startSurvivorAutoGrade();
