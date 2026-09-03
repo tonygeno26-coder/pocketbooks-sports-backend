@@ -4889,7 +4889,7 @@ function _ledgerId(eventType) {
   return 'LE_'+eventType.slice(0,4)+'_'+Date.now()+'_'+_crypto.randomBytes(4).toString('hex');
 }
 
-// Derive ledger balance from rows
+// Derive ledger balance from rows (canonical `ledger` table: credit/debit directions)
 function _deriveLedgerBalance(startingLimit, rows) {
   let bal = parseFloat(startingLimit)||0;
   (rows||[]).forEach(function(r) {
@@ -4897,6 +4897,26 @@ function _deriveLedgerBalance(startingLimit, rows) {
     if (r.direction==='credit') bal+=amt;
     else if (r.direction==='debit') bal-=amt;
   });
+  return Math.round(bal*100)/100;
+}
+
+// Derive available balance from mirror `ledger_entries` (signed amounts + balance_after).
+// Risk is debited at bet_placed, so the latest balance_after IS available (includes open risk).
+function _deriveBalanceFromLedgerEntries(startingBalance, entries) {
+  const rows = (entries||[]).slice().sort(function(a,b){
+    return new Date(a.created_at||0).getTime() - new Date(b.created_at||0).getTime();
+  });
+  if (!rows.length) {
+    return startingBalance != null && !isNaN(parseFloat(startingBalance))
+      ? Math.round(parseFloat(startingBalance)*100)/100
+      : null;
+  }
+  const last = rows[rows.length-1];
+  if (last && last.balance_after != null && !isNaN(parseFloat(last.balance_after))) {
+    return Math.round(parseFloat(last.balance_after)*100)/100;
+  }
+  let bal = parseFloat(startingBalance)||0;
+  rows.forEach(function(r){ bal += parseFloat(r.amount)||0; });
   return Math.round(bal*100)/100;
 }
 
@@ -12060,13 +12080,25 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       else if (s==='won')  settledGains+=p;
       else if (s==='lost') settledLosses+=r;
     });
-    // Formula: club_members.balance_start + settled_gains - open_risk - settled_losses
-    // NOTE: ledger adjustments (BALANCE_ADJUSTMENT, WEEKLY_ROLLOVER, SETTLEMENT_APPLIED)
-    // are not included here — tracked as RISK-4 follow-up (requires ledger balance view).
+    // Prefer ledger_entries as source of truth (signed amounts / balance_after).
+    // Ticket formula is fallback when no ledger rows exist yet.
+    var ticketAvailable = rnd(startBal - openRisk - settledLosses + settledGains);
+    var available = ticketAvailable;
+    try {
+      var { data: _preLedger } = await sb.from('ledger_entries')
+        .select('amount,balance_after,created_at')
+        .eq('club_id', clubId).eq('player_id', playerId)
+        .order('created_at', { ascending:true });
+      if (_preLedger && _preLedger.length) {
+        var ledAvail = _deriveBalanceFromLedgerEntries(startBal, _preLedger);
+        if (ledAvail != null) available = ledAvail;
+      }
+    } catch(_preLedErr) {
+      console.warn('[bets/place] ledger precheck fallback to tickets:', _preLedErr.message);
+    }
     // The RPC re-checks atomically; this precheck is informational early rejection only.
-    var available = rnd(startBal - openRisk - settledLosses + settledGains);
     if (stakeAmt > available + 0.005)
-      return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt });
+      return res.status(400).json({ ok:false, error:'insufficient_balance', available, stake:stakeAmt, ticketAvailable });
 
     // 3. Phase K: snapshot-based odds verification + server payout recalculation
     const nowMs = Date.now();
@@ -12881,7 +12913,7 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
     } catch(_e) { console.warn('[player/summary] club_members balance fetch error:', _e.message); }
     if (startingBalance === null) console.warn('[player/summary] no club_members row for player='+playerId+' club='+clubId+' — balance shown as null');
 
-    // Derive balance
+    // Ticket-derived components (breakdown + fallback)
     var openRisk=0, settledGains=0, settledLosses=0;
     var active=[], settled=[], canceled=[];
     var warnings = [];
@@ -12894,7 +12926,38 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
       else if (s==='lost')            { settledLosses+=r; settled.push(t); }
       else if (s==='push'||s==='pushed') { settled.push(t); } // push: no net change
     });
-    var available = startingBalance !== null ? rnd(startingBalance - openRisk - settledLosses + settledGains) : null;
+    var ticketAvailable = startingBalance !== null
+      ? rnd(startingBalance - openRisk - settledLosses + settledGains)
+      : null;
+
+    // Ledger is source of truth (ledger_entries: risk debited at place).
+    var ledgerAvailable = null;
+    var ledgerEntryCount = 0;
+    try {
+      var lq = sb.from('ledger_entries')
+        .select('id,type,amount,balance_before,balance_after,created_at,ticket_id')
+        .eq('player_id', playerId)
+        .order('created_at', { ascending:true });
+      if (clubId) lq = lq.eq('club_id', clubId);
+      var { data: ledgerRows, error: lErr } = await lq;
+      if (lErr) throw lErr;
+      ledgerEntryCount = (ledgerRows||[]).length;
+      if (ledgerEntryCount > 0) {
+        ledgerAvailable = _deriveBalanceFromLedgerEntries(startingBalance, ledgerRows);
+      }
+    } catch(_le) {
+      console.warn('[player/dashboard] ledger_entries fetch error:', _le.message||_le);
+      warnings.push('ledger_fetch_error');
+    }
+
+    var available = ledgerAvailable != null ? ledgerAvailable : ticketAvailable;
+    var balanceSource = ledgerAvailable != null ? 'ledger' : 'tickets';
+    if (ledgerAvailable != null && ticketAvailable != null &&
+        Math.abs(ledgerAvailable - ticketAvailable) > 0.01) {
+      warnings.push('ticket_ledger_mismatch:ticket='+ticketAvailable+',ledger='+ledgerAvailable);
+      console.warn('[player/dashboard] MISMATCH player='+playerId+
+        ' ticket='+ticketAvailable+' ledger='+ledgerAvailable+' — using ledger');
+    }
     if (available !== null && available<0) warnings.push('available_negative:'+available);
     if (startingBalance === null) warnings.push('missing_balance_start');
 
@@ -12925,7 +12988,11 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
         settledGains: rnd(settledGains),
         settledLosses: rnd(settledLosses),
         pendingPayouts: rnd(openRisk),
-        refunds: 0  // push handled via openRisk exclusion
+        refunds: 0,  // push handled via openRisk exclusion
+        source: balanceSource,
+        ticketAvailable: ticketAvailable,
+        ledgerAvailable: ledgerAvailable,
+        ledgerEntryCount: ledgerEntryCount
       },
       tickets: {
         active,
