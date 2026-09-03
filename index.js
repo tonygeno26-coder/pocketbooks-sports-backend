@@ -12080,8 +12080,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
             balance_after: balBefore,
             reason: 'weekly_rollover:'+week,
             created_at: performedAt,
-            created_by: performedBy||'host',
-            settlement_week: week
+            created_by: performedBy||'host'
           }, { onConflict: 'id' });
         } catch(_se) {
           console.warn('[weekly-rollover] SETTLEMENT_APPLIED write failed player='+p.playerId+':', _se.message||_se);
