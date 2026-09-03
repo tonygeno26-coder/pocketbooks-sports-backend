@@ -8599,11 +8599,36 @@ const PROPS_SUPPORTED_SPORTS = ['mlb', 'nba', 'nfl', 'nhl', 'ncaab', 'ncaaf', 'w
 const _PROPS_DISPLAY_BOOKS = ['draftkings', 'fanduel', 'betmgm'];
 const _PROPS_EXCLUDED_BOOKS = ['pinnacle'];
 const _PROPS_MAX_ABS_ODDS = 1000;
+// Discrete allowed lines (exact match). MLB keep tight; NFL counting stats are
+// generous so mainstream books' half-points aren't wiped. Yardage uses ranges
+// below — a fixed whitelist would drop nearly every NFL prop.
 const _PROPS_ALLOWED_LINES_BY_CATEGORY = {
+  // MLB
   'Hits': [0.5, 1.5, 2.5],
   'Strikeouts': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
   'Home Runs': [0.5],
-  'RBIs': [0.5, 1.5, 2.5]
+  'RBIs': [0.5, 1.5, 2.5],
+  // NFL / NCAAF counting stats
+  'Passing TDs': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
+  'Rushing TDs': [0.5, 1.5, 2.5, 3.5],
+  'Receiving TDs': [0.5, 1.5, 2.5, 3.5],
+  'Anytime TD': [0.5],
+  'Receptions': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5],
+  'Pass Completions': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
+    11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5,
+    26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5],
+  'Pass Attempts': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
+    11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5,
+    26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5,
+    41.5, 42.5, 43.5, 44.5, 45.5, 46.5, 47.5, 48.5, 49.5, 50.5, 51.5, 52.5, 53.5, 54.5, 55.5],
+  'Interceptions Thrown': [0.5, 1.5, 2.5, 3.5],
+  'Sacks': [0.5, 1.5, 2.5, 3.5, 4.5]
+};
+// Continuous NFL yardage — accept any half-point in a sensible range.
+const _PROPS_LINE_RANGES_BY_CATEGORY = {
+  'Passing Yards': { min: 0.5, max: 499.5 },
+  'Rushing Yards': { min: 0.5, max: 249.5 },
+  'Receiving Yards': { min: 0.5, max: 249.5 }
 };
 const _OWLS_PROP_CATEGORY_LABELS = {
   hits: 'Hits', runs: 'Runs Scored', rbis: 'RBIs', home_runs: 'Home Runs',
@@ -8616,9 +8641,17 @@ const _OWLS_PROP_CATEGORY_LABELS = {
   pts_rebs: 'Pts + Reb', pts_asts: 'Pts + Ast', rebs_asts: 'Reb + Ast',
   pts_rebs_asts: 'Pts + Reb + Ast',
   passing_yards: 'Passing Yards', passing_tds: 'Passing TDs',
+  pass_yards: 'Passing Yards', pass_tds: 'Passing TDs',
+  pass_completions: 'Pass Completions', completions: 'Pass Completions',
+  pass_attempts: 'Pass Attempts', attempts: 'Pass Attempts',
+  pass_interceptions: 'Interceptions Thrown', interceptions: 'Interceptions Thrown',
   rushing_yards: 'Rushing Yards', rushing_tds: 'Rushing TDs',
-  receiving_yards: 'Receiving Yards', receptions: 'Receptions',
-  touchdowns: 'Anytime TD',
+  rush_yards: 'Rushing Yards', rush_tds: 'Rushing TDs',
+  receiving_yards: 'Receiving Yards', reception_yards: 'Receiving Yards',
+  receiving_tds: 'Receiving TDs', reception_tds: 'Receiving TDs',
+  receptions: 'Receptions',
+  touchdowns: 'Anytime TD', anytime_td: 'Anytime TD',
+  sacks: 'Sacks', player_sacks: 'Sacks',
   goals: 'Goals', hockey_assists: 'Assists', hockey_points: 'Points',
   shots_on_goal: 'Shots on Goal'
 };
@@ -8646,20 +8679,55 @@ function _betterAmericanOdds(a, b) {
 
 function _propLineCategory(propType) {
   var t = String(propType || '').trim();
+  // ----- MLB (exact / narrow — must not match NFL labels) -----
   if (t === 'Hits' || /to record a hit/i.test(t)) return 'Hits';
-  if (t === 'Strikeouts' || /strikeout/i.test(t)) return 'Strikeouts';
-  if (t === 'Home Runs' || /home run/i.test(t)) return 'Home Runs';
-  if (t === 'RBIs' || /\brbi/i.test(t)) return 'RBIs';
+  if (t === 'Strikeouts' || /^pitcher\s+strikeouts$/i.test(t) || /\bstrikeouts?\b/i.test(t)) {
+    // Guard: only treat as MLB Ks when it looks like a pitching/batter K market
+    if (/pass|rush|receiv|sack|yard|completion|attempt|td|touchdown/i.test(t)) return null;
+    return 'Strikeouts';
+  }
+  if (t === 'Home Runs' || /home\s*runs?/i.test(t)) return 'Home Runs';
+  if (t === 'RBIs' || /\brbis?\b/i.test(t)) return 'RBIs';
+  // ----- NFL / NCAAF -----
+  if (t === 'Passing Yards' || /passing\s*yards?/i.test(t) || /pass\s*yards?/i.test(t)) return 'Passing Yards';
+  if (t === 'Rushing Yards' || /rushing\s*yards?/i.test(t) || /rush\s*yards?/i.test(t)) return 'Rushing Yards';
+  if (t === 'Receiving Yards' || /receiving\s*yards?/i.test(t) || /reception\s*yards?/i.test(t)) return 'Receiving Yards';
+  if (t === 'Passing TDs' || /passing\s*t(?:d|ouchdown)s?/i.test(t) || /pass\s*t(?:d|ouchdown)s?/i.test(t)) return 'Passing TDs';
+  if (t === 'Rushing TDs' || /rushing\s*t(?:d|ouchdown)s?/i.test(t) || /rush\s*t(?:d|ouchdown)s?/i.test(t)) return 'Rushing TDs';
+  if (t === 'Receiving TDs' || /receiving\s*t(?:d|ouchdown)s?/i.test(t) || /reception\s*t(?:d|ouchdown)s?/i.test(t)) return 'Receiving TDs';
+  if (t === 'Anytime TD' || /anytime\s*t(?:d|ouchdown)/i.test(t)) return 'Anytime TD';
+  if (t === 'Receptions' || /^receptions$/i.test(t)) return 'Receptions';
+  if (t === 'Pass Completions' || /pass\s*completions?/i.test(t) || /^completions$/i.test(t)) return 'Pass Completions';
+  if (t === 'Pass Attempts' || /pass\s*attempts?/i.test(t) || /^attempts$/i.test(t)) return 'Pass Attempts';
+  if (t === 'Interceptions Thrown' || /interceptions?\s*(thrown)?$/i.test(t)) return 'Interceptions Thrown';
+  if (t === 'Sacks' || /^sacks?$/i.test(t)) return 'Sacks';
   return null;
+}
+
+function _isHalfPointLine(line) {
+  // Books almost always post .5 lines for O/U props; allow integers too.
+  return Number.isFinite(line) && (Math.abs(line * 2) % 1 < 1e-9);
 }
 
 function _isAllowedPropLine(propType, line) {
   if (typeof line !== 'number' || isNaN(line)) return false;
   var cat = _propLineCategory(propType);
+  // Unknown categories: keep (do not let MLB-only rules wipe NFL/NBA/etc.).
   if (!cat) return true;
   var allowed = _PROPS_ALLOWED_LINES_BY_CATEGORY[cat];
-  if (!allowed) return true;
-  return allowed.indexOf(line) >= 0;
+  if (allowed) return allowed.indexOf(line) >= 0;
+  var range = _PROPS_LINE_RANGES_BY_CATEGORY[cat];
+  if (range) {
+    if (line < range.min || line > range.max) return false;
+    return _isHalfPointLine(line);
+  }
+  return true;
+}
+
+function _normalizePropsSportParam(sport) {
+  var s = String(sport || '').toLowerCase();
+  var mapped = _mapToOwlsSport(s);
+  return mapped || s;
 }
 
 function _selectMainstreamPropBooks(books) {
@@ -8917,7 +8985,7 @@ function _filterPropsByTeams(props, home, away) {
 }
 
 app.get('/api/props/:sport', async function(req, res) {
-  var sport = String(req.params.sport || '').toLowerCase();
+  var sport = _normalizePropsSportParam(req.params.sport);
   if (PROPS_SUPPORTED_SPORTS.indexOf(sport) < 0) {
     return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
   }
@@ -9071,7 +9139,7 @@ async function _collectSplitsForSport(sportShort) {
 }
 
 app.get('/api/splits/:sport', async function(req, res) {
-  var sport = String(req.params.sport || '').toLowerCase();
+  var sport = _normalizePropsSportParam(req.params.sport);
   var now = Date.now();
   var cached = _SPLITS_RESPONSE_CACHE[sport];
   if (cached && (now - cached.at) < SPLITS_CACHE_TTL_MS) {
@@ -9167,7 +9235,7 @@ function _normalizeOwlsEvResponse(owlsData, sportKey) {
 }
 
 app.get('/api/value-bets/:sport', async function(req, res) {
-  var sport = String(req.params.sport || '').toLowerCase();
+  var sport = _normalizePropsSportParam(req.params.sport);
   var minEv = parseFloat(req.query.min_ev || req.query.minEv || '0') || 0;
   var now = Date.now();
   var cacheKey = sport + ':' + minEv;
