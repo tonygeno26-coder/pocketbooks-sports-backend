@@ -8973,14 +8973,60 @@ function _normalizeTeamNameForPropsMatch(name) {
   return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+/** Case-insensitive exact or partial team name match. Empty query = no constraint. */
+function _propsTeamNameMatches(query, candidate) {
+  var q = _normalizeTeamNameForPropsMatch(query);
+  if (!q) return true;
+  var c = _normalizeTeamNameForPropsMatch(candidate);
+  if (!c) return false;
+  return c === q || c.indexOf(q) >= 0 || q.indexOf(c) >= 0;
+}
+
+/**
+ * Parse teams from prop gameId forms like:
+ *   mlb:Boston Red Sox@Baltimore Orioles-20260903
+ *   Boston Red Sox@Baltimore Orioles-20260903
+ * Returns { away, home } or null.
+ */
+function _parseTeamsFromPropGameId(gameId) {
+  var s = String(gameId || '').trim();
+  if (!s || s.indexOf('@') < 0) return null;
+  var body = s;
+  var colon = body.indexOf(':');
+  if (colon >= 0) body = body.slice(colon + 1);
+  var at = body.indexOf('@');
+  if (at < 0) return null;
+  var away = body.slice(0, at).trim();
+  var homePart = body.slice(at + 1).trim();
+  var dateSuffix = homePart.match(/^(.*)-(\d{8})$/);
+  var home = (dateSuffix ? dateSuffix[1] : homePart).trim();
+  if (!home || !away) return null;
+  return { home: home, away: away };
+}
+
+function _propHomeAwayTeams(p) {
+  var home = p && p.home;
+  var away = p && p.away;
+  if (home && away) return { home: home, away: away };
+  var parsed = _parseTeamsFromPropGameId(
+    (p && (p.gameId || p.providerGameId || p.canonicalGameKey)) || ''
+  );
+  if (!parsed) return { home: home || '', away: away || '' };
+  return {
+    home: home || parsed.home,
+    away: away || parsed.away
+  };
+}
+
 function _filterPropsByTeams(props, home, away) {
-  var h = _normalizeTeamNameForPropsMatch(home);
-  var a = _normalizeTeamNameForPropsMatch(away);
-  if (!h || !a) return [];
+  var h = home != null && String(home).trim() !== '' ? String(home) : '';
+  var a = away != null && String(away).trim() !== '' ? String(away) : '';
+  if (!h && !a) return props || [];
   return (props || []).filter(function(p) {
     if (!p) return false;
-    return _normalizeTeamNameForPropsMatch(p.home) === h
-      && _normalizeTeamNameForPropsMatch(p.away) === a;
+    var teams = _propHomeAwayTeams(p);
+    return _propsTeamNameMatches(h, teams.home)
+      && _propsTeamNameMatches(a, teams.away);
   });
 }
 
@@ -9026,11 +9072,17 @@ app.get('/api/props/:sport', async function(req, res) {
       }
     };
   }
-  var outProps = gameId ? _filterPropsByGameId(fullProps, gameId) : fullProps;
-  var filterMode = gameId ? 'gameId' : null;
-  if (gameId && outProps.length === 0 && homeTeam && awayTeam) {
+  // Prefer gameId when present; fall back to home/away whenever teams are
+  // provided (including when gameId is absent or matches nothing).
+  var outProps = fullProps;
+  var filterMode = null;
+  if (gameId) {
+    outProps = _filterPropsByGameId(fullProps, gameId);
+    filterMode = 'gameId';
+  }
+  if ((homeTeam || awayTeam) && (!gameId || outProps.length === 0)) {
     outProps = _filterPropsByTeams(fullProps, homeTeam, awayTeam);
-    if (outProps.length) filterMode = 'teams';
+    filterMode = 'teams';
   }
   var data = {
     ok: true,
@@ -9044,11 +9096,12 @@ app.get('/api/props/:sport', async function(req, res) {
     data.gameId = gameId;
     data.filtered = true;
   }
-  if (filterMode === 'teams') {
-    data.filterMode = 'teams';
+  if (homeTeam || awayTeam) {
     data.home = homeTeam;
     data.away = awayTeam;
+    data.filtered = true;
   }
+  if (filterMode) data.filterMode = filterMode;
   res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
