@@ -11620,6 +11620,41 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
 });
 // ────────────────────────────────────────────────────────────────────────────
 
+
+// Last SETTLEMENT_APPLIED / settlement / weekly rollover marker per player (cutoff for weekly nets)
+async function _loadSettlementCutoffs(sb, clubId, playerIds) {
+  const map = {}; // playerId -> ISO timestamp ms
+  if (!sb || !(playerIds||[]).length) return map;
+  try {
+    const { data: rows } = await sb.from('ledger_entries')
+      .select('player_id,type,created_at')
+      .eq('club_id', clubId)
+      .in('player_id', playerIds)
+      .in('type', ['settlement','SETTLEMENT_APPLIED','weekly_rollover','WEEKLY_ROLLOVER']);
+    (rows||[]).forEach(function(r){
+      const pid = String(r.player_id||'');
+      const ms = new Date(r.created_at||0).getTime();
+      if (!pid || !ms) return;
+      if (!map[pid] || ms > map[pid]) map[pid] = ms;
+    });
+  } catch(_e) {
+    console.warn('[settlement-cutoff] ledger_entries read failed:', _e.message||_e);
+  }
+  try {
+    const { data: rolls } = await sb.from('weekly_rollovers')
+      .select('performed_at').eq('club_id', clubId)
+      .order('performed_at', { ascending:false }).limit(1);
+    if (rolls && rolls[0] && rolls[0].performed_at) {
+      const rms = new Date(rolls[0].performed_at).getTime();
+      playerIds.forEach(function(pid){
+        const k = String(pid);
+        if (!map[k] || rms > map[k]) map[k] = rms;
+      });
+    }
+  } catch(_e2) {}
+  return map;
+}
+
 // GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
 app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
@@ -11629,7 +11664,7 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
   try {
     // Load all tickets for this club
     let tq = sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,type');
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at,type');
     if (clubId) tq = tq.eq('club_id', clubId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
@@ -11667,8 +11702,13 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
 
     function rnd(v){ return Math.round((isNaN(v)?0:v)*100)/100; }
 
+    // Ensure roster players appear even with zero tickets
+    Object.keys(memberMap).forEach(function(pid){ getOrCreate(pid, pid); });
+
+    var cutoffMap = await _loadSettlementCutoffs(sb, clubId, Object.keys(byPlayer).concat(Object.keys(memberMap)));
+
     (tickets||[]).forEach(function(t) {
-      var pid  = t.player_id || 'unknown';
+      var pid  = String(t.player_id || 'unknown');
       var s    = (t.status||'').toLowerCase();
       var risk = parseFloat(t.risk_amount)||0;
       var prof = parseFloat(t.potential_profit)||0;
@@ -11676,16 +11716,49 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       var pMs  = t.placed_at ? new Date(t.placed_at).getTime() : 0;
       if (pMs && (!p.lastTicketAt || pMs > new Date(p.lastTicketAt).getTime())) p.lastTicketAt = t.placed_at;
       if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
-      if (s==='active'||s==='open')  { p.openRisk   += risk; }
-      else if (s==='won')             { p.settledNet += prof; }
-      else if (s==='lost')            { p.settledNet -= risk; }
+      if (s==='active'||s==='open')  { p.openRisk   += risk; return; }
+      // Settled nets only count AFTER last SETTLEMENT_APPLIED cutoff (no double-count)
+      var cut = cutoffMap[pid] || 0;
+      var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
+      if (cut && gradeMs && gradeMs <= cut) return;
+      if (s==='won')             { p.settledNet += prof; }
+      else if (s==='lost')       { p.settledNet -= risk; }
     });
+
+    // Ledger-derived current balances
+    var ledgerBalByPid = {};
+    try {
+      var allPids = Object.keys(byPlayer);
+      if (allPids.length) {
+        const { data: ledRows } = await sb.from('ledger_entries')
+          .select('player_id,amount,balance_after,created_at,type')
+          .eq('club_id', clubId).in('player_id', allPids)
+          .order('created_at', { ascending:true });
+        var byLed = {};
+        (ledRows||[]).forEach(function(r){
+          var pid=String(r.player_id||'');
+          if (!byLed[pid]) byLed[pid]=[];
+          byLed[pid].push(r);
+        });
+        allPids.forEach(function(pid){
+          var start = (memberMap[pid]&&memberMap[pid].balance_start!=null) ? memberMap[pid].balance_start : 0;
+          ledgerBalByPid[pid] = _deriveBalanceFromLedgerEntries(start, byLed[pid]||[]);
+        });
+      }
+    } catch(_lb) { console.warn('[settlements-preview] ledger balance error:', _lb.message); }
 
     Object.values(byPlayer).forEach(function(p) {
       p.settledNet = rnd(p.settledNet);
       p.openRisk   = rnd(p.openRisk);
       if (p.settledNet < 0) { p.owesHost = rnd(Math.abs(p.settledNet)); p.hostOwes = 0; }
       else                  { p.hostOwes = rnd(p.settledNet); p.owesHost = 0; }
+      var start = (memberMap[p.playerId]&&memberMap[p.playerId].balance_start!=null)
+        ? rnd(memberMap[p.playerId].balance_start) : null;
+      p.startingBalance = start;
+      p.currentBalance = ledgerBalByPid[p.playerId] != null ? rnd(ledgerBalByPid[p.playerId]) : start;
+      // Next week starts from current available balance (open risk already held in ledger)
+      p.startingBalanceNextWeek = p.currentBalance;
+      p.settlementCutoffAt = cutoffMap[p.playerId] ? new Date(cutoffMap[p.playerId]).toISOString() : null;
     });
 
     var players = Object.values(byPlayer).sort(function(a,b){ return (b.owesHost+b.hostOwes)-(a.owesHost+a.hostOwes); });
@@ -11876,7 +11949,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
 
     // 2. Load current tickets for settlement preview
     const { data: tickets } = await sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at')
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at')
       .eq('club_id', clubId);
 
     // 2b. Load player starting balances from club_members (PL-3 fix).
@@ -11899,13 +11972,19 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       return byPlayer[pid];
     }
     var rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+    var _rollCutoffs = await _loadSettlementCutoffs(sb, clubId,
+      Array.from(new Set((tickets||[]).map(function(t){ return String(t.player_id||''); }).filter(Boolean)
+        .concat(Object.keys(balMap))));
     (tickets||[]).forEach(function(t) {
       var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
       var pl = goc(t.player_id, t.player_username);
       if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
-      if (s==='active'||s==='open')  { pl.openRisk+=r; pl.activeBetCount++; }
-      else if (s==='lost')            { pl.settledNet-=r; }
-      else if (s==='won')             { pl.settledNet+=p; }
+      if (s==='active'||s==='open')  { pl.openRisk+=r; pl.activeBetCount++; return; }
+      var cut = _rollCutoffs[String(t.player_id)] || 0;
+      var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
+      if (cut && gradeMs && gradeMs <= cut) return;
+      if (s==='lost')            { pl.settledNet-=r; }
+      else if (s==='won')        { pl.settledNet+=p; }
     });
     Object.values(byPlayer).forEach(function(pl) {
       var net=pl.settledNet;
@@ -11980,6 +12059,33 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
             p_created_by:       performedBy||'host'
           });
         } catch(_e) { /* non-fatal: snapshot already exists */ }
+      }));
+
+      // Mirror SETTLEMENT_APPLIED into ledger_entries (cutoff marker; never double-count next week)
+      await Promise.all(players.map(async function(p) {
+        try {
+          var netAmt = rnd((p.hostOwes||0) - (p.owesHost||0)); // + host owes player
+          var entryId = 'SETTLEMENT_APPLIED_'+clubId+'_'+week+'_'+p.playerId;
+          var startBal = balMap[String(p.playerId)];
+          var balBefore = startBal != null ? startBal : null;
+          // Settlement records cash settlement of weekly net; available bankroll unchanged
+          // until cash moves — amount is signed net for audit/cutoff, balance_after unchanged.
+          await sb.from('ledger_entries').upsert({
+            id: entryId,
+            club_id: clubId,
+            player_id: p.playerId,
+            type: 'SETTLEMENT_APPLIED',
+            amount: netAmt,
+            balance_before: balBefore,
+            balance_after: balBefore,
+            reason: 'weekly_rollover:'+week,
+            created_at: performedAt,
+            created_by: performedBy||'host',
+            settlement_week: week
+          }, { onConflict: 'id' });
+        } catch(_se) {
+          console.warn('[weekly-rollover] SETTLEMENT_APPLIED write failed player='+p.playerId+':', _se.message||_se);
+        }
       }));
     }
 
