@@ -11974,7 +11974,7 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
     var rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
     var _rollCutoffs = await _loadSettlementCutoffs(sb, clubId,
       Array.from(new Set((tickets||[]).map(function(t){ return String(t.player_id||''); }).filter(Boolean)
-        .concat(Object.keys(balMap))));
+        .concat(Object.keys(balMap)))));
     (tickets||[]).forEach(function(t) {
       var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
       var pl = goc(t.player_id, t.player_username);
