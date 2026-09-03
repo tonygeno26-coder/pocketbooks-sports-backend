@@ -11520,23 +11520,65 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     console.log('[host/dashboard] playersOut='+players.length
       + ' names='+players.map(function(p){ return p.username; }).join(','));
 
-    const settledHandle = handle - activeRisk;
-    const profit        = rnd(settledGain - settledLoss);
+    // Players Owe You = lost stakes (settledGain); You Owe Players = won profits (settledLoss)
+    const playersOweAll = rnd(settledGain);
+    const hostOwesAll   = rnd(settledLoss);
+    const settledHandle = rnd(handle - activeRisk);
+    const profit        = rnd(playersOweAll - hostOwesAll);
     const holdPct       = settledHandle>0 ? rnd(profit/settledHandle*100) : null;
 
+    // Weekly window (ISO Mon 00:00 local-ish UTC Monday)
+    var _wStart = new Date(); _wStart.setUTCHours(0,0,0,0);
+    _wStart.setUTCDate(_wStart.getUTCDate() - ((_wStart.getUTCDay()+6)%7));
+    var _wStartMs = _wStart.getTime();
+    var weekPlayersOwe=0, weekHostOwes=0, weekHandle=0, weekSettledCount=0;
+    (tickets||[]).forEach(function(t){
+      var s=(t.status||'').toLowerCase();
+      if (s!=='won' && s!=='lost') return;
+      var ts=new Date(t.graded_at||t.placed_at||0).getTime();
+      if (!(ts>=_wStartMs)) return;
+      var risk=parseFloat(t.risk_amount)||0;
+      var profitAmt=parseFloat(t.potential_profit)||0;
+      weekHandle+=risk; weekSettledCount++;
+      if (s==='lost') weekPlayersOwe+=risk;
+      else weekHostOwes+=profitAmt;
+    });
+    weekPlayersOwe=rnd(weekPlayersOwe); weekHostOwes=rnd(weekHostOwes);
+    weekHandle=rnd(weekHandle);
+    var weekNet=rnd(weekPlayersOwe-weekHostOwes);
+    var weekHoldPct=weekHandle>0?rnd(weekNet/weekHandle*100):null;
+
     const stats = {
-      handle:         rnd(handle),
+      handle:         settledHandle, // settled handle (risk on won/lost/push)
+      handleAll:      rnd(handle),
       activeRisk:     rnd(activeRisk),
       hostAtRisk:     rnd(hostAtRisk),
       settledGain:    rnd(settledGain),
       settledLoss:    rnd(settledLoss),
-      playersOwe:     rnd(settledLoss),
-      hostOwes:       rnd(settledGain),
+      playersOwe:     playersOweAll,
+      hostOwes:       hostOwesAll,
       profit:         profit,
+      net:            profit,
       holdPct:        holdPct,
       activeBetCount: activeBetCount,
       gradedCount:    gradedCount,
-      canceledCount:  canceledCount
+      canceledCount:  canceledCount,
+      weekly: {
+        playersOwe: weekPlayersOwe,
+        hostOwes: weekHostOwes,
+        net: weekNet,
+        handle: weekHandle,
+        settledCount: weekSettledCount,
+        holdPct: weekHoldPct
+      },
+      allTime: {
+        playersOwe: playersOweAll,
+        hostOwes: hostOwesAll,
+        net: profit,
+        handle: settledHandle,
+        settledCount: gradedCount,
+        holdPct: holdPct
+      }
     };
 
     // Warnings
