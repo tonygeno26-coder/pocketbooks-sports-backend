@@ -3510,17 +3510,18 @@ const OWLS_SPORT_MAP = {
   // ── Motorsports ──
   nascar:'nascar',                      nascar_cup:'nascar',
   formula1:'f1',                        f1:'f1',
-  // ── Soccer (multi-competition; all roll up to 'soccer' for unified-odds path) ──
-  soccer:'soccer',
+  // ── Soccer (multi-competition; /api/odds/soccer combines OWLS_SOCCER_TAB_KEYS) ──
+  // Generic `soccer` is not a real Owls feed — tab leagues are polled individually.
+  soccer:'soccer_epl',
   soccer_epl:'soccer_epl',              epl:'soccer_epl',           premier_league:'soccer_epl',
   soccer_uefa_champs_league:'soccer_ucl', ucl:'soccer_ucl',         champions_league:'soccer_ucl',
   soccer_usa_mls:'soccer_mls',          mls:'soccer_mls',
   soccer_fifa_world_cup:'soccer_worldcup', worldcup:'soccer_worldcup', world_cup:'soccer_worldcup',
   soccer_uefa_european_championship:'soccer_euros', euros:'soccer_euros',
-  soccer_spain_la_liga:'soccer_laliga', laliga:'soccer_laliga',
-  soccer_italy_serie_a:'soccer_seriea', serie_a:'soccer_seriea',
+  soccer_spain_la_liga:'soccer_laliga', laliga:'soccer_laliga',     la_liga:'soccer_laliga',
+  soccer_italy_serie_a:'soccer_seriea', serie_a:'soccer_seriea',    seriea:'soccer_seriea',
   soccer_germany_bundesliga:'soccer_bundesliga', bundesliga:'soccer_bundesliga',
-  soccer_france_ligue_one:'soccer_ligue1', ligue1:'soccer_ligue1',
+  soccer_france_ligue_one:'soccer_ligue1', ligue1:'soccer_ligue1',  ligue_one:'soccer_ligue1',
   // ── Other international team sports ──
   cricket:'cricket',
   cricket_ipl:'cricket_ipl',            ipl:'cricket_ipl',
@@ -3546,11 +3547,24 @@ const OWLS_SPORT_MAP = {
   rocketleague:'rocketleague',          rl:'rocketleague'
 };
 
+// Soccer lobby tab: major leagues fetched from Owls and combined for /api/odds/soccer.
+// Owls path segments (short keys) — aliases like soccer_spain_la_liga map via OWLS_SPORT_MAP.
+const OWLS_SOCCER_TAB_KEYS = [
+  'soccer_epl',
+  'soccer_laliga',
+  'soccer_bundesliga',
+  'soccer_seriea',
+  'soccer_ligue1',
+  'soccer_ucl'
+];
+
 // The exhaustive list of short keys this backend is willing to surface when
-// OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped).
+// OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped), plus
+// the unified `soccer` tab key (not an Owls path — leagues via OWLS_SOCCER_TAB_KEYS).
 const OWLS_ALL_SPORTS = (function(){
   var seen = {}, out = [];
   Object.values(OWLS_SPORT_MAP).forEach(function(v){ if (v && !seen[v]) { seen[v]=true; out.push(v); } });
+  if (!seen.soccer) { seen.soccer = true; out.push('soccer'); }
   return out;
 })();
 
@@ -3592,7 +3606,8 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   ncaab:'basketball_ncaab', ncaaf:'americanfootball_ncaaf', ncaabaseball:'baseball_ncaa',
   mma:'mma_mixed_martial_arts', boxing:'boxing_boxing',
   nascar:'nascar', f1:'formula1',
-  soccer:'soccer',
+  // Generic soccer expands to OWLS_SOCCER_TAB_KEYS in CACHE_SPORTS (not a single feed).
+  soccer:'soccer_epl',
   soccer_epl:'soccer_epl', soccer_ucl:'soccer_uefa_champs_league',
   soccer_mls:'soccer_usa_mls', soccer_worldcup:'soccer_fifa_world_cup',
   soccer_euros:'soccer_uefa_european_championship',
@@ -3605,12 +3620,37 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   table_tennis:'table_tennis',
   cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
-const CACHE_SPORTS = (ODDS_PROVIDER === 'owls_insight')
-  ? OWLS_SAFE_SPORTS.map(function(s){ return _CACHE_SPORT_KEY_BY_SHORT[s] || s; })
-  : _CACHE_SPORTS_BASE;
+// Build Owls poll list: expand `soccer` → tab leagues, and always include those
+// leagues so /api/odds/soccer can serve from cache without Odds API fallback.
+const CACHE_SPORTS = (function() {
+  if (ODDS_PROVIDER !== 'owls_insight') return _CACHE_SPORTS_BASE;
+  var seen = {}, out = [];
+  function addShort(s) {
+    var k = _CACHE_SPORT_KEY_BY_SHORT[s] || s;
+    if (!seen[k]) { seen[k] = true; out.push(k); }
+  }
+  OWLS_SAFE_SPORTS.forEach(function(s) {
+    if (s === 'soccer') OWLS_SOCCER_TAB_KEYS.forEach(addShort);
+    else addShort(s);
+  });
+  OWLS_SOCCER_TAB_KEYS.forEach(addShort);
+  return out;
+})();
 
 function _mapToOwlsSport(key) { return OWLS_SPORT_MAP[key] || null; }
 function _mapSportToOwls(key) { return _mapToOwlsSport(key); }
+
+function _isSoccerCacheSportKey(gameSportKey) {
+  var g = String(gameSportKey || '').toLowerCase();
+  if (!g) return false;
+  if (g === 'soccer' || g.indexOf('soccer_') === 0 || g.indexOf('soccer') === 0) return true;
+  for (var i = 0; i < OWLS_SOCCER_TAB_KEYS.length; i++) {
+    var short = OWLS_SOCCER_TAB_KEYS[i];
+    var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+    if (g === short || g === full) return true;
+  }
+  return false;
+}
 
 // Cache: { "sport:name" -> canonical }
 const _teamNormCache = new Map();
@@ -7639,9 +7679,8 @@ async function pollLiveOddsLoop() {
   const quotaBlocked = _oddsApiQuotaBlocked();
 
   // When cache is critically stale, prefer Odds API refresh (bypasses Owls)
-  // unless quota is exhausted — hammering a dead key keeps lastSuccessAt null
-  // and burns remaining credits.
-  if (criticallyStale && ODDS_KEY && !quotaBlocked) {
+  // unless Owls is the configured provider or quota is exhausted.
+  if (criticallyStale && ODDS_KEY && !quotaBlocked && ODDS_PROVIDER !== 'owls_insight') {
     console.warn('[poll] cache critically stale ageMs='+cacheAgeMs+' — forcing Odds API refresh');
     _oddsApiFallbackLastRun = Date.now();
     await _runOddsApiPoll('cache_stale_recovery');
@@ -7660,6 +7699,9 @@ async function pollLiveOddsLoop() {
     }
     const restResult = await _runOwlsRestPoll('poll_tick');
     if (restResult.ok) return;
+    // When Owls is the configured provider, never fall back to The Odds API
+    // (quota exhausted / empty slate → keep serving Owls cache or empty).
+    if (ODDS_PROVIDER === 'owls_insight') return;
     // Owls failed or returned empty. Fall through to the Odds API path when:
     //   (a) the cache is empty (fresh deploy / first poll), OR
     //   (b) the cache is populated but stale (older than PREGAME_SNAPSHOT_TTL_MS)
@@ -8502,17 +8544,30 @@ function _compareGamesForBoard(a, b) {
 }
 
 // Project ALL Owls cache games matching a sport key into the flat shape.
+// For sport=soccer, combine every soccer league in OWLS_SOCCER_TAB_KEYS (and
+// any other soccer_* keys present in cache).
 function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
   var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
   if (!cache || !Array.isArray(cache.games) || !cache.games.length) return [];
   var short = String(requestedSport||'').toLowerCase();
   var full  = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+  var combineSoccer = (short === 'soccer');
   var out = [];
+  var seenIds = {};
   for (var i = 0; i < cache.games.length; i++) {
     var g = cache.games[i];
-    if (!_isMatchingSport(g.sport_key, short, full)) continue;
+    if (combineSoccer) {
+      if (!_isSoccerCacheSportKey(g.sport_key)) continue;
+    } else if (!_isMatchingSport(g.sport_key, short, full)) {
+      continue;
+    }
     var flat = _projectOwlsGameToFlat(g, sportLabel || short.toUpperCase());
-    if (flat && flat.home && flat.away) out.push(flat);
+    if (flat && flat.home && flat.away) {
+      var dedupe = flat.id || (flat.away+'@'+flat.home+'@'+flat.time);
+      if (seenIds[dedupe]) continue;
+      seenIds[dedupe] = true;
+      out.push(flat);
+    }
   }
   return out;
 }
@@ -8522,12 +8577,17 @@ app.get('/api/odds/:sport', async (req, res) => {
   const sportShort = String(req.params.sport||'').toLowerCase();
   const sport = sportMap[sportShort] || sportShort;
   // ── Owls Insight path: serve from the in-memory cache the poller fills.
+  // Never fall back to The Odds API when Owls is the configured provider
+  // (empty cache → 200 + [] — not 402 from exhausted Odds API quota).
   if (ODDS_PROVIDER === 'owls_insight') {
     const flat = _owlsCacheFlatGamesForSport(sportShort, sportShort.toUpperCase());
     const cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
     res.setHeader('X-Provider',      'owls_insight');
     res.setHeader('X-Source-Status', (cache && cache.sourceStatus) || 'unknown');
     res.setHeader('X-Games-Count',   String(flat.length));
+    if (sportShort === 'soccer') {
+      res.setHeader('X-Soccer-Leagues', OWLS_SOCCER_TAB_KEYS.join(','));
+    }
     if (cache && cache.updatedAt) {
       res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
     }
@@ -8535,25 +8595,11 @@ app.get('/api/odds/:sport', async (req, res) => {
     flat.sort(_compareGamesForBoard);
     console.log('[odds] source=owls-cache sport='+sportShort+' games='+flat.length+
       ' live='+flat.filter(function(g){return g.status==='live';}).length+
+      (sportShort === 'soccer' ? ' leagues='+OWLS_SOCCER_TAB_KEYS.join('+') : '')+
       ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
-    // If Owls cache has no games for this sport but Odds API is configured,
-    // fall back to the Odds API so the lobby never shows "No games available"
-    // when the Owls poller is stale or not covering this sport.
-    if (flat.length === 0 && ODDS_KEY && !_oddsApiQuotaBlocked()) {
-      console.log('[odds] owls-cache empty for sport='+sportShort+' — falling back to odds-api');
-      res.setHeader('X-Provider', 'odds_api_fallback');
-      // fall through to legacy Odds API path below
-    } else {
-      if (flat.length === 0 && _oddsApiQuotaBlocked()) {
-        console.warn('[odds] owls-cache empty and odds-api quota blocked for sport='+sportShort+
-          ' — returning empty slate');
-        res.setHeader('X-Provider', 'owls_insight');
-        res.setHeader('X-Source-Status', 'quota_blocked');
-      }
-      return res.json(flat.slice(0, 50));
-    }
+    return res.json(flat.slice(0, 50));
   }
-  // ── Legacy Odds API path (also serves as Owls fallback when cache is empty) ─
+  // ── Legacy Odds API path (only when ODDS_PROVIDER != owls_insight) ─
   console.log('[odds] source=backend-proxy sport='+req.params.sport+' key_fingerprint='+(ODDS_KEY?ODDS_KEY.slice(0,4)+'...'+ODDS_KEY.slice(-4):'MISSING'));
   try {
     const games = await fetchOdds(sport);
@@ -9424,6 +9470,38 @@ app.get('/api/sports', (req, res) => {
   // still surface so a manually-flipped flag works without code changes.
   const enabledSet = {};
   for (const s of OWLS_ENABLED_SPORTS) enabledSet[s] = true;
+  // Unified soccer tab: treat as enabled when any soccer tab league is enabled,
+  // or when `soccer` itself is listed.
+  if (enabledSet.soccer || OWLS_SOCCER_TAB_KEYS.some(function(k){ return !!enabledSet[k]; }) ||
+      ODDS_PROVIDER === 'owls_insight') {
+    enabledSet.soccer = true;
+  }
+  // Roll league game counts into the unified soccer tab for lobby badges.
+  const soccerRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
+  for (let si = 0; si < OWLS_SOCCER_TAB_KEYS.length; si++) {
+    const sc = counts[OWLS_SOCCER_TAB_KEYS[si]];
+    if (!sc) continue;
+    soccerRollup.games += sc.games;
+    soccerRollup.markets += sc.markets;
+    soccerRollup.live += sc.live;
+    soccerRollup.upcoming += sc.upcoming;
+    soccerRollup.final += sc.final;
+  }
+  // Also count any other soccer_* cache keys (MLS, World Cup, etc.)
+  for (const ck in counts) {
+    if (ck === 'soccer' || OWLS_SOCCER_TAB_KEYS.indexOf(ck) >= 0) continue;
+    if (!_isSoccerCacheSportKey(ck) && String(ck).indexOf('soccer') !== 0) continue;
+    const sc = counts[ck];
+    soccerRollup.games += sc.games;
+    soccerRollup.markets += sc.markets;
+    soccerRollup.live += sc.live;
+    soccerRollup.upcoming += sc.upcoming;
+    soccerRollup.final += sc.final;
+  }
+  if (soccerRollup.games > 0 || enabledSet.soccer) {
+    counts.soccer = soccerRollup;
+  }
+
   const allKeys = {};
   for (const k in enabledSet) allKeys[k] = true;
   for (const k in counts)     allKeys[k] = true;
