@@ -8310,7 +8310,9 @@ app.get('/api/mirror/audit/ledger', async (req, res) => {
 app.get('/api/scores/:sport', async (req, res) => {
   const sportMap = { nfl:'americanfootball_nfl', nba:'basketball_nba', mlb:'baseball_mlb', nhl:'icehockey_nhl', soccer:'soccer_usa_mls', ufl:'americanfootball_ufl' };
   const sport = sportMap[req.params.sport] || req.params.sport;
-  const daysFrom = req.query.daysFrom || '3';
+  // NFL slate spans a full week; default 3 days often returns [] mid-week.
+  const defaultDays = (_oddsApiSportKey(sport) === 'americanfootball_nfl') ? '7' : '3';
+  const daysFrom = req.query.daysFrom || defaultDays;
   try {
     const fetched = await _fetchScoresForSport(sport, daysFrom);
     const games = (fetched && fetched.games) || [];
@@ -9774,9 +9776,19 @@ console.log('ODDS_API_KEY set:', !!_k, '| fingerprint:', _k ? _k.slice(0,4)+'...
 // ════════════════════════════════════════════════════════════════════════════
 
 // Map ticket sport labels (MLB, mlb, baseball_mlb) to Odds API sport keys.
+// Also normalize ESPN paths (football/nfl) and Owls aliases to canonical keys.
 function _oddsApiSportKey(sport) {
   const s = String(sport || 'baseball_mlb').toLowerCase().trim();
   if (!s || s === 'unknown') return 'baseball_mlb';
+  // ESPN scoreboard path segments → Odds/Owls canonical keys
+  if (s === 'football/nfl' || s === 'football_nfl' || s === 'american football' || s === 'americanfootball')
+    return 'americanfootball_nfl';
+  if (s === 'football/college-football' || s === 'college-football' || s === 'cfb')
+    return 'americanfootball_ncaaf';
+  if (s === 'basketball/nba') return 'basketball_nba';
+  if (s === 'basketball/wnba') return 'basketball_wnba';
+  if (s === 'baseball/mlb') return 'baseball_mlb';
+  if (s === 'hockey/nhl' || s === 'icehockey/nhl') return 'icehockey_nhl';
   if (typeof _CACHE_SPORT_KEY_BY_SHORT !== 'undefined' && _CACHE_SPORT_KEY_BY_SHORT[s])
     return _CACHE_SPORT_KEY_BY_SHORT[s];
   return s;
@@ -10037,6 +10049,31 @@ async function _fetchEspnSportScores(sport, daysBack, extraYmds) {
     });
     console.log('RESULT_ESPN_FETCH sport='+sportKey+' dates='+ymd+' games='+games.length+' added='+added);
   }
+  // NFL: also merge the current regular-season week slate (seasontype=2).
+  // Date-window fetches miss upcoming Week 1 games and can miss finals when
+  // daysBack is short; week scoreboard is the ESPN path football/nfl uses.
+  if (sportKey === 'americanfootball_nfl') {
+    try {
+      const weekPack = await _fetchEspnNflScores(1);
+      (weekPack.games || []).forEach(function(g) {
+        if (!g || !g.id || seen[g.id]) return;
+        seen[g.id] = true;
+        all.push(g);
+      });
+      // Also pull "current" scoreboard (whatever week ESPN considers active)
+      const cur = await _httpsGetJson(
+        'https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard', 8000);
+      if (cur.data) {
+        _espnScoreboardToGames(cur.data).forEach(function(g) {
+          if (!g || !g.id || seen[g.id]) return;
+          seen[g.id] = true;
+          all.push(g);
+        });
+      }
+    } catch(_nflWeekErr) {
+      console.warn('RESULT_ESPN_NFL_WEEK_FAIL err='+(_nflWeekErr.message||_nflWeekErr));
+    }
+  }
   return all;
 }
 
@@ -10246,33 +10283,52 @@ function _deriveLegOutcome(leg, result) {
   if (canceledStatuses.has(result.status)) {
     return { outcome: 'push', reason: 'event_' + result.status };
   }
-  if (result.status !== 'final') return { outcome:'pending', reason:'result_not_final', status:result.status };
+  // Treat ESPN/Owls "post" and completed flags as final for grading.
+  const statusNorm = String(result.status || '').toLowerCase();
+  const isFinal = statusNorm === 'final' || statusNorm === 'post' || statusNorm === 'completed' ||
+    statusNorm === 'complete' || result.completed === true;
+  if (!isFinal) return { outcome:'pending', reason:'result_not_final', status:result.status };
   const market   = (leg.market||'moneyline').toLowerCase().replace('run line','spread').replace('puck line','spread');
   const pick     = (leg.pick||'').toLowerCase();
   const homeTeam = (result.home_team||'').toLowerCase();
   const awayTeam = (result.away_team||'').toLowerCase();
-  const homeScore= parseInt(result.home_score,10)||0;
-  const awayScore= parseInt(result.away_score,10)||0;
+  const homeScore= parseInt(result.home_score,10);
+  const awayScore= parseInt(result.away_score,10);
+  if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore))
+    return { outcome:'pending', reason:'scores_missing' };
+
+  // Derive winner from scores when snapshot omitted it (public scores / Owls).
+  let winner = result.winner;
+  if (!winner || winner === 'unknown') {
+    if (homeScore > awayScore) winner = 'home';
+    else if (awayScore > homeScore) winner = 'away';
+    else winner = 'tie';
+  }
 
   if (market==='moneyline'||market==='h2h') {
-    if (homeScore===awayScore) return { outcome:'push', reason:'tie' };
-    const pickedHome = pick.includes(homeTeam);
-    const pickedAway = pick.includes(awayTeam);
-    if (result.winner==='home'&&pickedHome) return { outcome:'won' };
-    if (result.winner==='away'&&pickedAway) return { outcome:'won' };
+    if (homeScore===awayScore || winner==='tie') return { outcome:'push', reason:'tie' };
+    const pickedHome = pick.includes(homeTeam) || _teamNamesLooselyEqual(pick, homeTeam);
+    const pickedAway = pick.includes(awayTeam) || _teamNamesLooselyEqual(pick, awayTeam);
+    if (winner==='home'&&pickedHome) return { outcome:'won' };
+    if (winner==='away'&&pickedAway) return { outcome:'won' };
+    // Abbrev / short-name picks: fall back to score-side inference
+    if (!pickedHome && !pickedAway) {
+      if (winner==='home' && pick && homeTeam.includes(pick)) return { outcome:'won' };
+      if (winner==='away' && pick && awayTeam.includes(pick)) return { outcome:'won' };
+    }
     return { outcome:'lost' };
   }
-  if (market==='spread'||market==='run line') {
-    const line = parseFloat(leg.accepted_point_line||leg.line||0);
-    const pickedHome = pick.includes(homeTeam);
+  if (market==='spread'||market==='run line'||market==='spreads') {
+    const line = parseFloat(leg.accepted_point_line||leg.point||leg.line||0);
+    const pickedHome = pick.includes(homeTeam) || _teamNamesLooselyEqual(pick, homeTeam);
     const margin = homeScore-awayScore;
     const adjusted = pickedHome ? margin+line : awayScore-homeScore+line;
     if (Math.abs(adjusted)<0.001) return { outcome:'push' };
     return adjusted>0 ? { outcome:'won' } : { outcome:'lost' };
   }
-  if (market==='total'||market==='totals') {
+  if (market==='total'||market==='totals'||market==='over/under') {
     const total = homeScore+awayScore;
-    const line  = parseFloat(leg.accepted_point_line||leg.line||0);
+    const line  = parseFloat(leg.accepted_point_line||leg.point||leg.line||0);
     const pickOver = pick.includes('over');
     if (Math.abs(total-line)<0.001) return { outcome:'push' };
     return (pickOver?total>line:total<line) ? { outcome:'won' } : { outcome:'lost' };
