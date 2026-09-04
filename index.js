@@ -3880,7 +3880,8 @@ function _owlsPropType(key) {
   if (k==='player_last_td')                                          return 'Last TD';
   if (k==='player_kicking_points')                                   return 'Kicking Points';
   if (k==='player_sacks')                                            return 'Sacks';
-  if (k==='player_tackles_assists' || k==='player_tackles')          return 'Tackles + Asts';
+  if (k==='player_tackles_assists' || k==='tackles_assists')         return 'Tackles + Asts';
+  if (k==='player_tackles' || k==='tackles')                         return 'Tackles';
   // ----- MLB -----
   if (k==='pitcher_strikeouts' || k==='player_strikeouts')           return 'Strikeouts';
   if (k==='pitcher_outs')                                            return 'Pitching Outs';
@@ -8771,39 +8772,45 @@ app.get('/api/odds/:sport', async (req, res) => {
 const _PROPS_RESPONSE_CACHE = Object.create(null);
 const PROPS_CACHE_TTL_MS = 60 * 1000;
 const PROPS_SUPPORTED_SPORTS = ['mlb', 'nba', 'nfl', 'nhl', 'ncaab', 'ncaaf', 'wnba'];
-const _PROPS_DISPLAY_BOOKS = ['draftkings', 'fanduel', 'betmgm'];
+const _PROPS_DISPLAY_BOOKS = ['draftkings', 'fanduel', 'betmgm', 'caesars'];
 const _PROPS_EXCLUDED_BOOKS = ['pinnacle'];
-const _PROPS_MAX_ABS_ODDS = 1000;
-// Discrete allowed lines (exact match). MLB keep tight; NFL counting stats are
-// generous so mainstream books' half-points aren't wiped. Yardage uses ranges
-// below — a fixed whitelist would drop nearly every NFL prop.
+// Props fetch books — prefer mainstream US books (not sharp/pinnacle-only).
+const _PROPS_FETCH_BOOKS = (process.env.OWLS_PROPS_BOOKS || 'draftkings,fanduel,betmgm,caesars')
+  .split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean);
+const _PROPS_MAX_ABS_ODDS = 2000;
+// NFL display prop types we always want to surface when Owls posts them.
+const _NFL_PROP_TYPES_INCLUDE = {
+  'Passing Yards': 1, 'Passing TDs': 1, 'Pass Completions': 1,
+  'Interceptions Thrown': 1, 'Rushing Yards': 1, 'Receiving Yards': 1,
+  'Receptions': 1, 'Anytime TD': 1, 'First TD': 1, 'Sacks': 1, 'Tackles': 1,
+  'Rushing TDs': 1, 'Receiving TDs': 1, 'Pass Attempts': 1, 'Tackles + Asts': 1
+};
+// Discrete allowed lines (exact match). MLB keep tight; NFL counting stats use
+// ranges below so milestone / alt half-points aren't wiped.
 const _PROPS_ALLOWED_LINES_BY_CATEGORY = {
   // MLB
   'Hits': [0.5, 1.5, 2.5],
   'Strikeouts': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
   'Home Runs': [0.5],
-  'RBIs': [0.5, 1.5, 2.5],
-  // NFL / NCAAF counting stats
-  'Passing TDs': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5],
-  'Rushing TDs': [0.5, 1.5, 2.5, 3.5],
-  'Receiving TDs': [0.5, 1.5, 2.5, 3.5],
-  'Anytime TD': [0.5],
-  'Receptions': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5, 11.5, 12.5],
-  'Pass Completions': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
-    11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5,
-    26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5],
-  'Pass Attempts': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5, 8.5, 9.5, 10.5,
-    11.5, 12.5, 13.5, 14.5, 15.5, 16.5, 17.5, 18.5, 19.5, 20.5, 21.5, 22.5, 23.5, 24.5, 25.5,
-    26.5, 27.5, 28.5, 29.5, 30.5, 31.5, 32.5, 33.5, 34.5, 35.5, 36.5, 37.5, 38.5, 39.5, 40.5,
-    41.5, 42.5, 43.5, 44.5, 45.5, 46.5, 47.5, 48.5, 49.5, 50.5, 51.5, 52.5, 53.5, 54.5, 55.5],
-  'Interceptions Thrown': [0.5, 1.5, 2.5, 3.5],
-  'Sacks': [0.5, 1.5, 2.5, 3.5, 4.5]
+  'RBIs': [0.5, 1.5, 2.5]
 };
-// Continuous NFL yardage — accept any half-point in a sensible range.
+// Continuous ranges — NFL yardage + counting stats (alts included).
 const _PROPS_LINE_RANGES_BY_CATEGORY = {
   'Passing Yards': { min: 0.5, max: 499.5 },
   'Rushing Yards': { min: 0.5, max: 249.5 },
-  'Receiving Yards': { min: 0.5, max: 249.5 }
+  'Receiving Yards': { min: 0.5, max: 249.5 },
+  'Passing TDs': { min: 0.5, max: 7.5 },
+  'Rushing TDs': { min: 0.5, max: 5.5 },
+  'Receiving TDs': { min: 0.5, max: 5.5 },
+  'Anytime TD': { min: 0.5, max: 0.5 },
+  'First TD': { min: 0.5, max: 0.5 },
+  'Receptions': { min: 0.5, max: 20.5 },
+  'Pass Completions': { min: 0.5, max: 55.5 },
+  'Pass Attempts': { min: 0.5, max: 70.5 },
+  'Interceptions Thrown': { min: 0.5, max: 5.5 },
+  'Sacks': { min: 0.5, max: 6.5 },
+  'Tackles': { min: 0.5, max: 20.5 },
+  'Tackles + Asts': { min: 0.5, max: 20.5 }
 };
 const _OWLS_PROP_CATEGORY_LABELS = {
   hits: 'Hits', runs: 'Runs Scored', rbis: 'RBIs', home_runs: 'Home Runs',
@@ -8826,7 +8833,10 @@ const _OWLS_PROP_CATEGORY_LABELS = {
   receiving_tds: 'Receiving TDs', reception_tds: 'Receiving TDs',
   receptions: 'Receptions',
   touchdowns: 'Anytime TD', anytime_td: 'Anytime TD',
+  first_td: 'First TD', player_first_td: 'First TD',
   sacks: 'Sacks', player_sacks: 'Sacks',
+  tackles: 'Tackles', player_tackles: 'Tackles',
+  player_tackles_assists: 'Tackles + Asts', tackles_assists: 'Tackles + Asts',
   goals: 'Goals', hockey_assists: 'Assists', hockey_points: 'Points',
   shots_on_goal: 'Shots on Goal'
 };
@@ -8871,11 +8881,14 @@ function _propLineCategory(propType) {
   if (t === 'Rushing TDs' || /rushing\s*t(?:d|ouchdown)s?/i.test(t) || /rush\s*t(?:d|ouchdown)s?/i.test(t)) return 'Rushing TDs';
   if (t === 'Receiving TDs' || /receiving\s*t(?:d|ouchdown)s?/i.test(t) || /reception\s*t(?:d|ouchdown)s?/i.test(t)) return 'Receiving TDs';
   if (t === 'Anytime TD' || /anytime\s*t(?:d|ouchdown)/i.test(t)) return 'Anytime TD';
+  if (t === 'First TD' || /first\s*t(?:d|ouchdown)/i.test(t)) return 'First TD';
   if (t === 'Receptions' || /^receptions$/i.test(t)) return 'Receptions';
   if (t === 'Pass Completions' || /pass\s*completions?/i.test(t) || /^completions$/i.test(t)) return 'Pass Completions';
   if (t === 'Pass Attempts' || /pass\s*attempts?/i.test(t) || /^attempts$/i.test(t)) return 'Pass Attempts';
   if (t === 'Interceptions Thrown' || /interceptions?\s*(thrown)?$/i.test(t)) return 'Interceptions Thrown';
   if (t === 'Sacks' || /^sacks?$/i.test(t)) return 'Sacks';
+  if (t === 'Tackles' || /^tackles$/i.test(t)) return 'Tackles';
+  if (t === 'Tackles + Asts' || /tackles?\s*\+?\s*asts?/i.test(t)) return 'Tackles + Asts';
   return null;
 }
 
@@ -8912,10 +8925,36 @@ function _selectMainstreamPropBooks(books) {
     return _PROPS_DISPLAY_BOOKS.indexOf(k) >= 0;
   });
   if (mainstream.length) return mainstream;
-  return list.filter(function(b) {
+  // Prefer non-pinnacle when present, but NEVER wipe the board — if the only
+  // books Owls returned are sharp/excluded, keep them so NFL props still surface.
+  var nonExcluded = list.filter(function(b) {
     var k = String(b && b.key || '').toLowerCase();
     return _PROPS_EXCLUDED_BOOKS.indexOf(k) < 0;
   });
+  return nonExcluded.length ? nonExcluded : list;
+}
+
+function _propYesNoOdds(prop) {
+  // Owls yes/no (Anytime TD / First TD) may use yesPrice/noPrice or a single price.
+  var yesOdds = null;
+  var noOdds = null;
+  if (typeof prop.yesPrice === 'number') yesOdds = prop.yesPrice;
+  else if (typeof prop.yesOdds === 'number') yesOdds = prop.yesOdds;
+  else if (typeof prop.price === 'number' && prop.side !== 'no' && prop.side !== 'under') yesOdds = prop.price;
+  if (typeof prop.noPrice === 'number') noOdds = prop.noPrice;
+  else if (typeof prop.noOdds === 'number') noOdds = prop.noOdds;
+  return { yesOdds: yesOdds, noOdds: noOdds };
+}
+
+function _propsDedupeKey(p) {
+  // Exact identity for display: player + prop type + line + side (case-insensitive).
+  // Keep best American odds only — never emit book-level duplicates.
+  return [
+    String(p.playerName || '').toLowerCase().trim(),
+    String(p.propType || '').toLowerCase().trim(),
+    String(p.line),
+    String(p.side || '').toLowerCase().trim()
+  ].join('|');
 }
 
 function _filterPropsForDisplay(props) {
@@ -8927,13 +8966,7 @@ function _filterPropsForDisplay(props) {
     if (typeof p.odds !== 'number' || isNaN(p.odds)) continue;
     if (Math.abs(p.odds) > _PROPS_MAX_ABS_ODDS) continue;
     if (!_isAllowedPropLine(p.propType, p.line)) continue;
-    var dedupeKey = [
-      String(p.gameId || p.canonicalGameKey || ''),
-      String(p.playerName).toLowerCase(),
-      String(p.propType || ''),
-      String(p.line),
-      String(p.side || '')
-    ].join('|');
+    var dedupeKey = _propsDedupeKey(p);
     var prev = bestByKey[dedupeKey];
     if (!prev || p.odds > prev.odds) bestByKey[dedupeKey] = p;
   }
@@ -8941,6 +8974,7 @@ function _filterPropsForDisplay(props) {
   out.sort(function(a, b) {
     if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
     if (a.playerName !== b.playerName) return (a.playerName || '').localeCompare(b.playerName || '');
+    if (a.line !== b.line) return Number(a.line) - Number(b.line);
     return (a.side || '').localeCompare(b.side || '');
   });
   return out;
@@ -8948,7 +8982,9 @@ function _filterPropsForDisplay(props) {
 
 function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
   if (!owlsData || owlsData.success === false) return [];
-  var games = Array.isArray(owlsData.data) ? owlsData.data : [];
+  var games = Array.isArray(owlsData.data) ? owlsData.data
+    : (Array.isArray(owlsData.games) ? owlsData.games
+    : (Array.isArray(owlsData) ? owlsData : []));
   var out = [];
   var sportLabel = String(sportShort || '').toUpperCase();
   for (var gi = 0; gi < games.length; gi++) {
@@ -8957,22 +8993,43 @@ function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
     var home = game.homeTeam || game.home_team || '';
     var away = game.awayTeam || game.away_team || '';
     var gameId = game.gameId || game.id || null;
-    var books = _selectMainstreamPropBooks(game.books);
+    var books = _selectMainstreamPropBooks(game.books || game.bookmakers || []);
+    // Some Owls payloads put props on the game itself (no per-book nesting).
+    if ((!books || !books.length) && Array.isArray(game.props) && game.props.length) {
+      books = [{ key: 'owls', props: game.props }];
+    }
     var bestByKey = Object.create(null);
     for (var bi = 0; bi < books.length; bi++) {
       var book = books[bi];
-      var props = Array.isArray(book && book.props) ? book.props : [];
+      var props = Array.isArray(book && book.props) ? book.props
+        : (Array.isArray(book && book.markets) ? book.markets : []);
       for (var pi = 0; pi < props.length; pi++) {
         var prop = props[pi];
-        if (!prop || !prop.playerName) continue;
+        if (!prop) continue;
+        var playerName = prop.playerName || prop.player || prop.name || null;
+        if (!playerName) continue;
+        var propType = _owlsPropCategoryLabel(
+          prop.category || prop.propType || prop.market || prop.marketKey || prop.key
+        );
         var line = prop.line;
-        if (typeof line !== 'number' || isNaN(line)) continue;
-        var propType = _owlsPropCategoryLabel(prop.category || prop.propType || prop.market);
-        var dedupeKey = String(prop.playerName).toLowerCase() + '|' + propType + '|' + line;
+        if (typeof line !== 'number' || isNaN(line)) {
+          // Yes/no TD markets often omit line — treat as 0.5 so UI can show them.
+          if (/anytime\s*td|first\s*td|last\s*td/i.test(propType) || prop.yesPrice != null || prop.noPrice != null) {
+            line = 0.5;
+          } else {
+            continue;
+          }
+        }
         var overOdds = (typeof prop.overPrice === 'number') ? prop.overPrice
           : ((typeof prop.overOdds === 'number') ? prop.overOdds : null);
         var underOdds = (typeof prop.underPrice === 'number') ? prop.underPrice
           : ((typeof prop.underOdds === 'number') ? prop.underOdds : null);
+        if (overOdds == null && underOdds == null) {
+          var yn = _propYesNoOdds(prop);
+          if (typeof yn.yesOdds === 'number') overOdds = yn.yesOdds;
+          if (typeof yn.noOdds === 'number') underOdds = yn.noOdds;
+        }
+        var dedupeKey = String(playerName).toLowerCase() + '|' + propType + '|' + line;
         if (bestByKey[dedupeKey]) {
           var existing = bestByKey[dedupeKey];
           existing.overOdds = _betterAmericanOdds(existing.overOdds, overOdds);
@@ -8980,7 +9037,7 @@ function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
         } else {
           bestByKey[dedupeKey] = {
             propType: propType,
-            playerName: prop.playerName,
+            playerName: playerName,
             team: prop.team || prop.playerTeam || null,
             line: line,
             overOdds: overOdds,
@@ -9027,12 +9084,12 @@ function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
   return out;
 }
 
-async function fetchPropsFromOwlsInsight(sportShort) {
-  if (!OWLS_KEY) return { ok: false, error: 'owls_insight_not_configured' };
+function _fetchOwlsPropsOnce(sportShort, booksCsv) {
+  if (!OWLS_KEY) return Promise.resolve({ ok: false, error: 'owls_insight_not_configured' });
   var owlsSport = _mapToOwlsSport(sportShort);
-  if (!owlsSport) return { ok: false, error: 'unsupported_sport:' + sportShort };
+  if (!owlsSport) return Promise.resolve({ ok: false, error: 'unsupported_sport:' + sportShort });
   var path = '/api/v1/' + owlsSport + '/props';
-  var url = OWLS_BASE_URL + path + '?books=' + encodeURIComponent(OWLS_BOOKS);
+  var url = OWLS_BASE_URL + path + '?books=' + encodeURIComponent(booksCsv || OWLS_BOOKS);
   return new Promise(function(resolve) {
     var parsed;
     try { parsed = new URL(url); } catch (_e) {
@@ -9064,9 +9121,11 @@ async function fetchPropsFromOwlsInsight(sportShort) {
         try {
           var data = JSON.parse(body);
           var props = _normalizeOwlsPropsApiResponse(data, sportShort);
+          var gameCount = Array.isArray(data.data) ? data.data.length
+            : (Array.isArray(data.games) ? data.games.length : 0);
           console.log('[owls-props] fetch ok sport=' + sportShort + ' url=' + reqPath +
-            ' games=' + (Array.isArray(data.data) ? data.data.length : 0) + ' props=' + props.length);
-          resolve({ ok: true, props: props, url: url });
+            ' games=' + gameCount + ' props=' + props.length);
+          resolve({ ok: true, props: props, url: url, raw: data });
         } catch (_e) {
           console.warn('[owls-props] fetch json parse error sport=' + sportShort + ' url=' + reqPath +
             ' detail=' + _e.message + ' body=' + bodyPreview);
@@ -9085,6 +9144,32 @@ async function fetchPropsFromOwlsInsight(sportShort) {
     });
     req.end();
   });
+}
+
+async function fetchPropsFromOwlsInsight(sportShort) {
+  // Prefer mainstream US books for display props; fall back to configured OWLS_BOOKS.
+  var primaryBooks = (_PROPS_FETCH_BOOKS && _PROPS_FETCH_BOOKS.length)
+    ? _PROPS_FETCH_BOOKS.join(',')
+    : (OWLS_BOOKS || 'draftkings,fanduel,betmgm,caesars');
+  var first = await _fetchOwlsPropsOnce(sportShort, primaryBooks);
+  var merged = (first.ok && first.props) ? first.props.slice() : [];
+  // NFL/NCAAF: if thin, merge a second fetch with sharp+soft books so we clear 50+.
+  var needExpand = String(sportShort || '').toLowerCase() === 'nfl'
+    || String(sportShort || '').toLowerCase() === 'ncaaf';
+  if (needExpand && merged.length < 50) {
+    var expandBooks = Array.from(new Set(
+      (primaryBooks + ',' + (OWLS_BOOKS || '') + ',pinnacle,bet365,williamhill_us,bovada')
+        .split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean)
+    )).join(',');
+    if (expandBooks !== primaryBooks) {
+      var second = await _fetchOwlsPropsOnce(sportShort, expandBooks);
+      if (second.ok && second.props && second.props.length) {
+        merged = merged.concat(second.props);
+      }
+    }
+  }
+  if (!merged.length && first.ok === false) return first;
+  return { ok: true, props: merged, url: first && first.url };
 }
 
 function _collectPropsForSport(sportShort) {
@@ -9225,18 +9310,21 @@ app.get('/api/props/:sport', async function(req, res) {
   } else {
     if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
       var fetched = await fetchPropsFromOwlsInsight(sport);
-      if (fetched.ok && fetched.props && fetched.props.length) {
-        fullProps = _filterPropsForDisplay(fetched.props);
-      } else {
-        fullProps = _filterPropsForDisplay(_collectPropsForSport(sport));
-        source = 'owls_cache_fallback';
-      }
+      var fromApi = (fetched.ok && fetched.props) ? fetched.props : [];
+      var fromCache = _collectPropsForSport(sport) || [];
+      var mergedRaw = fromApi.concat(fromCache);
+      fullProps = _filterPropsForDisplay(mergedRaw);
+      if (fromApi.length && fromCache.length) source = 'owls_props_api+cache';
+      else if (fromApi.length) source = 'owls_props_api';
+      else source = 'owls_cache_fallback';
     } else {
       fullProps = _filterPropsForDisplay(_collectPropsForSport(sport));
       source = 'owls_cache_fallback';
     }
+    // Short-circuit cache when NFL slate is still thin so expand-fetch can retry soon.
+    var cacheTtl = (sport === 'nfl' && fullProps.length < 50) ? 15 * 1000 : PROPS_CACHE_TTL_MS;
     _PROPS_RESPONSE_CACHE[sport] = {
-      at: now,
+      at: now - (PROPS_CACHE_TTL_MS - cacheTtl),
       data: {
         ok: true,
         sport: sport,
