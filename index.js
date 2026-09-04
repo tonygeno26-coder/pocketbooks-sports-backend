@@ -11848,6 +11848,95 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
   }
 });
 
+// POST /api/host/player-credit — update club_members.balance_start (credit limit)
+app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionScoped('settle_player'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+
+  const actor = req._actor || {};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'host/admin' });
+
+  const { clubId, playerId, balanceStart } = req.body || {};
+  const errors = [];
+  if (!clubId)   errors.push('missing_clubId');
+  if (!playerId) errors.push('missing_playerId');
+  const newStart = typeof balanceStart === 'number' ? balanceStart : parseFloat(balanceStart);
+  if (!Number.isFinite(newStart)) errors.push('invalid_balanceStart');
+  if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
+  const newBalanceStart = rnd(newStart);
+
+  try {
+    const { data: memRows, error: memErr } = await sb.from('club_members')
+      .select('player_id,balance_start')
+      .eq('club_id', clubId).eq('player_id', playerId).limit(1);
+    if (memErr) throw memErr;
+    if (!memRows || !memRows.length)
+      return res.status(404).json({ ok:false, error:'member_not_found' });
+
+    const previousBalanceStart = memRows[0].balance_start != null
+      ? rnd(parseFloat(memRows[0].balance_start)) : null;
+    if (previousBalanceStart != null && Math.abs(previousBalanceStart - newBalanceStart) < 0.005)
+      return res.json({ ok:true, playerId, newBalanceStart, previousBalanceStart, unchanged:true });
+
+    const { error: updErr } = await sb.from('club_members')
+      .update({ balance_start: newBalanceStart })
+      .eq('club_id', clubId).eq('player_id', playerId);
+    if (updErr) throw updErr;
+
+    // Current derived balance so HOST_ADJUSTMENT keeps ledger balance_after correct
+    var balanceBefore = previousBalanceStart != null ? previousBalanceStart : newBalanceStart;
+    try {
+      const { data: ledRows } = await sb.from('ledger_entries')
+        .select('amount,balance_after,created_at,type')
+        .eq('club_id', clubId).eq('player_id', playerId)
+        .order('created_at', { ascending:true });
+      if (ledRows && ledRows.length)
+        balanceBefore = _deriveBalanceFromLedgerEntries(previousBalanceStart, ledRows);
+    } catch(_lb) { console.warn('[player-credit] ledger read error:', _lb.message); }
+
+    const delta = rnd(newBalanceStart - (previousBalanceStart != null ? previousBalanceStart : newBalanceStart));
+    const balanceAfter = rnd((balanceBefore != null ? balanceBefore : 0) + delta);
+    const ledgerId = 'HOST_ADJ_'+clubId+'_'+playerId+'_'+Date.now()+'_'+_crypto.randomBytes(3).toString('hex');
+    const actorId = actor.actorId || 'host';
+
+    await sb.from('ledger_entries').upsert({
+      id: ledgerId,
+      club_id: clubId,
+      player_id: playerId,
+      type: 'HOST_ADJUSTMENT',
+      amount: delta,
+      balance_before: balanceBefore,
+      balance_after: balanceAfter,
+      reason: 'player_credit: '+
+        (previousBalanceStart != null ? previousBalanceStart.toFixed(2) : 'null')+
+        ' → '+newBalanceStart.toFixed(2),
+      created_at: new Date().toISOString(),
+      created_by: actorId
+    }, { onConflict: 'id' });
+
+    try {
+      await sb.from('audit_events').insert({
+        event_type: 'player_credit_updated',
+        club_id: clubId, player_id: playerId,
+        payload: {
+          previousBalanceStart, newBalanceStart, delta,
+          ledgerId, actorId
+        }
+      });
+    } catch(_ae) { console.warn('[player-credit] audit error:', _ae.message); }
+
+    console.log('[player-credit] player='+playerId+' '+previousBalanceStart+' → '+newBalanceStart);
+    res.json({ ok:true, playerId, newBalanceStart, previousBalanceStart });
+  } catch(e) {
+    console.error('[player-credit] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 // POST /api/host/settle-player — execute settlement, write ledger + audit
 app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
