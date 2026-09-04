@@ -30,9 +30,10 @@ describe('GET /api/host/dashboard', () => {
     expect(dash).not.toContain(".select('id,name,username,display_name')");
   });
 
-  test('club_members query is club-scoped and approved-only', () => {
+  test('club_members query is club-scoped; approved rows merged in JS', () => {
     expect(dash).toContain("from('club_members')");
-    expect(dash).toContain(".eq('status', 'approved')");
+    expect(dash).toContain("if (clubId) plq = plq.eq('club_id', clubId)");
+    expect(dash).toContain("String(r.status||'').toLowerCase() === 'approved'");
   });
 
   test('tickets query does not cap at 1', () => {
@@ -45,6 +46,15 @@ describe('GET /api/host/dashboard', () => {
   test('all active tickets are pushed, not just the latest', () => {
     expect(dash).toContain('active.push(enriched)');
     expect(dash).toContain('activeTickets:  active');
+  });
+
+  test('overview summary uses all-time handle and active risk_amount', () => {
+    expect(dash).toContain('handleAll');
+    expect(dash).toContain('settledHandle');
+    expect(dash).toMatch(/atRisk:\s*stats\.activeRisk/);
+    expect(dash).toMatch(/handle:\s*stats\.handle/);
+    expect(dash).toContain('playersOwe:');
+    expect(dash).toContain('hostOwes:');
   });
 
   test('players array is built from club_members plus tickets', () => {

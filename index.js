@@ -11523,8 +11523,10 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     // Players Owe You = lost stakes (settledGain); You Owe Players = won profits (settledLoss)
     const playersOweAll = rnd(settledGain);
     const hostOwesAll   = rnd(settledLoss);
-    const settledHandle = rnd(handle - activeRisk);
+    const handleAll     = rnd(handle);                 // active + settled risk (excl. void/canceled)
+    const settledHandle = rnd(handle - activeRisk);    // won/lost/push only
     const profit        = rnd(playersOweAll - hostOwesAll);
+    // Settled Hold % = profit / settledHandle * 100
     const holdPct       = settledHandle>0 ? rnd(profit/settledHandle*100) : null;
 
     // Weekly window (ISO Mon 00:00 local-ish UTC Monday)
@@ -11549,10 +11551,12 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     var weekHoldPct=weekHandle>0?rnd(weekNet/weekHandle*100):null;
 
     const stats = {
-      handle:         settledHandle, // settled handle (risk on won/lost/push)
-      handleAll:      rnd(handle),
-      activeRisk:     rnd(activeRisk),
-      hostAtRisk:     rnd(hostAtRisk),
+      // Handle = all-time risk wagered (active + settled). settledHandle kept for Hold %.
+      handle:         handleAll,
+      handleAll:      handleAll,
+      settledHandle:  settledHandle,
+      activeRisk:     rnd(activeRisk),   // At Risk = sum of active risk_amount
+      hostAtRisk:     rnd(hostAtRisk),   // potential_profit exposure if all active win
       settledGain:    rnd(settledGain),
       settledLoss:    rnd(settledLoss),
       playersOwe:     playersOweAll,
@@ -11575,7 +11579,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         playersOwe: playersOweAll,
         hostOwes: hostOwesAll,
         net: profit,
-        handle: settledHandle,
+        handle: handleAll,
+        settledHandle: settledHandle,
         settledCount: gradedCount,
         holdPct: holdPct
       }
@@ -11605,11 +11610,18 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       settledTickets: settledTickets,
       ledgerEntries:  ledger||[],
       stats,
+      // Canonical overview numbers for the host home cards (prefer these over localStorage).
       summary: {
         activeBetCount: stats.activeBetCount,
-        atRisk:         stats.hostAtRisk,
+        atRisk:         stats.activeRisk,      // sum of risk_amount on active tickets
         activeRisk:     stats.activeRisk,
-        profit:         stats.profit
+        hostAtRisk:     stats.hostAtRisk,
+        handle:         stats.handle,          // all-time risk (active + settled)
+        settledHandle:  stats.settledHandle,
+        holdPct:        stats.holdPct,
+        profit:         stats.profit,
+        playersOwe:     stats.playersOwe,
+        hostOwes:       stats.hostOwes
       },
       warnings
     });
