@@ -6961,13 +6961,13 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
     return { ok:false, code:'payout_above_max', max:maxPayout, payout:pay };
 
   // Bet type gates
-  if ((type==='parlay'||type==='roundrobin') && cs.allow_parlays===false)
+  if ((type==='parlay'||type==='roundrobin'||type==='sgp') && cs.allow_parlays===false)
     return { ok:false, code:'parlays_disabled' };
   if (type==='teaser' && cs.allow_teasers===false)
     return { ok:false, code:'teasers_disabled' };
   if (type==='roundrobin' && cs.allow_round_robins===false)
     return { ok:false, code:'round_robins_disabled' };
-  if ((type==='parlay'||type==='roundrobin') && cs.max_parlay_legs && legsArr.length > cs.max_parlay_legs)
+  if ((type==='parlay'||type==='roundrobin'||type==='sgp') && cs.max_parlay_legs && legsArr.length > cs.max_parlay_legs)
     return { ok:false, code:'too_many_parlay_legs', max:cs.max_parlay_legs, legs:legsArr.length };
 
   const liveLegs = legsArr.filter(function(l){ return !!l.server_is_live; });
@@ -6976,7 +6976,7 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
       return { ok:false, code:'live_betting_disabled' };
     if (liveLegs.length > 1 && cs.allow_live_parlays !== true)
       return { ok:false, code:'live_parlays_disabled' };
-    if ((type==='parlay'||type==='roundrobin') && cs.allow_live_parlays !== true)
+    if ((type==='parlay'||type==='roundrobin'||type==='sgp') && cs.allow_live_parlays !== true)
       return { ok:false, code:'live_parlays_disabled' };
     if (cs.max_live_stake && s > parseFloat(cs.max_live_stake))
       return { ok:false, code:'live_stake_above_max', max:cs.max_live_stake, stake:s };
@@ -13067,7 +13067,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   const now = new Date().toISOString();
 
   // Validate required fields
-  const VALID_TYPES = new Set(['Single','Parlay','RoundRobin','Teaser']);
+  const VALID_TYPES = new Set(['Single','Parlay','RoundRobin','Teaser','SGP']);
   const errors = [];
   if (!playerId)          errors.push('missing_playerId');
   if (!idempotencyKey)    errors.push('missing_idempotencyKey');
