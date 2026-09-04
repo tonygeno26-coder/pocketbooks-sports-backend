@@ -11751,6 +11751,10 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
           balance:      meta.balance_start != null ? parseFloat(meta.balance_start) : null,
           openRisk:     0,
           settledNet:   0,
+          weekWagered:  0,
+          weekWon:      0,
+          weekLost:     0,
+          weekNet:      0,
           owesHost:     0,
           hostOwes:     0,
           lastTicketAt: null
@@ -11775,13 +11779,13 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       var pMs  = t.placed_at ? new Date(t.placed_at).getTime() : 0;
       if (pMs && (!p.lastTicketAt || pMs > new Date(p.lastTicketAt).getTime())) p.lastTicketAt = t.placed_at;
       if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
-      if (s==='active'||s==='open')  { p.openRisk   += risk; return; }
-      // Settled nets only count AFTER last SETTLEMENT_APPLIED cutoff (no double-count)
+      if (s==='active'||s==='open')  { p.openRisk += risk; p.weekWagered += risk; return; }
+      // Settled nets / week stats only count AFTER last SETTLEMENT_APPLIED cutoff (no double-count)
       var cut = cutoffMap[pid] || 0;
       var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
       if (cut && gradeMs && gradeMs <= cut) return;
-      if (s==='won')             { p.settledNet += prof; }
-      else if (s==='lost')       { p.settledNet -= risk; }
+      if (s==='won')             { p.settledNet += prof; p.weekWon += prof; p.weekWagered += risk; }
+      else if (s==='lost')       { p.settledNet -= risk; p.weekLost += risk; p.weekWagered += risk; }
     });
 
     // Ledger-derived current balances
@@ -11807,13 +11811,18 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     } catch(_lb) { console.warn('[settlements-preview] ledger balance error:', _lb.message); }
 
     Object.values(byPlayer).forEach(function(p) {
-      p.settledNet = rnd(p.settledNet);
-      p.openRisk   = rnd(p.openRisk);
+      p.settledNet  = rnd(p.settledNet);
+      p.openRisk    = rnd(p.openRisk);
+      p.weekWagered = rnd(p.weekWagered);
+      p.weekWon     = rnd(p.weekWon);
+      p.weekLost    = rnd(p.weekLost);
+      p.weekNet     = rnd(p.settledNet); // player POV: + = player won / host owes
       if (p.settledNet < 0) { p.owesHost = rnd(Math.abs(p.settledNet)); p.hostOwes = 0; }
       else                  { p.hostOwes = rnd(p.settledNet); p.owesHost = 0; }
       var start = (memberMap[p.playerId]&&memberMap[p.playerId].balance_start!=null)
         ? rnd(memberMap[p.playerId].balance_start) : null;
       p.startingBalance = start;
+      p.balance_start   = start; // alias for clients expecting snake_case
       p.currentBalance = ledgerBalByPid[p.playerId] != null ? rnd(ledgerBalByPid[p.playerId]) : start;
       // Next week starts from current available balance (open risk already held in ledger)
       p.startingBalanceNextWeek = p.currentBalance;
