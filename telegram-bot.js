@@ -434,6 +434,26 @@ async function sendPickReminders(isFinal) {
   console.log('[telegram] sent ' + targets.length + (isFinal ? ' final' : ' open') + ' reminders');
 }
 
+async function notifySurvivorPick(args) {
+  const playerId = args && args.playerId;
+  const week = args && args.week;
+  const team = args && args.team;
+  if (!playerId || !team) return;
+  try {
+    const sb = getSb();
+    if (!sb) return;
+    const { data, error } = await sb.from('telegram_links')
+      .select('chat_id')
+      .eq('player_id', String(playerId))
+      .maybeSingle();
+    if (error || !data || !data.chat_id) return;
+    const text = '✅ Week ' + week + ' pick locked: ' + team + '\nDeadline Sunday 1PM ET — ' + PICK_URL;
+    await sendMessage(data.chat_id, text);
+  } catch (e) {
+    console.warn('[telegram] pick notify failed:', e && e.message);
+  }
+}
+
 async function notifySurvivorGrade(args) {
   const playerId = args && args.playerId;
   const week = args && args.week;
@@ -498,5 +518,6 @@ module.exports = {
   startTelegramBot,
   handleWebhook,
   handleLinkStatus,
-  notifySurvivorGrade
+  notifySurvivorGrade,
+  notifySurvivorPick
 };
