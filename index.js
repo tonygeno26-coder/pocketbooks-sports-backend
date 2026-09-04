@@ -3350,7 +3350,6 @@ app.get('/api/auth/me', auth, async (req, res) => {
 function genCode() { return Math.random().toString(36).substring(2,8).toUpperCase(); }
 
 app.post('/api/clubs', auth, async (req, res) => {
-  return res.status(403).json({ error: 'clubs_locked', message: 'Club creation is paused. Use Survivor Pool.' });
   const { name, description, max_bet, max_parlay } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   let code = genCode();
@@ -3370,24 +3369,74 @@ app.get('/api/clubs', auth, async (req, res) => {
 
 app.get('/api/clubs/search/:code', async (req, res) => {
   try {
-    const r = await query('SELECT id,name,code,description FROM clubs WHERE code=$1 AND is_active=true', [req.params.code.toUpperCase()]);
+    const code = String(req.params.code || '').toUpperCase();
+    const sb = getSupabase();
+    if (sb) {
+      const { data, error } = await sb.from('clubs')
+        .select('id,name,code,description,is_locked,active')
+        .eq('code', code)
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data || data.active === false) return res.status(404).json({ error: 'Club not found' });
+      return res.json(Object.assign({}, data, {
+        is_locked: !!data.is_locked,
+        is_active: data.active !== false
+      }));
+    }
+    const r = await query('SELECT id,name,code,description,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [code]);
     if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
-    res.json(r.rows[0]);
+    const row = r.rows[0];
+    res.json(Object.assign({}, row, { is_locked: !!row.is_locked, is_active: !!row.active }));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/clubs/request', auth, async (req, res) => {
-  return res.status(403).json({ error: 'clubs_locked', message: 'Club join is paused. Use Survivor Pool.' });
-  const { code } = req.body;
+  const { code } = req.body || {};
+  if (!code) return res.status(400).json({ ok:false, error: 'missing_code' });
   try {
-    const club = await query('SELECT * FROM clubs WHERE code=$1 AND is_active=true', [code.toUpperCase()]);
-    if (!club.rows.length) return res.status(404).json({ error: 'Club not found' });
-    const c = club.rows[0];
-    const exists = await query('SELECT id,status FROM club_memberships WHERE club_id=$1 AND player_id=$2', [c.id, req.user.id]);
-    if (exists.rows.length) return res.status(400).json({ error: 'Already a member', status: exists.rows[0].status });
-    await query('INSERT INTO club_memberships (club_id,player_id,host_id,status,role) VALUES ($1,$2,$3,$4,$5)', [c.id, req.user.id, c.host_id, 'pending', 'player']);
-    res.json({ success: true, club: { id: c.id, name: c.name, code: c.code } });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const codeUp = String(code).toUpperCase();
+    const actorId = String(req.user.id);
+    const sb = getSupabase();
+    let c = null;
+    if (sb) {
+      const { data, error } = await sb.from('clubs').select('*').eq('code', codeUp).limit(1).maybeSingle();
+      if (error) throw error;
+      if (!data || data.active === false) return res.status(404).json({ ok:false, error: 'Club not found' });
+      c = data;
+    } else {
+      const club = await query('SELECT * FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [codeUp]);
+      if (!club.rows.length) return res.status(404).json({ ok:false, error: 'Club not found' });
+      c = club.rows[0];
+    }
+    if (c.is_locked) {
+      return res.status(403).json({
+        ok: false,
+        error: 'club_locked',
+        message: 'This club is not accepting new members right now'
+      });
+    }
+    const clubId = String(c.id);
+    if (sb) {
+      const { data: existing } = await sb.from('club_memberships')
+        .select('actor_id,status').eq('club_id', clubId).eq('actor_id', actorId).limit(1);
+      if (existing && existing.length) {
+        return res.status(400).json({ ok:false, error: 'Already a member', status: existing[0].status });
+      }
+      const now = new Date().toISOString();
+      const { error: insErr } = await sb.from('club_memberships').insert({
+        actor_id: actorId, club_id: clubId, role: 'player', status: 'pending',
+        joined_at: now, updated_at: now
+      });
+      if (insErr) throw insErr;
+    } else {
+      const exists = await query('SELECT actor_id,status FROM club_memberships WHERE club_id=$1 AND actor_id=$2', [clubId, actorId]);
+      if (exists.rows.length) return res.status(400).json({ ok:false, error: 'Already a member', status: exists.rows[0].status });
+      await query('INSERT INTO club_memberships (club_id,actor_id,status,role,joined_at,updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())',
+        [clubId, actorId, 'pending', 'player']);
+    }
+    res.json({ ok:true, success: true, club: { id: c.id, name: c.name, code: c.code, is_locked: !!c.is_locked } });
+  } catch(e) { res.status(500).json({ ok:false, error: e.message }); }
 });
 
 app.get('/api/clubs/:id/members', auth, async (req, res) => {
@@ -11006,6 +11055,130 @@ app.post('/api/club/members/remove', requirePermissionScoped('settle_player'), a
     await _sessionRevokeByActor(targetActorId, clubId, 'removed');
     _writeAuthAudit('member_removed', actor.actorId, clubId, '/club/members/remove', { targetActorId });
     res.json({ ok:true, targetActorId, status:'removed' });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/toggle-lock — host/admin flips clubs.is_locked
+app.post('/api/club/toggle-lock', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const clubId = (req.body && req.body.clubId) || req._clubId;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    const sb = getSupabase();
+    let nextLocked = false;
+    if (sb) {
+      const { data, error: selErr } = await sb.from('clubs').select('id,is_locked').eq('id', String(clubId)).limit(1).maybeSingle();
+      if (selErr) throw selErr;
+      if (!data) return res.status(404).json({ ok:false, error:'club_not_found' });
+      nextLocked = !data.is_locked;
+      const { error: upErr } = await sb.from('clubs').update({ is_locked: nextLocked }).eq('id', String(clubId));
+      if (upErr) throw upErr;
+    } else {
+      const cur = await query('SELECT id, COALESCE(is_locked,false) AS is_locked FROM clubs WHERE id=$1', [clubId]);
+      if (!cur.rows.length) return res.status(404).json({ ok:false, error:'club_not_found' });
+      nextLocked = !cur.rows[0].is_locked;
+      await query('UPDATE clubs SET is_locked=$1 WHERE id=$2', [nextLocked, clubId]);
+    }
+    _writeAuthAudit('club_lock_toggled', actor.actorId, clubId, '/club/toggle-lock', { is_locked: nextLocked });
+    res.json({
+      ok: true,
+      is_locked: nextLocked,
+      message: nextLocked ? 'Club is now locked' : 'Club is now open'
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/join-request — player requests to join (respects clubs.is_locked)
+app.post('/api/club/join-request', auth, async (req, res) => {
+  const body = req.body || {};
+  const code = body.code || body.clubCode;
+  const clubIdIn = body.clubId || body.club_id || null;
+  try {
+    const actorId = String(req.user.id);
+    const sb = getSupabase();
+    let c = null;
+    if (sb) {
+      let q = sb.from('clubs').select('*');
+      if (code) q = q.eq('code', String(code).toUpperCase());
+      else if (clubIdIn) q = q.eq('id', String(clubIdIn));
+      else return res.status(400).json({ ok:false, error:'missing_code' });
+      const { data, error } = await q.limit(1).maybeSingle();
+      if (error) throw error;
+      if (!data || data.active === false) return res.status(404).json({ ok:false, error:'Club not found' });
+      c = data;
+    } else if (code) {
+      const club = await query('SELECT * FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [String(code).toUpperCase()]);
+      if (!club.rows.length) return res.status(404).json({ ok:false, error:'Club not found' });
+      c = club.rows[0];
+    } else if (clubIdIn) {
+      const club = await query('SELECT * FROM clubs WHERE id=$1 AND COALESCE(active,true)=true', [clubIdIn]);
+      if (!club.rows.length) return res.status(404).json({ ok:false, error:'Club not found' });
+      c = club.rows[0];
+    } else {
+      return res.status(400).json({ ok:false, error:'missing_code' });
+    }
+    if (c.is_locked) {
+      return res.status(403).json({
+        ok: false,
+        error: 'club_locked',
+        message: 'This club is not accepting new members right now'
+      });
+    }
+    const clubId = String(c.id);
+    if (sb) {
+      const { data: existing } = await sb.from('club_memberships')
+        .select('actor_id,status').eq('club_id', clubId).eq('actor_id', actorId).limit(1);
+      if (existing && existing.length) {
+        return res.status(400).json({ ok:false, error:'Already a member', status: existing[0].status });
+      }
+      const now = new Date().toISOString();
+      const { error: insErr } = await sb.from('club_memberships').insert({
+        actor_id: actorId, club_id: clubId, role: 'player', status: 'pending',
+        joined_at: now, updated_at: now
+      });
+      if (insErr) throw insErr;
+    } else {
+      const exists = await query('SELECT actor_id,status FROM club_memberships WHERE club_id=$1 AND actor_id=$2', [clubId, actorId]);
+      if (exists.rows.length) {
+        return res.status(400).json({ ok:false, error:'Already a member', status: exists.rows[0].status });
+      }
+      await query(
+        'INSERT INTO club_memberships (club_id,actor_id,status,role,joined_at,updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())',
+        [clubId, actorId, 'pending', 'player']
+      );
+    }
+    res.json({ ok:true, success:true, club: { id: c.id, name: c.name, code: c.code, is_locked: false } });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/club/:id — public club info including lock status (UUID only)
+app.get('/api/club/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', async (req, res) => {
+  try {
+    const id = req.params.id;
+    const sb = getSupabase();
+    if (sb) {
+      const { data, error } = await sb.from('clubs')
+        .select('id,name,code,description,is_locked,active')
+        .eq('id', id)
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      if (!data) return res.status(404).json({ ok:false, error:'club_not_found' });
+      return res.json(Object.assign({ ok:true }, data, {
+        is_locked: !!data.is_locked,
+        is_active: data.active !== false
+      }));
+    }
+    const r = await query(
+      'SELECT id,name,code,description,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE id=$1',
+      [id]
+    );
+    if (!r.rows.length) return res.status(404).json({ ok:false, error:'club_not_found' });
+    const row = r.rows[0];
+    res.json(Object.assign({ ok:true }, row, { is_locked: !!row.is_locked, is_active: !!row.active }));
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 // ───────────────────────────────────────────────────────────────────────────
