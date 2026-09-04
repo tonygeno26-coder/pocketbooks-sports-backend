@@ -3093,6 +3093,17 @@ async function initDB() {
     `ALTER TABLE club_memberships ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP`,
     `ALTER TABLE clubs ADD COLUMN IF NOT EXISTS max_parlay DECIMAL(10,2) DEFAULT 1000`,
     `ALTER TABLE clubs ADD COLUMN IF NOT EXISTS description TEXT DEFAULT ''`,
+    `CREATE TABLE IF NOT EXISTS player_notifications (
+      id text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      player_id text NOT NULL,
+      type text NOT NULL,
+      title text NOT NULL,
+      message text NOT NULL,
+      read boolean DEFAULT false,
+      created_at timestamptz DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS player_notifications_player_created_idx ON player_notifications (player_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS player_notifications_player_unread_idx ON player_notifications (player_id) WHERE read = false`,
   ];
   for (const sql of migrations) {
     try { await query(sql); } catch(e) { console.error('[migration] failed:', sql.slice(0,60), e.message); }
@@ -15443,6 +15454,15 @@ app.post('/api/survivor/:poolId/approve', async (req, res) => {
     }
     const { error: insErr } = await sb.from('survivor_entries').insert(rows);
     if (insErr && insErr.code !== '23505') throw insErr;
+    try {
+      await _notifyPlayer({
+        playerId: playerId,
+        type: 'survivor_join_approved',
+        title: 'Survivor pool approved',
+        message: 'You were approved for ' + (pool.name || 'the survivor pool') +
+          ' with ' + entriesGranted + ' entr' + (entriesGranted === 1 ? 'y' : 'ies') + '.'
+      });
+    } catch(_n) {}
     res.json({ ok:true, entriesCreated: entriesGranted });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -15536,6 +15556,15 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
         playerId: String(actor.actorId), week: week, team: canonical
       });
     } catch(_tg) {}
+    try {
+      await _notifyPlayer({
+        playerId: String(actor.actorId),
+        type: 'survivor_pick_submitted',
+        title: 'Survivor pick submitted',
+        message: 'Week ' + week + ': ' + canonical +
+          (entryNumber > 1 ? ' (entry ' + entryNumber + ')' : '') + ' locked in.'
+      });
+    } catch(_n) {}
     res.json({ ok:true, pick: pick, phase: phase, entryNumber: entryNumber });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -15578,6 +15607,15 @@ async function _gradeSurvivorPool(sb, pool, week, opts) {
       eliminated.push({ playerId: entry.player_id, playerUsername: entry.player_username, entryNumber: entryNumber, entryLabel: label, reason:'no_pick' });
       results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: null, result:'lost', reason:'no_pick' });
       try { telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: null, won: false }); } catch(_e) {}
+      try {
+        await _notifyPlayer({
+          playerId: entry.player_id,
+          type: 'survivor_grade',
+          title: 'Survivor Week ' + week + ' result',
+          message: 'Eliminated — no pick submitted for Week ' + week +
+            (entryNumber > 1 ? ' (entry ' + entryNumber + ')' : '') + '.'
+        });
+      } catch(_n) {}
       continue;
     }
     if (pick.result === 'won' || pick.result === 'lost') {
@@ -15607,6 +15645,15 @@ async function _gradeSurvivorPool(sb, pool, week, opts) {
     }
     results.push({ playerId: entry.player_id, entryNumber: entryNumber, team: pick.team, result: result, reason:'graded', gameId: game.id });
     try { telegramBot.notifySurvivorGrade({ playerId: entry.player_id, week: week, team: pick.team, won: !!won }); } catch(_e) {}
+    try {
+      await _notifyPlayer({
+        playerId: entry.player_id,
+        type: 'survivor_grade',
+        title: won ? 'Survivor Week ' + week + ' survived' : 'Survivor Week ' + week + ' eliminated',
+        message: (won ? 'Survived' : 'Eliminated') + ' with ' + pick.team +
+          (entryNumber > 1 ? ' (entry ' + entryNumber + ')' : '') + '.'
+      });
+    } catch(_n) {}
   }
 
   let weekAdvanced = false;
@@ -15928,6 +15975,136 @@ try {
   });
 } catch (e) { console.warn('[admin-diamonds] register failed:', e.message); }
 
+// ── Player in-app notifications (survivor + general) ─────────────────────────
+async function _notifyPlayer(opts) {
+  var sb = getSupabase();
+  if (!sb || !opts || !opts.playerId || !opts.title) return null;
+  try {
+    var row = {
+      player_id: String(opts.playerId),
+      type: String(opts.type || 'general'),
+      title: String(opts.title),
+      message: String(opts.message || opts.body || ''),
+      read: false,
+      created_at: new Date().toISOString()
+    };
+    var r = await sb.from('player_notifications').insert(row).select('id').maybeSingle();
+    if (r && r.error) {
+      console.warn('[notify] insert failed:', r.error.message);
+      return null;
+    }
+    return r && r.data ? r.data.id : null;
+  } catch (e) {
+    console.warn('[notify] insert failed:', e && e.message);
+    return null;
+  }
+}
+
+app.get('/api/notifications', auth, async (req, res) => {
+  try {
+    var actor = req._actor || requireActor(req) || {};
+    var playerId = String((req.query && req.query.playerId) || actor.actorId || (req.user && req.user.id) || '');
+    if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
+    // Players may only read their own notifications unless host/admin.
+    if (actor.actorId && String(actor.actorId) !== playerId && actor.role !== 'host' && actor.role !== 'admin' && actor.role !== 'owner') {
+      playerId = String(actor.actorId);
+    }
+    var sb = getSupabase();
+    if (!sb) return res.json({ ok:true, notifications: [], unread: 0 });
+    var { data, error } = await sb.from('player_notifications')
+      .select('*')
+      .eq('player_id', playerId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+    var list = data || [];
+    var unread = list.filter(function(n){ return !n.read; }).length;
+    res.json({ ok:true, notifications: list, unread: unread });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+app.post('/api/notifications/read', auth, async (req, res) => {
+  try {
+    var actor = req._actor || requireActor(req) || {};
+    var playerId = String((req.body && req.body.playerId) || actor.actorId || (req.user && req.user.id) || '');
+    if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
+    if (actor.actorId && String(actor.actorId) !== playerId) playerId = String(actor.actorId);
+    var ids = (req.body && req.body.ids) || null;
+    var sb = getSupabase();
+    if (!sb) return res.json({ ok:true });
+    var q = sb.from('player_notifications').update({ read: true })
+      .eq('player_id', playerId).eq('read', false);
+    if (Array.isArray(ids) && ids.length) q = q.in('id', ids);
+    var { error } = await q;
+    if (error) throw error;
+    res.json({ ok:true });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+const SURVIVOR_WED_REMINDER_MS = 60 * 60 * 1000; // hourly check; fires once on Wed ET
+var _lastWedReminderDayKey = '';
+
+async function _survivorWedReminderTick() {
+  try {
+    var et = _etParts(Date.now());
+    if (et.dow !== 3) return; // Wednesday ET
+    var dayKey = et.y + '-' + et.m + '-' + et.d;
+    if (_lastWedReminderDayKey === dayKey) return;
+    var sb = getSupabase();
+    if (!sb) return;
+    var { data: pools, error } = await sb.from('survivor_pools').select('*').eq('status', 'active');
+    if (error) throw error;
+    var sent = 0;
+    for (var i = 0; i < (pools || []).length; i++) {
+      var pool = pools[i];
+      var week = pool.current_week;
+      var { data: entries } = await sb.from('survivor_entries').select('*')
+        .eq('pool_id', pool.id).eq('status', 'alive');
+      var { data: picks } = await sb.from('survivor_picks').select('player_id,entry_number')
+        .eq('pool_id', pool.id).eq('week', week);
+      var picked = {};
+      (picks || []).forEach(function(p){
+        picked[String(p.player_id) + ':' + _survivorEntryNum(p)] = true;
+      });
+      for (var j = 0; j < (entries || []).length; j++) {
+        var e = entries[j];
+        var key = String(e.player_id) + ':' + _survivorEntryNum(e);
+        if (picked[key]) continue;
+        // Dedup: skip if we already sent a Wed reminder today for this entry.
+        var since = new Date(Date.UTC(et.y, et.m - 1, et.d)).toISOString();
+        var { data: existing } = await sb.from('player_notifications')
+          .select('id')
+          .eq('player_id', String(e.player_id))
+          .eq('type', 'survivor_wed_reminder')
+          .gte('created_at', since)
+          .limit(1);
+        if (existing && existing.length) continue;
+        await _notifyPlayer({
+          playerId: e.player_id,
+          type: 'survivor_wed_reminder',
+          title: 'Survivor pick reminder',
+          message: 'Week ' + week + ' picks are due soon for ' + (pool.name || 'your survivor pool') + '. Lock in your team.'
+        });
+        sent++;
+      }
+    }
+    _lastWedReminderDayKey = dayKey;
+    console.log('[SURVIVOR_WED_REMINDER] day=' + dayKey + ' sent=' + sent);
+  } catch (e) {
+    console.warn('[SURVIVOR_WED_REMINDER] failed:', e && e.message);
+  }
+}
+
+function _startSurvivorWedReminder() {
+  console.log('[SURVIVOR_WED_REMINDER] hourly check (Wed America/New_York)');
+  setInterval(function() {
+    _survivorWedReminderTick().catch(function(e){ console.warn('[SURVIVOR_WED_REMINDER]', e.message); });
+  }, SURVIVOR_WED_REMINDER_MS);
+  setTimeout(function() {
+    _survivorWedReminderTick().catch(function(e){ console.warn('[SURVIVOR_WED_REMINDER]', e.message); });
+  }, 45000);
+}
+
 app.listen(PORT, '0.0.0.0', () => {
   const _startSHA = 'grade-espn-fallback';
   console.log('\n╔══════════════════════════════════════════════════╗');
@@ -15960,6 +16137,7 @@ app.listen(PORT, '0.0.0.0', () => {
   telegramBot.startTelegramBot();
   dailyAudit.startScheduler({ getSupabase: getSupabase });
   _startSurvivorAutoGrade();
+  _startSurvivorWedReminder();
   _startMlbGradePoller();
   // Init DB after server is bound
   initDB()
