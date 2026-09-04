@@ -3448,9 +3448,129 @@ app.get('/api/clubs/:id/members', auth, async (req, res) => {
 
 app.get('/api/clubs/:id/requests', auth, async (req, res) => {
   try {
-    const r = await query(`SELECT m.*,u.name,u.email FROM club_memberships m JOIN users u ON m.player_id=u.id WHERE m.club_id=$1 AND m.host_id=$2 AND m.status='pending' ORDER BY m.joined_at DESC`, [req.params.id, req.user.id]);
-    res.json(r.rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    const clubId = String(req.params.id);
+    const sb = getSupabase();
+    if (sb) {
+      const { data, error } = await sb.from('club_memberships')
+        .select('id,actor_id,club_id,role,status,joined_at,updated_at')
+        .eq('club_id', clubId)
+        .eq('status', 'pending')
+        .order('joined_at', { ascending: false });
+      if (error) throw error;
+      const rows = data || [];
+      const actorIds = rows.map(function(r){ return r.actor_id; }).filter(Boolean);
+      var usersById = Object.create(null);
+      if (actorIds.length) {
+        const { data: users } = await sb.from('users')
+          .select('id,name,email,username')
+          .in('id', actorIds);
+        (users || []).forEach(function(u){ usersById[String(u.id)] = u; });
+      }
+      const requests = rows.map(function(r){
+        var u = usersById[String(r.actor_id)] || {};
+        return {
+          id: r.id,
+          membershipId: r.id,
+          actor_id: r.actor_id,
+          player_id: r.actor_id,
+          playerId: r.actor_id,
+          club_id: r.club_id,
+          status: r.status,
+          role: r.role,
+          joined_at: r.joined_at,
+          name: u.name || u.username || null,
+          username: u.username || u.name || null,
+          email: u.email || null,
+          playerName: u.name || u.username || u.email || 'Player'
+        };
+      });
+      return res.json({ ok: true, requests: requests });
+    }
+    const r = await query(
+      `SELECT m.*, COALESCE(u.name,u.username,u.email) AS player_name, u.email, u.username
+       FROM club_memberships m
+       LEFT JOIN users u ON u.id::text = m.actor_id::text
+       WHERE m.club_id=$1 AND m.status='pending'
+       ORDER BY m.joined_at DESC`,
+      [clubId]
+    );
+    res.json({
+      ok: true,
+      requests: (r.rows || []).map(function(row){
+        return Object.assign({}, row, {
+          playerId: row.actor_id || row.player_id,
+          playerName: row.player_name || row.username || row.email || 'Player',
+          membershipId: row.id
+        });
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error: e.message }); }
+});
+
+// Alias used by overnight join-request flow
+app.get('/api/club/pending-requests', auth, async (req, res) => {
+  const clubId = (req.query && (req.query.clubId || req.query.club_id)) || req._clubId
+    || (req.body && (req.body.clubId || req.body.club_id));
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  // Reuse /api/clubs/:id/requests handler by mutating params and delegating.
+  req.params = Object.assign({}, req.params || {}, { id: String(clubId) });
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      const { data, error } = await sb.from('club_memberships')
+        .select('id,actor_id,club_id,role,status,joined_at,updated_at')
+        .eq('club_id', String(clubId))
+        .eq('status', 'pending')
+        .order('joined_at', { ascending: false });
+      if (error) throw error;
+      const rows = data || [];
+      const actorIds = rows.map(function(r){ return r.actor_id; }).filter(Boolean);
+      var usersById = Object.create(null);
+      if (actorIds.length) {
+        const { data: users } = await sb.from('users')
+          .select('id,name,email,username')
+          .in('id', actorIds);
+        (users || []).forEach(function(u){ usersById[String(u.id)] = u; });
+      }
+      const requests = rows.map(function(r){
+        var u = usersById[String(r.actor_id)] || {};
+        return {
+          id: r.id,
+          membershipId: r.id,
+          actor_id: r.actor_id,
+          player_id: r.actor_id,
+          playerId: r.actor_id,
+          club_id: r.club_id,
+          status: r.status,
+          role: r.role,
+          joined_at: r.joined_at,
+          name: u.name || u.username || null,
+          username: u.username || u.name || null,
+          email: u.email || null,
+          playerName: u.name || u.username || u.email || 'Player'
+        };
+      });
+      return res.json({ ok: true, requests: requests });
+    }
+    const r = await query(
+      `SELECT m.*, COALESCE(u.name,u.username,u.email) AS player_name, u.email, u.username
+       FROM club_memberships m
+       LEFT JOIN users u ON u.id::text = m.actor_id::text
+       WHERE m.club_id=$1 AND m.status='pending'
+       ORDER BY m.joined_at DESC`,
+      [String(clubId)]
+    );
+    res.json({
+      ok: true,
+      requests: (r.rows || []).map(function(row){
+        return Object.assign({}, row, {
+          playerId: row.actor_id || row.player_id,
+          playerName: row.player_name || row.username || row.email || 'Player',
+          membershipId: row.id
+        });
+      })
+    });
+  } catch(e) { res.status(500).json({ ok:false, error: e.message }); }
 });
 
 app.patch('/api/clubs/:id/requests/:memberId', auth, async (req, res) => {
@@ -8965,6 +9085,8 @@ function _filterPropsForDisplay(props) {
     if (!p || !p.playerName) continue;
     if (typeof p.odds !== 'number' || isNaN(p.odds)) continue;
     if (Math.abs(p.odds) > _PROPS_MAX_ABS_ODDS) continue;
+    // Drop basketball "Points" that sometimes leaks into NFL Owls payloads.
+    if (String(p.sport || '').toUpperCase() === 'NFL' && String(p.propType || '') === 'Points') continue;
     if (!_isAllowedPropLine(p.propType, p.line)) continue;
     var dedupeKey = _propsDedupeKey(p);
     var prev = bestByKey[dedupeKey];
@@ -9168,8 +9290,141 @@ async function fetchPropsFromOwlsInsight(sportShort) {
       }
     }
   }
+  // When Owls slate is still thin (early week), enrich from The Odds API player props.
+  // Owls remains primary; Odds API fills gaps so /api/props/nfl can clear 50+.
+  if (needExpand && merged.length < 50 && ODDS_KEY) {
+    try {
+      var oddsProps = await fetchNflPropsFromOddsApi();
+      if (oddsProps && oddsProps.length) {
+        console.log('[owls-props] odds-api enrich sport=' + sportShort + ' added=' + oddsProps.length);
+        merged = merged.concat(oddsProps);
+      }
+    } catch (e) {
+      console.warn('[owls-props] odds-api enrich failed:', e && e.message);
+    }
+  }
   if (!merged.length && first.ok === false) return first;
   return { ok: true, props: merged, url: first && first.url };
+}
+
+var _NFL_ODDS_API_PROP_MARKETS = [
+  'player_pass_yds', 'player_pass_tds', 'player_pass_completions', 'player_pass_interceptions',
+  'player_rush_yds', 'player_reception_yds', 'player_receptions',
+  'player_anytime_td', 'player_1st_td', 'player_sacks', 'player_tackles_assists'
+];
+
+function _oddsApiMarketToPropType(key) {
+  var k = String(key || '').toLowerCase();
+  if (k === 'player_pass_yds') return 'Passing Yards';
+  if (k === 'player_pass_tds') return 'Passing TDs';
+  if (k === 'player_pass_completions') return 'Pass Completions';
+  if (k === 'player_pass_interceptions') return 'Interceptions Thrown';
+  if (k === 'player_rush_yds') return 'Rushing Yards';
+  if (k === 'player_reception_yds') return 'Receiving Yards';
+  if (k === 'player_receptions') return 'Receptions';
+  if (k === 'player_anytime_td') return 'Anytime TD';
+  if (k === 'player_1st_td' || k === 'player_first_td') return 'First TD';
+  if (k === 'player_sacks') return 'Sacks';
+  if (k === 'player_tackles_assists') return 'Tackles + Asts';
+  if (k === 'player_tackles') return 'Tackles';
+  return _owlsPropType(k) || null;
+}
+
+function _httpGetJson(url, timeoutMs) {
+  return new Promise(function(resolve) {
+    var parsed;
+    try { parsed = new URL(url); } catch (_e) { return resolve(null); }
+    var chunks = [];
+    var req = https.request({
+      hostname: parsed.hostname, port: 443,
+      path: parsed.pathname + parsed.search, method: 'GET',
+      headers: { Accept: 'application/json', 'User-Agent': 'PocketBooksSports/2.0' }
+    }, function(res) {
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        if (res.statusCode !== 200) return resolve(null);
+        try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+        catch (_e) { resolve(null); }
+      });
+    });
+    req.on('error', function() { resolve(null); });
+    req.setTimeout(timeoutMs || 12000, function() { req.destroy(); resolve(null); });
+    req.end();
+  });
+}
+
+async function fetchNflPropsFromOddsApi() {
+  if (!ODDS_KEY) return [];
+  var sportKey = 'americanfootball_nfl';
+  var eventsUrl = 'https://api.the-odds-api.com/v4/sports/' + sportKey +
+    '/events?apiKey=' + encodeURIComponent(ODDS_KEY);
+  var events = await _httpGetJson(eventsUrl, 10000);
+  if (!Array.isArray(events) || !events.length) return [];
+  // Prefer nearest kickoffs; cap to control Odds API credit burn.
+  events = events.slice().sort(function(a, b) {
+    return String(a.commence_time || '').localeCompare(String(b.commence_time || ''));
+  }).slice(0, 8);
+  var markets = _NFL_ODDS_API_PROP_MARKETS.join(',');
+  var bookmakers = 'draftkings,fanduel,betmgm,caesars';
+  var out = [];
+  for (var i = 0; i < events.length; i++) {
+    var ev = events[i];
+    if (!ev || !ev.id) continue;
+    var url = 'https://api.the-odds-api.com/v4/sports/' + sportKey +
+      '/events/' + encodeURIComponent(ev.id) + '/odds?apiKey=' + encodeURIComponent(ODDS_KEY) +
+      '&regions=us&oddsFormat=american&bookmakers=' + encodeURIComponent(bookmakers) +
+      '&markets=' + encodeURIComponent(markets);
+    var data = await _httpGetJson(url, 12000);
+    if (!data || !Array.isArray(data.bookmakers)) continue;
+    var home = data.home_team || ev.home_team || '';
+    var away = data.away_team || ev.away_team || '';
+    var gameId = 'nfl:' + away + '@' + home + '-' + String(data.commence_time || ev.commence_time || '').slice(0, 10).replace(/-/g, '');
+    var best = Object.create(null);
+    data.bookmakers.forEach(function(bm) {
+      (bm.markets || []).forEach(function(mkt) {
+        var propType = _oddsApiMarketToPropType(mkt.key);
+        if (!propType) return;
+        (mkt.outcomes || []).forEach(function(oc) {
+          var playerName = oc.description || oc.name;
+          if (!playerName) return;
+          var side = 'over';
+          var line = typeof oc.point === 'number' ? oc.point : 0.5;
+          var nameLow = String(oc.name || '').toLowerCase();
+          if (nameLow === 'under' || nameLow === 'no') side = 'under';
+          else if (nameLow === 'over' || nameLow === 'yes') side = 'over';
+          else if (/under|no\b/.test(nameLow)) side = 'under';
+          // Anytime / First TD: description is player, name is Yes/No
+          if (/anytime td|first td/i.test(propType)) {
+            if (nameLow === 'no') side = 'under';
+            else side = 'over';
+            if (typeof oc.point !== 'number') line = 0.5;
+          }
+          var odds = typeof oc.price === 'number' ? oc.price : null;
+          if (odds == null) return;
+          var key = String(playerName).toLowerCase() + '|' + propType + '|' + line + '|' + side;
+          var prev = best[key];
+          if (!prev || odds > prev.odds) {
+            best[key] = {
+              gameId: gameId,
+              home: home,
+              away: away,
+              scheduledStart: data.commence_time || ev.commence_time || null,
+              sport: 'NFL',
+              propType: propType,
+              playerName: playerName,
+              team: null,
+              line: line,
+              side: side,
+              odds: odds,
+              pick: playerName + ' ' + (side === 'over' ? 'Over' : 'Under') + ' ' + line + ' ' + propType
+            };
+          }
+        });
+      });
+    });
+    Object.keys(best).forEach(function(k) { out.push(best[k]); });
+  }
+  return out;
 }
 
 function _collectPropsForSport(sportShort) {
