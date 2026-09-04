@@ -67,7 +67,9 @@ const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLE
 const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', _GRADING_DEFAULT_ON);
 const BROWSER_TICKET_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_TICKET_MIRROR_WRITES_ENABLED', false);
 const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRITES_ENABLED', false);
-const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', false);
+// Live betting: on in production unless explicitly disabled (matches grading default).
+// Set LIVE_BETTING_ENABLED=false to opt out during migration / testing.
+const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', _GRADING_DEFAULT_ON);
 const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
 const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
 const LIVE_PLACEMENT_REJECTION_CODES = new Set([
@@ -2813,6 +2815,7 @@ app.get('/api/health', async (req, res) => {
     bakedSHA:_gitSha, buildMarker:_gitSha, dbStatus, oddsStatus,
     resultStatus:_lastResultSuccessAt?'healthy':(_mlbGradePollerStarted?'starting':'unknown'),
     queueStatus:'not_implemented',
+    liveBettingEnabled: !!LIVE_BETTING_ENABLED,
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
     lastGradePollAt:_lastGradePollAt, lastGradeRunAt:_lastGradeRunAt,
     lastGradedAt:_lastGradedAt,
@@ -2842,7 +2845,8 @@ app.get('/api/admin/env-check', async (req, res) => {
     'WALLET_ERC20','WALLET_BTC',
     'POCKETBOOKS_USDT_CONTRACT','POCKETBOOKS_USDC_CONTRACT',
     'BTC_CONFIRMATIONS_REQUIRED','ETH_CONFIRMATIONS_REQUIRED',
-    'APP_VERSION','COMMIT_SHA','LOG_VERBOSE'
+    'APP_VERSION','COMMIT_SHA','LOG_VERBOSE','LIVE_BETTING_ENABLED',
+    'TELEGRAM_BOT_TOKEN','TELEGRAM_WEBHOOK_SECRET'
   ];
   const missing  = REQUIRED.filter(function(k){ return !process.env[k]; }).map(function(k){ return { key:k, level:'required' }; });
   const warnings = RECOMMENDED.filter(function(v){ return !process.env[v.key]; }).map(function(v){ return { key:v.key, reason:v.reason }; });
@@ -14850,6 +14854,11 @@ app.post('/api/survivor/:poolId/pick', async (req, res) => {
       throw error;
     }
     if (pick) { pick.phase = phase; pick.entryNumber = _survivorEntryNum(pick); }
+    try {
+      telegramBot.notifySurvivorPick({
+        playerId: String(actor.actorId), week: week, team: canonical
+      });
+    } catch(_tg) {}
     res.json({ ok:true, pick: pick, phase: phase, entryNumber: entryNumber });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
