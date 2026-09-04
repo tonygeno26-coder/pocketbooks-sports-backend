@@ -11506,19 +11506,62 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       }
     });
 
+    // Ledger is source of truth for available balance (matches /api/player/dashboard).
+    // Ticket formula is fallback only when a player has no ledger rows.
+    var ledgerBalByPid = {};
+    var ledgerCountByPid = {};
+    try {
+      var balPids = Object.keys(byPlayer);
+      if (balPids.length && clubId) {
+        const { data: ledRows, error: ledErr } = await sb.from('ledger_entries')
+          .select('player_id,amount,balance_after,created_at,type')
+          .eq('club_id', clubId)
+          .in('player_id', balPids)
+          .order('created_at', { ascending: true });
+        if (ledErr) throw ledErr;
+        var byLed = {};
+        (ledRows||[]).forEach(function(r){
+          var pid = String(r.player_id||'');
+          if (!pid) return;
+          if (!byLed[pid]) byLed[pid] = [];
+          byLed[pid].push(r);
+        });
+        balPids.forEach(function(pid){
+          var rows = byLed[pid] || [];
+          ledgerCountByPid[pid] = rows.length;
+          if (!rows.length) return;
+          var start = (memberMap[pid] && memberMap[pid].balance_start != null)
+            ? memberMap[pid].balance_start : null;
+          ledgerBalByPid[pid] = _deriveBalanceFromLedgerEntries(start, rows);
+        });
+      }
+    } catch(_lb) {
+      console.warn('[host/dashboard] ledger balance error:', _lb.message||_lb);
+    }
+
     const players = Object.keys(byPlayer).map(function(k) {
       var p = byPlayer[k];
       p.openRisk = rnd(p.openRisk);
       p.settledGains = rnd(p.settledGains);
       p.settledLosses = rnd(p.settledLosses);
-      p.availableBalance = p.startingBalance != null
+      var ticketAvailable = p.startingBalance != null
         ? rnd(p.startingBalance - p.openRisk - p.settledLosses + p.settledGains)
         : null;
+      if (ledgerBalByPid[k] != null) {
+        p.availableBalance = rnd(ledgerBalByPid[k]);
+        p.balanceSource = 'ledger';
+      } else {
+        p.availableBalance = ticketAvailable;
+        p.balanceSource = ticketAvailable != null ? 'tickets' : null;
+      }
+      p.ticketAvailable = ticketAvailable;
+      p.ledgerEntryCount = ledgerCountByPid[k] || 0;
       return p;
     }).sort(function(a,b){ return (b.openRisk||0) - (a.openRisk||0); });
 
     console.log('[host/dashboard] playersOut='+players.length
-      + ' names='+players.map(function(p){ return p.username; }).join(','));
+      + ' names='+players.map(function(p){ return p.username; }).join(',')
+      + ' balSrc='+players.map(function(p){ return (p.username||p.playerId)+':'+(p.balanceSource||'none')+'='+p.availableBalance; }).join('|'));
 
     // Players Owe You = lost stakes (settledGain); You Owe Players = won profits (settledLoss)
     const playersOweAll = rnd(settledGain);
@@ -11529,7 +11572,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     // Settled Hold % = profit / settledHandle * 100
     const holdPct       = settledHandle>0 ? rnd(profit/settledHandle*100) : null;
 
-    // Weekly window (ISO Mon 00:00 local-ish UTC Monday)
+    // Weekly window (ISO Mon 00:00 UTC Monday) — graded_at preferred, else placed_at
     var _wStart = new Date(); _wStart.setUTCHours(0,0,0,0);
     _wStart.setUTCDate(_wStart.getUTCDate() - ((_wStart.getUTCDay()+6)%7));
     var _wStartMs = _wStart.getTime();
@@ -11538,7 +11581,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       var s=(t.status||'').toLowerCase();
       if (s!=='won' && s!=='lost') return;
       var ts=new Date(t.graded_at||t.placed_at||0).getTime();
-      if (!(ts>=_wStartMs)) return;
+      if (!ts || !(ts>=_wStartMs)) return;
       var risk=parseFloat(t.risk_amount)||0;
       var profitAmt=parseFloat(t.potential_profit)||0;
       weekHandle+=risk; weekSettledCount++;
@@ -11549,6 +11592,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     weekHandle=rnd(weekHandle);
     var weekNet=rnd(weekPlayersOwe-weekHostOwes);
     var weekHoldPct=weekHandle>0?rnd(weekNet/weekHandle*100):null;
+    var weeklyStats = {
+      weekStart: _wStart.toISOString(),
+      playersOwe: weekPlayersOwe,
+      hostOwes: weekHostOwes,
+      net: weekNet,
+      handle: weekHandle,
+      settledCount: weekSettledCount,
+      holdPct: weekHoldPct
+    };
 
     const stats = {
       // Handle = all-time risk wagered (active + settled). settledHandle kept for Hold %.
@@ -11567,14 +11619,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       activeBetCount: activeBetCount,
       gradedCount:    gradedCount,
       canceledCount:  canceledCount,
-      weekly: {
-        playersOwe: weekPlayersOwe,
-        hostOwes: weekHostOwes,
-        net: weekNet,
-        handle: weekHandle,
-        settledCount: weekSettledCount,
-        holdPct: weekHoldPct
-      },
+      weekly: weeklyStats,
       allTime: {
         playersOwe: playersOweAll,
         hostOwes: hostOwesAll,
@@ -11621,7 +11666,9 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         holdPct:        stats.holdPct,
         profit:         stats.profit,
         playersOwe:     stats.playersOwe,
-        hostOwes:       stats.hostOwes
+        hostOwes:       stats.hostOwes,
+        weekly:         weeklyStats,
+        allTime:        stats.allTime
       },
       warnings
     });

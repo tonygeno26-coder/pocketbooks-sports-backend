@@ -57,6 +57,19 @@ describe('GET /api/host/dashboard', () => {
     expect(dash).toContain('hostOwes:');
   });
 
+  test('availableBalance prefers ledger over ticket formula', () => {
+    expect(dash).toContain("_deriveBalanceFromLedgerEntries");
+    expect(dash).toContain("p.balanceSource = 'ledger'");
+    expect(dash).toContain('ticketAvailable');
+    expect(dash).toContain('weekly:         weeklyStats');
+  });
+
+  test('weekly stats are computed from graded won/lost tickets', () => {
+    expect(dash).toContain('weekSettledCount');
+    expect(dash).toContain('graded_at||t.placed_at');
+    expect(dash).toContain('weeklyStats');
+  });
+
   test('players array is built from club_members plus tickets', () => {
     expect(dash).toContain('Object.keys(memberMap).forEach');
     expect(dash).toContain('players:        players');
