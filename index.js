@@ -3405,12 +3405,31 @@ app.get('/api/clubs/:id/requests', auth, async (req, res) => {
 });
 
 app.patch('/api/clubs/:id/requests/:memberId', auth, async (req, res) => {
-  const { action } = req.body;
+  const { action, max_bet, max_daily_risk, max_payout, max_open_risk, balanceStart, starting_balance, credit_limit } = req.body || {};
   const status = action === 'approve' ? 'approved' : 'rejected';
+  const startBal = parseFloat(balanceStart != null ? balanceStart : (starting_balance != null ? starting_balance : credit_limit));
+  const mb = parseFloat(max_bet); const md = parseFloat(max_daily_risk); const mp = parseFloat(max_payout);
   try {
-    const r = await query(`UPDATE club_memberships SET status=$1,approved_at=${action==='approve'?'NOW()':'NULL'} WHERE id=$2 AND host_id=$3 RETURNING *`, [status, req.params.memberId, req.user.id]);
-    if (action === 'approve' && r.rows[0]) await query('INSERT INTO player_limits (club_id,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.params.id, r.rows[0].player_id]);
-    res.json(r.rows[0]);
+    const credit = Number.isFinite(startBal) ? startBal : null;
+    const r = await query(
+      `UPDATE club_memberships SET status=$1,approved_at=${action==='approve'?'NOW()':'NULL'},
+        credit_limit=COALESCE($4,credit_limit), max_bet=COALESCE($5,max_bet), balance=COALESCE($4,balance)
+       WHERE id=$2 AND host_id=$3 RETURNING *`,
+      [status, req.params.memberId, req.user.id, credit, Number.isFinite(mb) ? mb : null]);
+    if (action === 'approve' && r.rows[0]) {
+      const pid = r.rows[0].player_id;
+      await query(
+        `INSERT INTO player_limits (club_id,user_id,max_bet,max_daily_risk,max_payout,updated_at)
+         VALUES ($1,$2,$3,$4,$5,NOW())
+         ON CONFLICT (club_id,user_id) DO UPDATE SET
+           max_bet=EXCLUDED.max_bet, max_daily_risk=EXCLUDED.max_daily_risk,
+           max_payout=EXCLUDED.max_payout, updated_at=NOW()`,
+        [req.params.id, pid,
+          Number.isFinite(mb) ? mb : 100,
+          Number.isFinite(md) ? md : 500,
+          Number.isFinite(mp) ? mp : 2000]);
+    }
+    res.json(Object.assign({}, r.rows[0] || {}, { ok:true, max_open_risk: max_open_risk != null ? parseFloat(max_open_risk) : null }));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -4527,20 +4546,25 @@ function _membershipInvalidate(actorId, clubId) {
 }
 
 // Resolve role for token issuance (production: DB wins; dev: fallback allowed)
+function _membershipStatusActive(status) {
+  const s = String(status || '').toLowerCase();
+  return s === 'active' || s === 'approved';
+}
+
 async function _resolveTokenRole(actorId, clubId, requestedRole) {
   if (!actorId) return { error:'missing_actorId' };
   if (!clubId)  return { error:'missing_clubId' };
   const m = await _membershipLoad(actorId, clubId);
   if (IS_PRODUCTION) {
     if (!m)                     return { error:'membership_not_found' };
-    if (m.status !== 'active')  return { error:'membership_inactive', status:m.status };
+    if (!_membershipStatusActive(m.status))  return { error:'membership_inactive', status:m.status };
     // platform_admin only from server allowlist
     if (requestedRole === 'platform_admin' && !PLATFORM_ADMIN_ALLOWLIST.includes(actorId))
       return { error:'cannot_self_issue_elevated_role' };
     return { ok:true, role:m.role, membership:m };
   }
   // Dev: DB wins if available, else use requested or default
-  if (m && m.status === 'active') return { ok:true, role:m.role, membership:m };
+  if (m && _membershipStatusActive(m.status)) return { ok:true, role:m.role, membership:m };
   const role = ROLE_RANK[requestedRole] != null ? requestedRole : 'player';
   return { ok:true, role, membership:null };
 }
@@ -4550,7 +4574,7 @@ async function _checkMembershipFreshness(actorId, clubId, tokenRole) {
   if (!actorId || !clubId) return { ok:true }; // dev-bypass actors skip
   const m = await _membershipLoad(actorId, clubId);
   if (!m)                     return { ok:false, reason:'membership_not_found' };
-  if (m.status !== 'active')  return { ok:false, reason:'membership_inactive', status:m.status };
+  if (!_membershipStatusActive(m.status))  return { ok:false, reason:'membership_inactive', status:m.status };
   const dbRole = m.role;
   if (dbRole !== tokenRole)   return { ok:false, reason:'membership_role_changed',
                                         tokenRole, dbRole };
@@ -4749,7 +4773,7 @@ function requireActor(req) {
       const mCheck = _membershipMemCache.get(_mKey(p.sub||p.actorId, club));
       if (mCheck && mCheck.row) {
         const m = mCheck.row;
-        if (m.status !== 'active') {
+        if (!_membershipStatusActive(m.status)) {
           _writeAuthAudit('membership_inactive', p.sub, club, req.path, { status:m.status, jti });
           return { error:'membership_inactive', status:401, auditEvent:'membership_inactive' };
         }
@@ -10779,22 +10803,140 @@ app.post('/api/club/members/invite', requirePermissionScoped('settle_player'), a
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// POST /api/club/members/approve
+// POST /api/club/members/approve — approve pending join + set player_limits / starting balance
 app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor || {};
   const deny  = _requireMemberAdmin(actor);
   if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
-  const { clubId, targetActorId } = req.body || {};
+  const body = req.body || {};
+  const clubId = body.clubId;
+  const targetActorId = body.targetActorId || body.playerId;
   if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+
+  const startRaw = body.balanceStart != null ? body.balanceStart
+    : (body.starting_balance != null ? body.starting_balance : body.credit_limit);
+  const startBal = parseFloat(startRaw);
+  const maxBet = parseFloat(body.max_bet != null ? body.max_bet : body.maxBet);
+  const maxDaily = parseFloat(body.max_daily_risk != null ? body.max_daily_risk : body.maxDailyRisk);
+  const maxPayout = parseFloat(body.max_payout != null ? body.max_payout : body.maxPayout);
+  const maxOpen = parseFloat(body.max_open_risk != null ? body.max_open_risk : body.maxOpenRisk);
+  const now = new Date().toISOString();
+  const limitsRow = {
+    club_id: String(clubId),
+    player_id: String(targetActorId),
+    max_bet: Number.isFinite(maxBet) ? maxBet : 100,
+    max_daily_risk: Number.isFinite(maxDaily) ? maxDaily : 500,
+    max_payout: Number.isFinite(maxPayout) ? maxPayout : 2000,
+    updated_at: now
+  };
+  if (Number.isFinite(maxOpen)) limitsRow.max_open_risk = maxOpen;
+  if (Number.isFinite(maxBet)) limitsRow.max_single_bet = maxBet;
+
   try {
     const sb = getSupabase();
-    if (sb) await sb.from('club_memberships')
-      .update({ status:'active', updated_at:new Date().toISOString(), updated_by:actor.actorId })
-      .eq('actor_id',targetActorId).eq('club_id',clubId).eq('status','pending');
+    if (sb) {
+      // Prefer status=approved (host approval flow); auth accepts approved|active.
+      const { error: memErr } = await sb.from('club_memberships')
+        .update({ status:'approved', updated_at:now, updated_by:actor.actorId, approved_at:now })
+        .eq('actor_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
+      if (memErr) {
+        // Some schemas use player_id instead of actor_id
+        await sb.from('club_memberships')
+          .update({ status:'approved', updated_at:now, updated_by:actor.actorId, approved_at:now })
+          .eq('player_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
+      }
+
+      await sb.from('player_limits').upsert(limitsRow, { onConflict:'club_id,player_id' });
+
+      if (Number.isFinite(startBal)) {
+        const memberRow = {
+          club_id: String(clubId),
+          player_id: String(targetActorId),
+          balance_start: startBal,
+          status: 'approved',
+          updated_at: now
+        };
+        const { error: cmErr } = await sb.from('club_members')
+          .upsert(memberRow, { onConflict:'club_id,player_id' });
+        if (cmErr) {
+          // Fallback: update-only if upsert conflict target differs
+          await sb.from('club_members')
+            .update({ balance_start: startBal, status:'approved', updated_at:now })
+            .eq('club_id', String(clubId)).eq('player_id', String(targetActorId));
+          const { data: existing } = await sb.from('club_members').select('player_id')
+            .eq('club_id', String(clubId)).eq('player_id', String(targetActorId)).limit(1);
+          if (!existing || !existing.length) {
+            await sb.from('club_members').insert(memberRow);
+          }
+        }
+      }
+
+      // Best-effort in-app notification for the player
+      try {
+        await sb.from('notifications').insert({
+          user_id: String(targetActorId),
+          club_id: String(clubId),
+          type: 'club_approved',
+          title: 'Club join approved',
+          body: 'You were approved to join the club. You can place bets now.',
+          read: false,
+          created_at: now
+        });
+      } catch(_n) { /* notifications table may not exist */ }
+    }
     _membershipInvalidate(targetActorId, clubId);
-    _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', { targetActorId });
-    res.json({ ok:true, targetActorId, status:'active' });
+    _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', {
+      targetActorId, balanceStart: Number.isFinite(startBal) ? startBal : null,
+      max_bet: limitsRow.max_bet, max_daily_risk: limitsRow.max_daily_risk, max_payout: limitsRow.max_payout
+    });
+    res.json({
+      ok:true, targetActorId, status:'approved',
+      balanceStart: Number.isFinite(startBal) ? startBal : null,
+      limits: limitsRow
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/club/members/deny — reject pending join request
+app.post('/api/club/members/deny', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  const deny  = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const body = req.body || {};
+  const clubId = body.clubId;
+  const targetActorId = body.targetActorId || body.playerId;
+  if (!targetActorId) return res.status(400).json({ ok:false, error:'missing_targetActorId' });
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  const now = new Date().toISOString();
+  try {
+    const sb = getSupabase();
+    if (sb) {
+      let { error } = await sb.from('club_memberships')
+        .update({ status:'rejected', updated_at:now, updated_by:actor.actorId })
+        .eq('actor_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
+      if (error) {
+        await sb.from('club_memberships')
+          .update({ status:'rejected', updated_at:now, updated_by:actor.actorId })
+          .eq('player_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
+      }
+      try {
+        await sb.from('notifications').insert({
+          user_id: String(targetActorId),
+          club_id: String(clubId),
+          type: 'club_denied',
+          title: 'Club join denied',
+          body: 'Your request to join the club was denied.',
+          read: false,
+          created_at: now
+        });
+      } catch(_n) {}
+    }
+    _membershipInvalidate(targetActorId, clubId);
+    _writeAuthAudit('member_denied', actor.actorId, clubId, '/club/members/deny', { targetActorId });
+    res.json({ ok:true, targetActorId, status:'rejected' });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
