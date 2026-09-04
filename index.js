@@ -9302,27 +9302,17 @@ async function fetchPropsFromOwlsInsight(sportShort) {
     }
   }
   // Enrich NFL/NCAAF from The Odds API so Completions/INTs/Anytime TD/Sacks/etc.
-  // still surface when Owls is yardage-heavy. Also covers the thin-slate (<50) case.
-  // /api/props response cache (60s) bounds Odds API credit burn.
-  if (needExpand && ODDS_KEY) {
-    var _owlsTypeSeen = Object.create(null);
-    for (var _ti = 0; _ti < merged.length; _ti++) {
-      var _pt = merged[_ti] && merged[_ti].propType;
-      if (_pt) _owlsTypeSeen[String(_pt)] = 1;
-    }
-    var _nflCoverageTypes = [
-      'Pass Completions', 'Interceptions Thrown', 'Receptions',
-      'Anytime TD', 'First TD', 'Sacks', 'Tackles', 'Tackles + Asts'
-    ];
-    var _missingCoverage = merged.length < 50;
-    for (var _ci = 0; !_missingCoverage && _ci < _nflCoverageTypes.length; _ci++) {
-      if (!_owlsTypeSeen[_nflCoverageTypes[_ci]]) _missingCoverage = true;
-    }
-    if (_missingCoverage) {
+  // Always supplement NFL/NCAAF with Odds API props — yardage + specialty coverage.
+  // The 60s response cache bounds credit burn regardless of how often this runs.
+  if (needExpand) {
+    if (!ODDS_KEY) {
+      console.warn('[owls-props] ODDS_KEY not configured — skipping Odds API NFL enrichment');
+    } else {
       try {
         var oddsProps = await fetchNflPropsFromOddsApi();
         if (oddsProps && oddsProps.length) {
-          console.log('[owls-props] odds-api enrich sport=' + sportShort + ' added=' + oddsProps.length);
+          console.log('[owls-props] odds-api enrich sport=' + sportShort
+            + ' owls=' + merged.length + ' added=' + oddsProps.length);
           merged = merged.concat(oddsProps);
         }
       } catch (e) {
@@ -9390,7 +9380,7 @@ async function fetchNflPropsFromOddsApi() {
   // Prefer nearest kickoffs; cap to control Odds API credit burn.
   events = events.slice().sort(function(a, b) {
     return String(a.commence_time || '').localeCompare(String(b.commence_time || ''));
-  }).slice(0, 8);
+  }).slice(0, 16);
   var markets = _NFL_ODDS_API_PROP_MARKETS.join(',');
   var bookmakers = 'draftkings,fanduel,betmgm,caesars';
   var out = [];
