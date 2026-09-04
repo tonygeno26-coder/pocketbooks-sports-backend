@@ -9290,17 +9290,33 @@ async function fetchPropsFromOwlsInsight(sportShort) {
       }
     }
   }
-  // When Owls slate is still thin (early week), enrich from The Odds API player props.
-  // Owls remains primary; Odds API fills gaps so /api/props/nfl can clear 50+.
-  if (needExpand && merged.length < 50 && ODDS_KEY) {
-    try {
-      var oddsProps = await fetchNflPropsFromOddsApi();
-      if (oddsProps && oddsProps.length) {
-        console.log('[owls-props] odds-api enrich sport=' + sportShort + ' added=' + oddsProps.length);
-        merged = merged.concat(oddsProps);
+  // Enrich NFL/NCAAF from The Odds API so Completions/INTs/Anytime TD/Sacks/etc.
+  // still surface when Owls is yardage-heavy. Also covers the thin-slate (<50) case.
+  // /api/props response cache (60s) bounds Odds API credit burn.
+  if (needExpand && ODDS_KEY) {
+    var _owlsTypeSeen = Object.create(null);
+    for (var _ti = 0; _ti < merged.length; _ti++) {
+      var _pt = merged[_ti] && merged[_ti].propType;
+      if (_pt) _owlsTypeSeen[String(_pt)] = 1;
+    }
+    var _nflCoverageTypes = [
+      'Pass Completions', 'Interceptions Thrown', 'Receptions',
+      'Anytime TD', 'First TD', 'Sacks', 'Tackles', 'Tackles + Asts'
+    ];
+    var _missingCoverage = merged.length < 50;
+    for (var _ci = 0; !_missingCoverage && _ci < _nflCoverageTypes.length; _ci++) {
+      if (!_owlsTypeSeen[_nflCoverageTypes[_ci]]) _missingCoverage = true;
+    }
+    if (_missingCoverage) {
+      try {
+        var oddsProps = await fetchNflPropsFromOddsApi();
+        if (oddsProps && oddsProps.length) {
+          console.log('[owls-props] odds-api enrich sport=' + sportShort + ' added=' + oddsProps.length);
+          merged = merged.concat(oddsProps);
+        }
+      } catch (e) {
+        console.warn('[owls-props] odds-api enrich failed:', e && e.message);
       }
-    } catch (e) {
-      console.warn('[owls-props] odds-api enrich failed:', e && e.message);
     }
   }
   if (!merged.length && first.ok === false) return first;
@@ -11435,7 +11451,8 @@ app.post('/api/club/toggle-lock', requirePermissionScoped('settle_player'), asyn
 });
 
 // POST /api/club/join-request — player requests to join (respects clubs.is_locked)
-app.post('/api/club/join-request', auth, async (req, res) => {
+// Alias: POST /api/club/request-join (same handler)
+async function _clubJoinRequestHandler(req, res) {
   const body = req.body || {};
   const code = body.code || body.clubCode;
   const clubIdIn = body.clubId || body.club_id || null;
@@ -11495,7 +11512,9 @@ app.post('/api/club/join-request', auth, async (req, res) => {
     }
     res.json({ ok:true, success:true, club: { id: c.id, name: c.name, code: c.code, is_locked: false } });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
-});
+}
+app.post('/api/club/join-request', auth, _clubJoinRequestHandler);
+app.post('/api/club/request-join', auth, _clubJoinRequestHandler);
 
 // GET /api/club/:id — public club info including lock status (UUID only)
 app.get('/api/club/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', async (req, res) => {
