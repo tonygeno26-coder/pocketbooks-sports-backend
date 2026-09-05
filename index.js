@@ -8,6 +8,7 @@ const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
 const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
 const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
+const owlsLiveScores = require('./lib/owls-live-scores');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4358,8 +4359,12 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
     var down      = ev.down || scoreObj.down || null;
     var distance  = ev.distance || ev.yards_to_go || scoreObj.distance || null;
 
+    // Owls odds `eventId` matches /scores/live `id` (e.g. mlb:Away@Home-YYYYMMDD).
+    var owlsEventId = ev.eventId || ev.event_id || null;
     var gEntry = { id:evId, sport_key:sport, commence_time:ct,
       home_team:home, away_team:away, canonicalKey:ck,
+      eventId: owlsEventId || null,
+      owlsEventId: owlsEventId || null,
       league: league || null,
       status:gameStatus, completed:!!evCompleted, canceled:!!evCanceled,
       isLive:!!evLive,
@@ -4368,6 +4373,7 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
       awayScore: awayScore!=null ? Number(awayScore) : null,
       period, clock, inning, inningHalf, outs, basesOccupied: basesOcc,
       possession, down, distance,
+      setScore: null, gameScore: null, statusDetail: null,
       markets:[] };
 
     // Bookmakers may be at ev.bookmakers, ev.books, or markets may be directly on ev
@@ -7244,6 +7250,8 @@ if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
       console.error('[poll] boot immediate refresh error:', e && e.message);
     });
   });
+  // Live scores poller (independent of odds WS skip).
+  setImmediate(function() { _startLiveScorePoller(); });
 } else {
   console.error('[poll] startup keyPresent=false keyMasked=MISSING provider='+ODDS_PROVIDER+
     ' pollerScheduled=false reason=no_api_key');
@@ -8151,6 +8159,8 @@ async function _runOwlsRestPoll(trigger) {
       console.log('[owls-rest] cache updated trigger='+trigger+' games='+applied.gameCount+
         ' markets='+applied.marketCount+' sportsOk='+owlsResults.length+
         ' sourceStatus='+applied.sourceStatus+' fetch='+fetchDurationMs+'ms');
+      // Refresh scores alongside odds (WS may skip later odds REST ticks).
+      _pollOwlsLiveScores('after_odds_'+trigger).catch(function(){});
       return { ok:true, gameCount:applied.gameCount, marketCount:applied.marketCount,
         sourceStatus:applied.sourceStatus, trigger };
     }
@@ -8269,6 +8279,7 @@ async function _applyOwlsResultsToCache(owlsResults, allGames, fetchDurationMs) 
 
   if (owlsResults.length > 0) {
     LIVE_MARKET_CACHE = newCache;
+    try { _hydrateLiveMarketCacheWithScores(); } catch(_hs) {}
     return { ok:true, gameCount:newCache.gameCount, marketCount:overlayMarketCount,
       sourceStatus:newCache.sourceStatus };
   }
@@ -8917,6 +8928,27 @@ function _isMatchingSport(gameSportKey, requestedShort, requestedFull) {
 
 function _projectOwlsGameToFlat(g, sportLabel) {
   if (!g || typeof g !== 'object') return null;
+  // Presentation-only: attach Owls /scores/live fields when odds row lacks them.
+  try {
+    if ((g.homeScore == null && g.awayScore == null) && typeof LIVE_SCORE_CACHE !== 'undefined' && LIVE_SCORE_CACHE && LIVE_SCORE_CACHE.bySport) {
+      var sportShortProbe = String(sportLabel || g.sport_key || '').toLowerCase();
+      var idxProbe = LIVE_SCORE_CACHE.bySport[sportShortProbe];
+      if (!idxProbe) {
+        if (sportShortProbe.indexOf('mlb') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.mlb;
+        else if (sportShortProbe.indexOf('soccer') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.soccer;
+        else if (sportShortProbe.indexOf('tennis') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.tennis;
+        else if (sportShortProbe.indexOf('ncaaf') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.ncaaf;
+        else if (sportShortProbe.indexOf('nfl') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.nfl;
+        else if (sportShortProbe.indexOf('nba') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.nba;
+        else if (sportShortProbe.indexOf('ncaab') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.ncaab;
+        else if (sportShortProbe.indexOf('nhl') >= 0) idxProbe = LIVE_SCORE_CACHE.bySport.nhl;
+      }
+      if (idxProbe) {
+        var scored = owlsLiveScores.matchScoreToGame(g, idxProbe);
+        if (scored) owlsLiveScores.applyScoreFieldsToGame(g, scored);
+      }
+    }
+  } catch(_scoreAttach) {}
   var canonicalGameKey = g.canonicalKey || g.canonicalGameKey || null;
   var providerGameId   = g.id || g.providerGameId || null;
   var moneyline = [];
@@ -9048,15 +9080,17 @@ function _projectOwlsGameToFlat(g, sportLabel) {
   // can filter the Live tab and decide whether to show a betting CTA.
   var status = g.status || _deriveGameStatus(g);
   var sportShort = String(sportLabel || g.sport_key || '').toLowerCase();
-  var gameStateText = _formatGameStateText(sportShort, {
+  var gameStateText = g.gameStateText || _formatGameStateText(sportShort, {
     status, period:g.period, clock:g.clock,
     inning:g.inning, inningHalf:g.inningHalf, outs:g.outs,
-    down:g.down, distance:g.distance
+    down:g.down, distance:g.distance,
+    setScore:g.setScore, gameScore:g.gameScore, statusDetail:g.statusDetail
   });
   var projected = {
     id:    g.id || g.providerGameId || ((g.away_team||'')+'@'+(g.home_team||'')+'@'+(g.commence_time||'')),
     canonicalGameKey: canonicalGameKey,
     providerGameId: providerGameId,
+    eventId: g.eventId || g.owlsEventId || null,
     sport: sportLabel || g.sport_key || '',
     home:  g.home_team || '',
     away:  g.away_team || '',
@@ -9078,6 +9112,9 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     possession:g.possession|| null,
     down:      g.down      || null,
     distance:  g.distance  != null ? g.distance : null,
+    setScore:  g.setScore  || null,
+    gameScore: g.gameScore || null,
+    statusDetail: g.statusDetail || null,
     gameStateText: gameStateText,
     league: g.league || null,
     moneyline: moneyline,
@@ -9108,6 +9145,7 @@ function _formatGameStateText(sportShort, s) {
   if (s.status !== 'live')     return '';
   var sp = String(sportShort||'').toLowerCase();
   if (sp.indexOf('mlb') >= 0 || sp.indexOf('baseball') >= 0) {
+    if (s.statusDetail) return String(s.statusDetail);
     var arrow = '';
     var half = String(s.inningHalf||'').toLowerCase();
     if (half === 'top'    || half === 't') arrow = '▲';
@@ -9130,7 +9168,20 @@ function _formatGameStateText(sportShort, s) {
     return (pp + (s.clock?' '+s.clock:'')).trim();
   }
   if (sp.indexOf('soccer') >= 0) {
-    return (s.clock ? s.clock+"'" : '');
+    if (s.clock) {
+      var clk = String(s.clock);
+      return /'$/.test(clk) ? clk : clk + "'";
+    }
+    if (s.statusDetail && /^\d/.test(String(s.statusDetail))) return String(s.statusDetail);
+    return '';
+  }
+  if (sp.indexOf('tennis') >= 0) {
+    var bits = [];
+    if (s.setScore) bits.push(String(s.setScore));
+    else if (s.period != null) bits.push('Set ' + s.period);
+    if (s.gameScore) bits.push(String(s.gameScore));
+    else if (s.statusDetail) bits.push(String(s.statusDetail));
+    return bits.join(' · ');
   }
   return [s.period?'Q'+s.period:'', s.clock||''].filter(Boolean).join(' ').trim();
 }
@@ -11026,42 +11077,129 @@ async function _fetchOwlsScores(sport) {
   try {
     const owlsSport = _mapSportToOwls(_oddsApiSportKey(sport));
     if (!owlsSport || !OWLS_KEY) return null;
-    const data = await _owlsApiGetJson('/api/v1/scores/' + owlsSport);
-    return (data && data.data && data.data.sports && data.data.sports[owlsSport]) || [];
+    // Canonical live-score path. Legacy /api/v1/scores/{sport} returns 404.
+    const data = await _owlsApiGetJson('/api/v1/' + owlsSport + '/scores/live');
+    if (!data) return null;
+    if (Array.isArray(data.events)) return data.events;
+    if (data.data && Array.isArray(data.data.events)) return data.data.events;
+    const sportsBag = data.data && data.data.sports && data.data.sports[owlsSport];
+    if (Array.isArray(sportsBag)) return sportsBag;
+    return [];
   } catch(e) {
     return null;
   }
 }
 
 function _owlsScoresToOddsScores(owlsGames, sportKey) {
+  const owlsSport = _mapSportToOwls(_oddsApiSportKey(sportKey)) || sportKey;
   return (owlsGames || []).map(function(g) {
-    const homeTeam = (g.home && g.home.team && (g.home.team.displayName || g.home.team.name)) || '';
-    const awayTeam = (g.away && g.away.team && (g.away.team.displayName || g.away.team.name)) || '';
-    const homeScore = g.home && g.home.score;
-    const awayScore = g.away && g.away.score;
-    const state = String((g.status && g.status.state) || g.status || '').toLowerCase();
-    const statusName = String((g.status && g.status.name) || '').toUpperCase();
-    const completed = g.completed === true || state === 'post' || state === 'final' ||
-      state === 'completed' || state === 'closed' ||
-      statusName === 'STATUS_FINAL' || statusName === 'STATUS_FULL_TIME';
-    const status = completed ? 'final' : (state === 'in' || state === 'live' ? 'live' : 'upcoming');
+    const parsed = owlsLiveScores.parseOwlsLiveScoreEvent(g, owlsSport);
+    if (!parsed) return null;
     return {
-      id: String(g.id || ''),
+      id: parsed.id,
       sport_key: sportKey,
-      home_team: homeTeam,
-      away_team: awayTeam,
-      commence_time: g.date || g.commence_time || null,
-      completed: completed,
-      canceled: false,
-      status: status,
-      homeLogoUrl: (g.home && g.home.team && g.home.team.logoUrl) || null,
-      awayLogoUrl: (g.away && g.away.team && g.away.team.logoUrl) || null,
+      home_team: parsed.home_team,
+      away_team: parsed.away_team,
+      commence_time: parsed.commence_time,
+      completed: parsed.completed,
+      canceled: !!parsed.canceled,
+      status: parsed.status,
+      homeScore: parsed.homeScore,
+      awayScore: parsed.awayScore,
+      period: parsed.period,
+      clock: parsed.clock,
+      inning: parsed.inning,
+      inningHalf: parsed.inningHalf,
       scores: [
-        { name: homeTeam, score: homeScore != null ? String(homeScore) : null },
-        { name: awayTeam, score: awayScore != null ? String(awayScore) : null }
+        { name: parsed.home_team, score: parsed.homeScore != null ? String(parsed.homeScore) : null },
+        { name: parsed.away_team, score: parsed.awayScore != null ? String(parsed.awayScore) : null }
       ]
     };
-  }).filter(function(g) { return g.id && g.home_team && g.away_team; });
+  }).filter(Boolean);
+}
+
+// ── Live score cache (Owls /scores/live → hydrate lobby cards) ──────────────
+// Independent of odds WebSocket: odds-update payloads do not carry scoreboard
+// fields, so scores must poll even when OWLS_USE_WEBSOCKET skips REST odds.
+const OWLS_LIVE_SCORE_SPORTS = ['mlb','nfl','nba','nhl','ncaaf','ncaab','soccer','tennis'];
+const LIVE_SCORE_POLL_MS = _envMs('LIVE_SCORE_POLL_MS', 10 * 1000);
+let LIVE_SCORE_CACHE = {
+  updatedAt: null,
+  bySport: {},
+  eventCount: 0,
+  lastError: null
+};
+let _liveScorePollTimer = null;
+let _liveScorePollInFlight = false;
+
+function _hydrateLiveMarketCacheWithScores() {
+  if (!LIVE_MARKET_CACHE || !Array.isArray(LIVE_MARKET_CACHE.games)) return { matched:0, unmatchedLive:0 };
+  return owlsLiveScores.hydrateGamesWithOwlsScores(
+    LIVE_MARKET_CACHE.games,
+    LIVE_SCORE_CACHE.bySport || {},
+    _formatGameStateText
+  );
+}
+
+async function _pollOwlsLiveScores(trigger) {
+  if (!OWLS_KEY || ODDS_PROVIDER !== 'owls_insight') {
+    return { ok:false, reason:'owls_not_configured' };
+  }
+  if (_liveScorePollInFlight) return { ok:false, reason:'in_flight' };
+  _liveScorePollInFlight = true;
+  const start = Date.now();
+  try {
+    const bySport = {};
+    let eventCount = 0;
+    await Promise.all(OWLS_LIVE_SCORE_SPORTS.map(async function(sport) {
+      const raw = await _fetchOwlsScores(sport);
+      const events = Array.isArray(raw) ? raw : [];
+      const idx = owlsLiveScores.indexOwlsLiveScores(events, sport);
+      bySport[sport] = idx;
+      eventCount += idx.list.length;
+      if (idx.list.length) {
+        console.log('OWLS_SCORES_LIVE_OK sport='+sport+' events='+idx.list.length+
+          ' live='+idx.list.filter(function(e){ return e.status==='live'; }).length+
+          ' trigger='+trigger);
+      }
+    }));
+    LIVE_SCORE_CACHE = {
+      updatedAt: new Date().toISOString(),
+      bySport: bySport,
+      eventCount: eventCount,
+      lastError: null
+    };
+    const hyd = _hydrateLiveMarketCacheWithScores();
+    console.log('OWLS_SCORES_LIVE_HYDRATE trigger='+trigger+' events='+eventCount+
+      ' matched='+hyd.matched+' unmatchedLive='+hyd.unmatchedLive+
+      ' ms='+(Date.now()-start));
+    return { ok:true, eventCount:eventCount, matched:hyd.matched, unmatchedLive:hyd.unmatchedLive };
+  } catch(e) {
+    LIVE_SCORE_CACHE.lastError = e && e.message ? e.message : String(e);
+    console.warn('OWLS_SCORES_LIVE_FAIL trigger='+trigger+' err='+LIVE_SCORE_CACHE.lastError);
+    return { ok:false, reason:'error', error:LIVE_SCORE_CACHE.lastError };
+  } finally {
+    _liveScorePollInFlight = false;
+  }
+}
+
+function _scheduleLiveScorePoll() {
+  if (_liveScorePollTimer) clearTimeout(_liveScorePollTimer);
+  _liveScorePollTimer = setTimeout(async function() {
+    try { await _pollOwlsLiveScores('interval'); }
+    catch(_e) {}
+    _scheduleLiveScorePoll();
+  }, LIVE_SCORE_POLL_MS);
+}
+
+function _startLiveScorePoller() {
+  if (!OWLS_KEY || ODDS_PROVIDER !== 'owls_insight') return;
+  setImmediate(function() {
+    _pollOwlsLiveScores('boot').catch(function(){});
+  });
+  _scheduleLiveScorePoll();
+  console.log('[owls-scores] poller started intervalMs='+LIVE_SCORE_POLL_MS+
+    ' sports='+OWLS_LIVE_SCORE_SPORTS.join(','));
 }
 
 async function _fetchEspnSportScores(sport, daysBack, extraYmds) {
