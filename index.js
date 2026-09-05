@@ -3679,6 +3679,10 @@ console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
   ' hasOwlsKey='+(!!OWLS_KEY)+
   ' hasOwlsBase='+(!!process.env.OWLS_INSIGHT_BASE_URL));
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
+// MMA often has no lines on pinnacle/FD/DK in Owls while betonline (and similar)
+// carry the full fight card. Append these only for the MMA poll — other sports
+// keep OWLS_BOOKS unchanged.
+const OWLS_MMA_BOOKS_EXTRA = process.env.OWLS_MMA_BOOKS || 'betonline,bet365,bovada,williamhill_us';
 const OWLS_ALTERNATES    = process.env.OWLS_INSIGHT_ALTERNATES === 'true';
 // WebSocket real-time feed (opt-in — default false so production keeps REST polling).
 const OWLS_USE_WEBSOCKET     = process.env.OWLS_USE_WEBSOCKET === 'true';
@@ -3780,6 +3784,11 @@ const OWLS_RUGBY_TAB_KEYS = [
   'rugby'
 ];
 
+// MMA lobby tab: Owls path key is exactly `mma` (UFC + other promotions).
+const OWLS_MMA_TAB_KEYS = [
+  'mma'
+];
+
 // The exhaustive list of short keys this backend is willing to surface when
 // OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped).
 // Soccer and tennis Owls path keys are included via the map values.
@@ -3790,8 +3799,26 @@ const OWLS_ALL_SPORTS = (function(){
   if (!seen.tennis) { seen.tennis = true; out.push('tennis'); }
   if (!seen.golf) { seen.golf = true; out.push('golf'); }
   if (!seen.rugby) { seen.rugby = true; out.push('rugby'); }
+  if (!seen.mma) { seen.mma = true; out.push('mma'); }
   return out;
 })();
+
+/** Merge configured books with sport-specific extras (deduped, order preserved). */
+function _owlsBooksForSport(sportKey) {
+  var owlsSport = _mapToOwlsSport(sportKey) || String(sportKey || '').toLowerCase();
+  var base = String(OWLS_BOOKS || '').split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean);
+  var extra = [];
+  if (owlsSport === 'mma') {
+    extra = String(OWLS_MMA_BOOKS_EXTRA || '').split(',').map(function(s){ return s.trim().toLowerCase(); }).filter(Boolean);
+  }
+  var seen = {}, out = [];
+  base.concat(extra).forEach(function(b) {
+    if (!b || seen[b]) return;
+    seen[b] = true;
+    out.push(b);
+  });
+  return out.length ? out.join(',') : (OWLS_BOOKS || 'pinnacle,fanduel,draftkings');
+}
 
 // ── Sport enablement ──
 // OWLS_ENABLED_SPORTS controls which sports the backend polls + advertises
@@ -3848,7 +3875,7 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   table_tennis:'table_tennis',
   cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
-// Build Owls poll list: always include soccer + tennis + golf + rugby so
+// Build Owls poll list: always include soccer + tennis + golf + rugby + mma so
 // lobby tabs can serve from cache (Owls path keys are single feeds).
 const CACHE_SPORTS = (function() {
   if (ODDS_PROVIDER !== 'owls_insight') return _CACHE_SPORTS_BASE;
@@ -3862,12 +3889,14 @@ const CACHE_SPORTS = (function() {
     else if (s === 'tennis') OWLS_TENNIS_TAB_KEYS.forEach(addShort);
     else if (s === 'golf') OWLS_GOLF_TAB_KEYS.forEach(addShort);
     else if (s === 'rugby') OWLS_RUGBY_TAB_KEYS.forEach(addShort);
+    else if (s === 'mma') OWLS_MMA_TAB_KEYS.forEach(addShort);
     else addShort(s);
   });
   OWLS_SOCCER_TAB_KEYS.forEach(addShort);
   OWLS_TENNIS_TAB_KEYS.forEach(addShort);
   OWLS_GOLF_TAB_KEYS.forEach(addShort);
   OWLS_RUGBY_TAB_KEYS.forEach(addShort);
+  OWLS_MMA_TAB_KEYS.forEach(addShort);
   return out;
 })();
 
@@ -3917,6 +3946,18 @@ function _isRugbyCacheSportKey(gameSportKey) {
   if (g === 'rugby' || g.indexOf('rugby') === 0 || g === 'nrl') return true;
   for (var i = 0; i < OWLS_RUGBY_TAB_KEYS.length; i++) {
     var short = OWLS_RUGBY_TAB_KEYS[i];
+    var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+    if (g === short || g === full) return true;
+  }
+  return false;
+}
+
+function _isMmaCacheSportKey(gameSportKey) {
+  var g = String(gameSportKey || '').toLowerCase();
+  if (!g) return false;
+  if (g === 'mma' || g === 'mma_mixed_martial_arts' || g.indexOf('mma') === 0) return true;
+  for (var i = 0; i < OWLS_MMA_TAB_KEYS.length; i++) {
+    var short = OWLS_MMA_TAB_KEYS[i];
     var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
     if (g === short || g === full) return true;
   }
@@ -4261,6 +4302,8 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
     var away   = ev.away_team  || ev.away  || ev.awayTeam  || '';
     var ct     = ev.commence_time || ev.start_time || ev.game_time || ev.startTime
                || ev.scheduled_start || ev.commenceTime || ev.start || '';
+    var league = ev.league || ev.league_name || ev.competition || ev.promotion ||
+                 ev.sport_title || ev.event_name || null;
     var date   = _isoDateFromValue(ct);
     var ck     = sport+'|'+away+'|'+home+'|'+date;
 
@@ -4304,6 +4347,7 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
 
     var gEntry = { id:evId, sport_key:sport, commence_time:ct,
       home_team:home, away_team:away, canonicalKey:ck,
+      league: league || null,
       status:gameStatus, completed:!!evCompleted, canceled:!!evCanceled,
       isLive:!!evLive,
       // Scoreboard (null when the feed doesn't supply it — frontend hides empty fields)
@@ -4492,7 +4536,8 @@ async function fetchOddsFromOwlsInsight(sportKey) {
   }
   var owlsSport = _mapToOwlsSport(sportKey);
   if (!owlsSport) return { ok:false, error:'unsupported_sport:'+sportKey };
-  var url = OWLS_BASE_URL+'/api/v1/'+owlsSport+'/odds?books='+OWLS_BOOKS+'&alternates='+OWLS_ALTERNATES;
+  var booksCsv = _owlsBooksForSport(sportKey);
+  var url = OWLS_BASE_URL+'/api/v1/'+owlsSport+'/odds?books='+encodeURIComponent(booksCsv)+'&alternates='+OWLS_ALTERNATES;
   return new Promise(function(resolve){
     var parsed; try { parsed = new URL(url); } catch(_){
       console.warn('[owls-rest] fetch invalid url sport='+sportKey+' url='+parsedPathForLog(url));
@@ -8824,6 +8869,7 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     down:      g.down      || null,
     distance:  g.distance  != null ? g.distance : null,
     gameStateText: gameStateText,
+    league: g.league || null,
     moneyline: moneyline,
     spreads:   spreads,
     totals:    totals,
@@ -8911,6 +8957,7 @@ function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
   var combineTennis = (short === 'tennis');
   var combineGolf = (short === 'golf');
   var combineRugby = (short === 'rugby');
+  var combineMma = (short === 'mma');
   var out = [];
   var seenIds = {};
   for (var i = 0; i < cache.games.length; i++) {
@@ -8923,6 +8970,8 @@ function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
       if (!_isGolfCacheSportKey(g.sport_key)) continue;
     } else if (combineRugby) {
       if (!_isRugbyCacheSportKey(g.sport_key)) continue;
+    } else if (combineMma) {
+      if (!_isMmaCacheSportKey(g.sport_key)) continue;
     } else if (!_isMatchingSport(g.sport_key, short, full)) {
       continue;
     }
@@ -8962,6 +9011,9 @@ app.get('/api/odds/:sport', async (req, res) => {
     if (sportShort === 'rugby') {
       res.setHeader('X-Rugby-Keys', OWLS_RUGBY_TAB_KEYS.join(','));
     }
+    if (sportShort === 'mma') {
+      res.setHeader('X-Mma-Keys', OWLS_MMA_TAB_KEYS.join(','));
+    }
     if (cache && cache.updatedAt) {
       res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
     }
@@ -8973,8 +9025,11 @@ app.get('/api/odds/:sport', async (req, res) => {
       (sportShort === 'tennis' ? ' keys='+OWLS_TENNIS_TAB_KEYS.join('+') : '')+
       (sportShort === 'golf' ? ' keys='+OWLS_GOLF_TAB_KEYS.join('+') : '')+
       (sportShort === 'rugby' ? ' keys='+OWLS_RUGBY_TAB_KEYS.join('+') : '')+
+      (sportShort === 'mma' ? ' keys='+OWLS_MMA_TAB_KEYS.join('+') : '')+
       ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
-    return res.json(flat.slice(0, 50));
+    // MMA fight cards are denser than major-league boards — allow a wider page.
+    var boardLimit = (sportShort === 'mma') ? 80 : 50;
+    return res.json(flat.slice(0, boardLimit));
   }
   // ── Legacy Odds API path (only when ODDS_PROVIDER != owls_insight) ─
   console.log('[odds] source=backend-proxy sport='+req.params.sport+' key_fingerprint='+(ODDS_KEY?ODDS_KEY.slice(0,4)+'...'+ODDS_KEY.slice(-4):'MISSING'));
@@ -10244,6 +10299,12 @@ app.get('/api/sports', (req, res) => {
       ODDS_PROVIDER === 'owls_insight') {
     enabledSet.rugby = true;
   }
+  // MMA lobby tab — always advertise when Owls is the provider so the grid
+  // can dim empty cells instead of hiding the sport.
+  if (enabledSet.mma || OWLS_MMA_TAB_KEYS.some(function(k){ return !!enabledSet[k]; }) ||
+      ODDS_PROVIDER === 'owls_insight') {
+    enabledSet.mma = true;
+  }
   // Roll league game counts into the unified soccer tab for lobby badges.
   const soccerRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
   for (let si = 0; si < OWLS_SOCCER_TAB_KEYS.length; si++) {
@@ -10340,6 +10401,30 @@ app.get('/api/sports', (req, res) => {
   }
   if (rugbyRollup.games > 0 || enabledSet.rugby) {
     counts.rugby = rugbyRollup;
+  }
+  // Roll mma cache keys into the unified MMA tab.
+  const mmaRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
+  for (let mi = 0; mi < OWLS_MMA_TAB_KEYS.length; mi++) {
+    const mc = counts[OWLS_MMA_TAB_KEYS[mi]];
+    if (!mc) continue;
+    mmaRollup.games += mc.games;
+    mmaRollup.markets += mc.markets;
+    mmaRollup.live += mc.live;
+    mmaRollup.upcoming += mc.upcoming;
+    mmaRollup.final += mc.final;
+  }
+  for (const ck in counts) {
+    if (ck === 'mma' || OWLS_MMA_TAB_KEYS.indexOf(ck) >= 0) continue;
+    if (!_isMmaCacheSportKey(ck)) continue;
+    const mc = counts[ck];
+    mmaRollup.games += mc.games;
+    mmaRollup.markets += mc.markets;
+    mmaRollup.live += mc.live;
+    mmaRollup.upcoming += mc.upcoming;
+    mmaRollup.final += mc.final;
+  }
+  if (mmaRollup.games > 0 || enabledSet.mma) {
+    counts.mma = mmaRollup;
   }
 
   const allKeys = {};
@@ -16631,7 +16716,13 @@ const _ESPN_SEARCH_SPORT = {
 const _PHOTO_INDIVIDUAL_SPORTS = { tennis:1, mma:1, boxing:1, golf:1 };
 
 function _photoNormName(n) {
-  return String(n || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return String(n || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 function _photoSportKey(s) {
   var k = String(s || 'tennis').toLowerCase().trim();
@@ -16683,30 +16774,40 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
   var firstLast = parts.length >= 2 ? (parts[0] + ' ' + parts[parts.length - 1]) : String(playerName || '').trim();
   var queries = s === 'tennis'
     ? [firstLast, String(playerName || '').trim(), firstLast + ' tennis']
-    : [String(playerName || '').trim(), String(playerName || '').trim() + ' ' + s];
+    : s === 'mma'
+      ? [String(playerName || '').trim(), firstLast, String(playerName || '').trim() + ' ufc', firstLast + ' mma']
+      : [String(playerName || '').trim(), String(playerName || '').trim() + ' ' + s];
   var want = _photoNormName(playerName);
   for (var qi = 0; qi < queries.length; qi++) {
     var q = queries[qi];
     if (!q) continue;
-    // ESPN returns empty items when `sport=` is set for tennis. Query by
+    // ESPN returns empty items when `sport=` is set for tennis/MMA. Query by
     // name + type=player, then filter the result's sport field.
     var url = 'https://site.api.espn.com/apis/common/v3/search?query=' +
       encodeURIComponent(q) + '&type=player&limit=5';
     var data = await _httpsJson(url, 8000);
     var items = (data && data.items) || [];
+    var exactHits = [];
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
       if (!it || !it.id) continue;
       var itemSport = String(it.sport || '').toLowerCase();
       if (itemSport && itemSport !== searchSport && itemSport !== s) continue;
       var dn = _photoNormName(it.displayName || it.name || '');
-      if (want && dn && dn !== want && dn.indexOf(want) < 0 && want.indexOf(dn) < 0) continue;
-      var espnId = String(it.id);
-      var photoUrl = _espnHeadshotUrl(s, espnId);
-      var verified = await _verifyImageUrl(photoUrl);
-      if (!verified) continue;
-      return { espnId: espnId, photoUrl: photoUrl, verified: true, displayName: it.displayName || playerName };
+      if (want && dn && dn === want) exactHits.push(it);
+      else if (s !== 'mma' && want && dn && (dn.indexOf(want) >= 0 || want.indexOf(dn) >= 0)) {
+        // Non-MMA: keep legacy soft match for tennis/team sports
+        exactHits.push(it);
+      }
     }
+    if (s === 'mma' && exactHits.length !== 1) continue;
+    var chosen = exactHits[0];
+    if (!chosen) continue;
+    var espnId = String(chosen.id);
+    var photoUrl = _espnHeadshotUrl(s, espnId);
+    var verified = await _verifyImageUrl(photoUrl);
+    if (!verified) continue;
+    return { espnId: espnId, photoUrl: photoUrl, verified: true, displayName: chosen.displayName || playerName };
   }
   return null;
 }
