@@ -5083,10 +5083,11 @@ function requireCanonicalClubId(req, res, next) {
 
 const LEDGER_EVENT_TYPES = new Set([
   'BET_PLACED','BET_CANCELED_REFUND','BET_GRADED_WIN','BET_GRADED_LOSS',
-  'BET_GRADED_PUSH','SETTLEMENT_APPLIED','WEEKLY_ROLLOVER','BALANCE_ADJUSTMENT'
+  'BET_GRADED_PUSH','SETTLEMENT_APPLIED','WEEKLY_ROLLOVER','BALANCE_ADJUSTMENT',
+  'PARLAY_INSURANCE_REFUND','CASHOUT_SETTLEMENT'
 ]);
 const LEDGER_DEBIT_EVENTS  = new Set(['BET_PLACED','SETTLEMENT_APPLIED']);
-const LEDGER_CREDIT_EVENTS = new Set(['BET_CANCELED_REFUND','BET_GRADED_WIN','BET_GRADED_PUSH','BALANCE_ADJUSTMENT']);
+const LEDGER_CREDIT_EVENTS = new Set(['BET_CANCELED_REFUND','BET_GRADED_WIN','BET_GRADED_PUSH','BALANCE_ADJUSTMENT','PARLAY_INSURANCE_REFUND','CASHOUT_SETTLEMENT']);
 
 function _ledgerDirection(eventType) {
   if (LEDGER_DEBIT_EVENTS.has(eventType))  return 'debit';
@@ -5165,6 +5166,61 @@ async function _writeLedgerEntry(params) {
   console.log('[ledger] '+eventType+' player='+playerId+' amt='+amt+
     (ticketId?' ticket='+ticketId:'')+(idempotencyKey?' idem='+idempotencyKey:''));
   return { ok:true, ledgerId, row };
+}
+
+// Credit a player's available balance via ledger + ledger_entries mirror.
+// Used for parlay insurance refunds and host cash-out settlements.
+async function _creditPlayerAccount(opts) {
+  const sb = getSupabase();
+  if (!sb) return { ok:false, error:'supabase_not_configured' };
+  const amt = Math.round((parseFloat(opts.amount)||0)*100)/100;
+  if (!(amt > 0)) return { ok:false, error:'invalid_amount' };
+  const clubId = opts.clubId || '';
+  const playerId = opts.playerId || '';
+  const eventType = opts.eventType;
+  const leType = opts.ledgerEntriesType || eventType;
+  const iKey = opts.idempotencyKey || ('CR_'+eventType+'_'+Date.now());
+  let startBal = 0;
+  try {
+    const { data: mem } = await sb.from('club_members').select('balance_start')
+      .eq('club_id', clubId).eq('player_id', playerId).limit(1);
+    if (mem && mem[0] && mem[0].balance_start != null) startBal = parseFloat(mem[0].balance_start)||0;
+  } catch(_e) {}
+  let before = startBal;
+  try {
+    var lq = sb.from('ledger_entries').select('amount,balance_after,created_at')
+      .eq('player_id', playerId).order('created_at', { ascending:true });
+    if (clubId) lq = lq.eq('club_id', clubId);
+    const { data: ledRows } = await lq;
+    if (ledRows && ledRows.length)
+      before = _deriveBalanceFromLedgerEntries(startBal, ledRows);
+  } catch(_e) {}
+  const after = Math.round((before + amt)*100)/100;
+  try {
+    await sb.from('ledger_entries').upsert({
+      id: iKey, club_id: clubId||null, player_id: playerId,
+      ticket_id: opts.ticketId||null, type: leType, amount: amt,
+      balance_before: before, balance_after: after,
+      reason: opts.reason || eventType,
+      created_at: new Date().toISOString(),
+      created_by: opts.createdBy || 'system'
+    }, { onConflict:'id' });
+  } catch(e) {
+    if (e && e.code !== '23505') console.warn('[credit] ledger_entries:', e.message);
+  }
+  try {
+    await _writeLedgerEntry({
+      clubId: clubId, playerId: playerId, ticketId: opts.ticketId,
+      eventType: eventType, amount: amt,
+      balanceBefore: before, balanceAfter: after,
+      idempotencyKey: iKey, createdBy: opts.createdBy || 'system',
+      reason: opts.reason || eventType, metadataJson: opts.metadataJson || null
+    });
+  } catch(e) {
+    if (!(e && (e.code === '23505' || String(e.message||'').indexOf('invalid_eventType')>=0)))
+      console.warn('[credit] ledger:', e.message);
+  }
+  return { ok:true, balanceBefore: before, balanceAfter: after, ledgerEntryId: iKey };
 }
 
 // Fetch player ledger rows from Supabase
@@ -8898,6 +8954,144 @@ app.get('/api/odds/:sport', async (req, res) => {
   } catch(e) { console.error('Odds endpoint error:', e.message); res.json([]); }
 });
 
+function _amToDecimalCmp(odds) {
+  var n = parseFloat(odds);
+  if (!isFinite(n) || n === 0) return null;
+  return n > 0 ? (n / 100) + 1 : (100 / Math.abs(n)) + 1;
+}
+function _bookShortLabel(name) {
+  var k = String(name || '').toLowerCase();
+  if (k.indexOf('draftkings') >= 0 || k === 'dk') return 'DK';
+  if (k.indexOf('fanduel') >= 0 || k === 'fd') return 'FD';
+  if (k.indexOf('betmgm') >= 0 || k.indexOf('mgm') >= 0) return 'BetMGM';
+  if (k.indexOf('caesars') >= 0) return 'Caesars';
+  if (k.indexOf('pinnacle') >= 0) return 'PIN';
+  return String(name || 'MKT');
+}
+function _cmpMarketKey(mt) {
+  var m = String(mt || '').toLowerCase();
+  if (m === 'h2h' || m === 'ml' || m === 'moneyline') return 'moneyline';
+  if (m === 'spreads' || m === 'spread') return 'spread';
+  if (m === 'totals' || m === 'total') return 'total';
+  if (m === 'player_prop' || m === 'prop') return 'player_prop';
+  return m;
+}
+
+function _buildOddsComparisonForSport(sportShort) {
+  var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+  var markets = [];
+  if (!cache || !Array.isArray(cache.games)) {
+    return { ok:true, sport: sportShort, markets: markets, gameCount: 0 };
+  }
+  var short = String(sportShort || '').toLowerCase();
+  var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+  var combineSoccer = (short === 'soccer');
+  var combineTennis = (short === 'tennis');
+  var MAIN_BOOKS = { draftkings:1, fanduel:1, betmgm:1, caesars:1 };
+
+  for (var i = 0; i < cache.games.length; i++) {
+    var g = cache.games[i];
+    if (!g) continue;
+    if (combineSoccer) {
+      if (!_isSoccerCacheSportKey(g.sport_key)) continue;
+    } else if (combineTennis) {
+      if (!_isTennisCacheSportKey(g.sport_key)) continue;
+    } else if (!_isMatchingSport(g.sport_key, short, full)) {
+      continue;
+    }
+    var gameId = g.id || g.providerGameId || '';
+    var mkts = Array.isArray(g.markets) ? g.markets.slice() : [];
+    if (!mkts.length && Array.isArray(g.bookmakers)) {
+      g.bookmakers.forEach(function(bm) {
+        var bmKey = (bm && (bm.key || bm.id)) || 'odds-api';
+        (bm && bm.markets || []).forEach(function(mkt) {
+          var mt = _cmpMarketKey(mkt.key);
+          (mkt.outcomes || []).forEach(function(oc) {
+            mkts.push({
+              marketType: mt, teamOrSide: oc.name, odds: oc.price,
+              line: oc.point != null ? oc.point : undefined,
+              sportsbook: bmKey, playerName: oc.description || oc.player || null,
+              overUnder: oc.name
+            });
+          });
+        });
+      });
+    }
+    // Group quotes by market+side+line. Our displayed line prefers Pinnacle
+    // (same rule as _projectOwlsGameToFlat). Market best is the highest
+    // decimal among DK/FD/BetMGM.
+    var groups = {};
+    mkts.forEach(function(m) {
+      if (!m || typeof m.odds !== 'number') return;
+      var mt = _cmpMarketKey(m.marketType);
+      var side = m.teamOrSide || m.playerName || '';
+      if (!side) return;
+      var line = (m.line != null && m.line !== '') ? m.line : '';
+      var key = mt + '|' + String(side).toLowerCase() + '|' + String(line);
+      if (!groups[key]) groups[key] = { market: mt, pick: side, line: line === '' ? null : line, quotes: [] };
+      groups[key].quotes.push({
+        book: m.sportsbook || 'unknown',
+        odds: m.odds,
+        dec: _amToDecimalCmp(m.odds)
+      });
+    });
+    Object.keys(groups).forEach(function(key) {
+      var grp = groups[key];
+      var our = null;
+      grp.quotes.forEach(function(q) {
+        if (!q.dec) return;
+        if (!our) { our = q; return; }
+        if (String(q.book).toLowerCase() === 'pinnacle' && String(our.book).toLowerCase() !== 'pinnacle')
+          our = q;
+      });
+      if (!our) return;
+      var retail = grp.quotes.filter(function(q) {
+        var k = String(q.book || '').toLowerCase();
+        return MAIN_BOOKS[k] || k.indexOf('draftkings')>=0 || k.indexOf('fanduel')>=0 || k.indexOf('betmgm')>=0;
+      });
+      var pool = retail.length ? retail : grp.quotes;
+      var best = null;
+      var sum = 0, n = 0;
+      pool.forEach(function(q) {
+        if (!q.dec) return;
+        sum += q.dec; n++;
+        if (!best || q.dec > best.dec) best = q;
+      });
+      var avg = n ? (sum / n) : our.dec;
+      var direction = 'even';
+      if (our.dec - avg > 0.012) direction = 'better';
+      else if (best && best.dec - our.dec > 0.012) direction = 'worse';
+      markets.push({
+        gameId: gameId,
+        home: g.home_team || g.home || '',
+        away: g.away_team || g.away || '',
+        market: grp.market,
+        pick: grp.pick,
+        line: grp.line,
+        ourOdds: our.odds,
+        ourBook: _bookShortLabel(our.book),
+        marketBestOdds: best ? best.odds : our.odds,
+        bestBook: best ? _bookShortLabel(best.book) : _bookShortLabel(our.book),
+        marketAvgDecimal: Math.round(avg * 1000) / 1000,
+        direction: direction
+      });
+    });
+  }
+  return { ok:true, sport: sportShort, markets: markets, gameCount: cache.games.length };
+}
+
+// GET /api/odds-comparison/:sport — our line vs Owls multi-book market (cache only)
+app.get('/api/odds-comparison/:sport', async (req, res) => {
+  const sportShort = String(req.params.sport || '').toLowerCase();
+  try {
+    const payload = _buildOddsComparisonForSport(sportShort);
+    res.json(payload);
+  } catch(e) {
+    console.error('[odds-comparison]', e.message);
+    res.status(500).json({ ok:false, error:e.message, markets:[] });
+  }
+});
+
 // ── GET /api/props/:sport ───────────────────────────────────────────────────
 // Fetches player props from Owls /api/v1/{sport}/props. 60s response cache.
 const _PROPS_RESPONSE_CACHE = Object.create(null);
@@ -10786,7 +10980,10 @@ function _deriveTicketOutcome(ticket, legs, resultsByKey) {
   if (type==='single'||type==='straight') return legOutcomes[0];
   // Parlay / Teaser / RoundRobin — any lost leg loses the whole ticket
   const anyLost = legOutcomes.find(function(l){ return l.outcome==='lost'; });
-  if (anyLost) return { outcome:'lost' };
+  if (anyLost) {
+    const lostLegCount = legOutcomes.filter(function(l){ return l.outcome==='lost'; }).length;
+    return { outcome:'lost', lostLegCount: lostLegCount };
+  }
   // GRD-2: Separate won legs from pushed legs
   const wonLegs  = legs.filter(function(_,i){ return legOutcomes[i].outcome==='won'; });
   const pushLegs = legs.filter(function(_,i){ return legOutcomes[i].outcome==='push'; });
@@ -10998,7 +11195,7 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
   try {
     // 1. Load active tickets from Supabase
     let tq = sb.from('tickets')
-      .select('id,type,status,risk_amount,potential_profit,estimated_payout,graded_at,player_id,club_id')
+      .select('id,type,status,risk_amount,potential_profit,estimated_payout,graded_at,player_id,club_id,insurance_enabled')
       .in('status',['active','open']);
     if (playerId) tq = tq.eq('player_id', playerId);
     if (clubId)   tq = tq.eq('club_id',   clubId);
@@ -11141,6 +11338,40 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
         row.canonicalLedgerId=gradeResult.ledger_entry_id||iKey;
         row.auditEventId=auditData&&auditData[0]?auditData[0].id:null;
         row.balanceAfter=gradeResult.balance_after;
+
+        // Parlay insurance: lost by exactly one leg → refund stake as credit.
+        var _insOn = ticket.insurance_enabled === true || ticket.insurance_enabled === 'true';
+        var _isParlay = String(ticket.type||'').toLowerCase() === 'parlay';
+        if (combined === 'lost' && _insOn && _isParlay && ticketLegs.length >= 3 && risk > 0) {
+          var lostN = outcome.lostLegCount;
+          if (lostN == null) {
+            var _lo = ticketLegs.map(function(leg) {
+              return _deriveLegOutcome(leg, _lookupResultForLeg(resultsByKey, leg)||null);
+            });
+            lostN = _lo.filter(function(l){ return l && l.outcome==='lost'; }).length;
+          }
+          if (lostN === 1) {
+            try {
+              var insCredit = await _creditPlayerAccount({
+                clubId: ticket.club_id||'', playerId: ticket.player_id,
+                ticketId: ticket.id, eventType: 'PARLAY_INSURANCE_REFUND',
+                ledgerEntriesType: 'PARLAY_INSURANCE_REFUND',
+                amount: risk,
+                idempotencyKey: 'INS_'+ticket.id,
+                createdBy: 'server-grade-api',
+                reason: 'parlay_insurance:lost_by_one_leg'
+              });
+              row.insuranceRefund = risk;
+              row.insuranceLedgerId = insCredit.ledgerEntryId;
+              if (insCredit.balanceAfter != null) row.balanceAfter = insCredit.balanceAfter;
+              console.log('[grade/run] parlay insurance refund ticketId='+ticket.id+' amount='+risk);
+            } catch(insErr) {
+              console.warn('[grade/run] insurance refund failed ticketId='+ticket.id+':', insErr.message);
+              row.insuranceError = insErr.message;
+            }
+          }
+        }
+
         graded++;
         console.log('[server grade] graded ticketId='+ticket.id+' result='+combined+' source=result_snapshot');
 
@@ -12029,7 +12260,7 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
   try {
     // Load tickets (club-scoped). Extra columns are additive for the host Bets tab.
     let tq = sb.from('tickets')
-      .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at')
+      .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at,insurance_enabled,cashout_offer_amount,cashout_offer_status')
       .order('placed_at', { ascending:false })
       .limit(1000);
     if (clubId)   tq = tq.eq('club_id',   clubId);
@@ -13049,6 +13280,8 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   const _resolvedPlayerId = _bodyRaw.playerId || (_actor && _actor.actorId) || null;
   const { clubId, betType, stake, legs, payout, potentialProfit,
           idempotencyKey, playerUsername, rrStakes } = _bodyRaw;
+  const insuranceEnabled = !!(_bodyRaw.insuranceEnabled || _bodyRaw.insurance_enabled)
+    && betType === 'Parlay' && Array.isArray(legs) && legs.length >= 3;
   const playerId = _resolvedPlayerId;
   if (_actor && !_bodyRaw.playerId && _actor.actorId) {
     console.log('TOKEN_SCOPE role='+(_actor.role||'?')+' playerCapable=true (resolved from token)');
@@ -13804,9 +14037,18 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         'ticketId='+ticketId);
     }
 
+    if (insuranceEnabled) {
+      try {
+        await sb.from('tickets').update({ insurance_enabled: true }).eq('id', ticketId);
+      } catch(_insUpd) {
+        console.warn('[bets/place] insurance_enabled update failed:', _insUpd.message);
+      }
+    }
+
     const ticketRow = { id:ticketId, club_id:clubId, player_id:playerId, type:betType,
-      status:'active', risk_amount:rnd(stakeAmt), placed_at:now };
-    console.log('[bets/place] RPC ok ticketId='+ticketId+' stake='+stakeAmt+' balanceAfter='+(rpcResult.balance_after||'?'));
+      status:'active', risk_amount:rnd(stakeAmt), placed_at:now,
+      insurance_enabled: !!insuranceEnabled };
+    console.log('[bets/place] RPC ok ticketId='+ticketId+' stake='+stakeAmt+' balanceAfter='+(rpcResult.balance_after||'?')+(insuranceEnabled?' insured=1':''));
     emitEvent('ticket_placed',{ ticketId, stake:stakeAmt, betType, balanceAfter:rpcResult.balance_after },
       { clubId, actorId:playerId, playerId }, req.requestId);
     emitEvent('balance_changed',{ playerId, balanceAfter:rpcResult.balance_after },
@@ -13926,6 +14168,162 @@ app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('ca
   }
 });
 
+function _cashoutPickLabel(ticket, legs) {
+  var first = (legs && legs[0]) || {};
+  return ticket.player_username || first.pick || first.home_team || ticket.id || 'bet';
+}
+
+// POST /api/host/offer-cashout — host offers a cash-out amount on an active ticket
+app.post('/api/host/offer-cashout', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
+  const actor = req._actor || {};
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'host/admin' });
+  const ticketId = req.body && req.body.ticketId;
+  const playerId = req.body && req.body.playerId;
+  const amount = Math.round((parseFloat(req.body && req.body.amount)||0)*100)/100;
+  if (!ticketId) return res.status(400).json({ ok:false, error:'missing_ticketId' });
+  if (!(amount > 0)) return res.status(400).json({ ok:false, error:'invalid_amount' });
+  try {
+    const { data: tix, error: tErr } = await sb.from('tickets')
+      .select('id,status,player_id,club_id,player_username,risk_amount,estimated_payout,type')
+      .eq('id', ticketId).limit(1);
+    if (tErr) throw tErr;
+    const ticket = tix && tix[0];
+    if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    const st = String(ticket.status||'').toLowerCase();
+    if (st !== 'active' && st !== 'open')
+      return res.status(400).json({ ok:false, error:'ticket_not_active' });
+    if (playerId && ticket.player_id && String(ticket.player_id) !== String(playerId))
+      return res.status(400).json({ ok:false, error:'player_mismatch' });
+    const { data: legs } = await sb.from('ticket_legs').select('pick,home_team,away_team')
+      .eq('ticket_id', ticketId).order('leg_index').limit(3);
+    const pickLbl = _cashoutPickLabel(ticket, legs);
+    await sb.from('tickets').update({
+      cashout_offer_amount: amount,
+      cashout_offer_status: 'offered'
+    }).eq('id', ticketId);
+    const notifId = await _notifyPlayer({
+      playerId: ticket.player_id,
+      type: 'cashout_offer',
+      title: 'Cash out offer',
+      message: 'Cash out offer: $'+amount.toFixed(2)+' on your '+pickLbl+' bet — accept or decline [ticket:'+ticketId+']',
+      metadata: { ticketId: ticketId, amount: amount, type: 'cashout_offer' }
+    });
+    try {
+      await sb.from('audit_events').insert({
+        event_type: 'cashout_offered', ticket_id: ticketId,
+        player_id: ticket.player_id, club_id: ticket.club_id,
+        payload: { amount: amount, offeredBy: actor.actorId, notificationId: notifId }
+      });
+    } catch(_ae) {}
+    res.json({ ok:true, ticketId, amount, notificationId: notifId, playerId: ticket.player_id });
+  } catch(e) {
+    console.error('[host/offer-cashout]', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// POST /api/bets/accept-cashout — player accepts host cash-out offer
+app.post('/api/bets/accept-cashout', requireCanonicalClubId, requirePermissionScoped('place_bet', function(req) {
+  const actor = requireActor(req);
+  return (req.body && req.body.playerId) || (actor && actor.actorId) || null;
+}), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const actor = req._actor || requireActor(req) || {};
+  const ticketId = req.body && req.body.ticketId;
+  const notificationId = req.body && req.body.notificationId;
+  if (!ticketId) return res.status(400).json({ ok:false, error:'missing_ticketId' });
+  try {
+    const { data: tix, error: tErr } = await sb.from('tickets')
+      .select('id,status,player_id,club_id,risk_amount,cashout_offer_amount,cashout_offer_status')
+      .eq('id', ticketId).limit(1);
+    if (tErr) throw tErr;
+    const ticket = tix && tix[0];
+    if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    if (actor.actorId && String(actor.actorId) !== String(ticket.player_id)
+        && (ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+      return res.status(403).json({ ok:false, error:'not_owner' });
+    const st = String(ticket.status||'').toLowerCase();
+    if (st === 'cashed_out') return res.json({ ok:true, idempotent:true, ticketId, status:'cashed_out' });
+    if (st !== 'active' && st !== 'open')
+      return res.status(400).json({ ok:false, error:'ticket_not_active' });
+    if (String(ticket.cashout_offer_status||'') !== 'offered')
+      return res.status(400).json({ ok:false, error:'no_cashout_offer' });
+    const amount = Math.round((parseFloat(ticket.cashout_offer_amount)||0)*100)/100;
+    if (!(amount > 0)) return res.status(400).json({ ok:false, error:'invalid_offer_amount' });
+    const iKey = 'CASHOUT_'+ticketId;
+    const credit = await _creditPlayerAccount({
+      clubId: ticket.club_id||'', playerId: ticket.player_id, ticketId: ticketId,
+      eventType: 'CASHOUT_SETTLEMENT', ledgerEntriesType: 'CASHOUT_SETTLEMENT',
+      amount: amount, idempotencyKey: iKey,
+      createdBy: actor.actorId || ticket.player_id,
+      reason: 'cashout_accepted:'+amount
+    });
+    await sb.from('tickets').update({
+      status: 'cashed_out',
+      cashout_offer_status: 'accepted',
+      graded_at: new Date().toISOString()
+    }).eq('id', ticketId);
+    if (notificationId) {
+      try {
+        await sb.from('player_notifications').update({ read: true }).eq('id', notificationId);
+      } catch(_n) {}
+    }
+    try {
+      await sb.from('audit_events').insert({
+        event_type: 'cashout_accepted', ticket_id: ticketId,
+        player_id: ticket.player_id, club_id: ticket.club_id,
+        payload: { amount: amount, notificationId: notificationId, ledgerEntryId: credit.ledgerEntryId }
+      });
+    } catch(_ae) {}
+    emitEvent('balance_changed', { playerId: ticket.player_id, balanceAfter: credit.balanceAfter },
+      { clubId: ticket.club_id, playerId: ticket.player_id }, req.requestId);
+    res.json({ ok:true, ticketId, status:'cashed_out', amount: amount,
+      balanceAfter: credit.balanceAfter, ledgerEntryId: credit.ledgerEntryId });
+  } catch(e) {
+    console.error('[bets/accept-cashout]', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// POST /api/bets/decline-cashout — player declines; bet stays active
+app.post('/api/bets/decline-cashout', requireCanonicalClubId, requirePermissionScoped('place_bet', function(req) {
+  const actor = requireActor(req);
+  return (req.body && req.body.playerId) || (actor && actor.actorId) || null;
+}), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  const actor = req._actor || requireActor(req) || {};
+  const ticketId = req.body && req.body.ticketId;
+  const notificationId = req.body && req.body.notificationId;
+  if (!ticketId) return res.status(400).json({ ok:false, error:'missing_ticketId' });
+  try {
+    const { data: tix, error: tErr } = await sb.from('tickets')
+      .select('id,status,player_id,club_id,cashout_offer_status')
+      .eq('id', ticketId).limit(1);
+    if (tErr) throw tErr;
+    const ticket = tix && tix[0];
+    if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    if (actor.actorId && String(actor.actorId) !== String(ticket.player_id)
+        && (ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+      return res.status(403).json({ ok:false, error:'not_owner' });
+    await sb.from('tickets').update({ cashout_offer_status: 'declined' }).eq('id', ticketId);
+    if (notificationId) {
+      try {
+        await sb.from('player_notifications').update({ read: true }).eq('id', notificationId);
+      } catch(_n) {}
+    }
+    res.json({ ok:true, ticketId, status: ticket.status, declined: true });
+  } catch(e) {
+    console.error('[bets/decline-cashout]', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
 // GET /api/player/dashboard?clubId=&playerId= — DB-derived player dashboard
 app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped('view_player_dashboard'), async (req, res) => {
   const sb = getSupabase();
@@ -13937,7 +14335,7 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
   try {
     // Tickets for this player
     let tq = sb.from('tickets').select(
-      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id'
+      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id,insurance_enabled,cashout_offer_amount,cashout_offer_status'
     ).eq('player_id', playerId);
     if (clubId) tq = tq.eq('club_id', clubId);
     tq = tq.order('placed_at', { ascending:false });
@@ -13966,7 +14364,7 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
       if (s==='active'||s==='open')   { openRisk+=r; active.push(t); }
       else if (s==='won')             { settledGains+=p; settled.push(t); }
       else if (s==='lost')            { settledLosses+=r; settled.push(t); }
-      else if (s==='push'||s==='pushed') { settled.push(t); } // push: no net change
+      else if (s==='push'||s==='pushed'||s==='cashed_out'||s==='cashedout') { settled.push(t); }
     });
     var ticketAvailable = startingBalance !== null
       ? rnd(startingBalance - openRisk - settledLosses + settledGains)
@@ -15978,7 +16376,14 @@ async function _notifyPlayer(opts) {
       read: false,
       created_at: new Date().toISOString()
     };
+    if (opts.metadata != null || opts.metadata_json != null) {
+      row.metadata_json = opts.metadata || opts.metadata_json;
+    }
     var r = await sb.from('player_notifications').insert(row).select('id').maybeSingle();
+    if (r && r.error && row.metadata_json) {
+      delete row.metadata_json;
+      r = await sb.from('player_notifications').insert(row).select('id').maybeSingle();
+    }
     if (r && r.error) {
       console.warn('[notify] insert failed:', r.error.message);
       return null;
