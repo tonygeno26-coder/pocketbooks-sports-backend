@@ -6,6 +6,7 @@ const jwt     = require('jsonwebtoken');
 const espnScoreboard = require('./lib/espn-scoreboard');
 const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
 const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
+const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const { io: socketIoClient } = require('socket.io-client');
 
@@ -9061,8 +9062,9 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     // provide props for this game.
     props:     props
   };
-  // Presentation-only NCAAF logo enrichment — never affects markets/odds/IDs.
+  // Presentation-only team logo enrichment — never affects markets/odds/IDs.
   _attachNcaafTeamLogos(projected, sportShort, g);
+  _attachSoccerTeamLogos(projected, sportShort, g);
   return projected;
 }
 
@@ -17202,10 +17204,12 @@ app.post('/api/player-photo/sync/:sport', async (req, res) => {
   }
 });
 
-// ── Team logos (NCAAF ESPN mappings) — presentation enrichment only ──────────
+// ── Team logos (NCAAF + Soccer ESPN mappings) — presentation enrichment only ─
 var _ncaafLogoIndex = null;
 var _ncaafLogoIndexAt = 0;
-var _NCAAF_LOGO_INDEX_TTL_MS = 10 * 60 * 1000;
+var _soccerLogoIndex = null;
+var _soccerLogoIndexAt = 0;
+var _TEAM_LOGO_INDEX_TTL_MS = 10 * 60 * 1000;
 
 function _isNcaafSportKey(sport) {
   var s = String(sport || '').toLowerCase();
@@ -17213,9 +17217,17 @@ function _isNcaafSportKey(sport) {
     s.indexOf('ncaaf') >= 0;
 }
 
+function _isSoccerSportKey(sport) {
+  var s = String(sport || '').toLowerCase();
+  return s === 'soccer' || s.indexOf('soccer') === 0 ||
+    s === 'epl' || s === 'mls' || s === 'ucl' || s === 'laliga' ||
+    s === 'seriea' || s === 'bundesliga' || s === 'ligue1' ||
+    s === 'worldcup' || s === 'euros';
+}
+
 async function _getNcaafLogoIndex(force) {
   var now = Date.now();
-  if (!force && _ncaafLogoIndex && (now - _ncaafLogoIndexAt) < _NCAAF_LOGO_INDEX_TTL_MS) {
+  if (!force && _ncaafLogoIndex && (now - _ncaafLogoIndexAt) < _TEAM_LOGO_INDEX_TTL_MS) {
     return _ncaafLogoIndex;
   }
   try {
@@ -17224,15 +17236,33 @@ async function _getNcaafLogoIndex(force) {
     _ncaafLogoIndex = ncaafTeamLogos.buildResolverIndex(rows || []);
     _ncaafLogoIndexAt = now;
   } catch (e) {
-    console.warn('[team-logos] index load failed:', e && e.message);
+    console.warn('[team-logos] ncaaf index load failed:', e && e.message);
     if (!_ncaafLogoIndex) _ncaafLogoIndex = ncaafTeamLogos.buildResolverIndex([]);
   }
   return _ncaafLogoIndex;
 }
 
-// Warm index shortly after boot (non-blocking).
+async function _getSoccerLogoIndex(force) {
+  var now = Date.now();
+  if (!force && _soccerLogoIndex && (now - _soccerLogoIndexAt) < _TEAM_LOGO_INDEX_TTL_MS) {
+    return _soccerLogoIndex;
+  }
+  try {
+    var sb = getSupabase();
+    var rows = await soccerTeamLogos.loadTeamLogoRows(sb, 'soccer');
+    _soccerLogoIndex = soccerTeamLogos.buildResolverIndex(rows || []);
+    _soccerLogoIndexAt = now;
+  } catch (e) {
+    console.warn('[team-logos] soccer index load failed:', e && e.message);
+    if (!_soccerLogoIndex) _soccerLogoIndex = soccerTeamLogos.buildResolverIndex([]);
+  }
+  return _soccerLogoIndex;
+}
+
+// Warm indexes shortly after boot (non-blocking).
 setTimeout(function () {
   _getNcaafLogoIndex(true).catch(function () {});
+  _getSoccerLogoIndex(true).catch(function () {});
 }, 2500);
 
 function _attachNcaafTeamLogos(projected, sportShort, rawGame) {
@@ -17256,17 +17286,42 @@ function _attachNcaafTeamLogos(projected, sportShort, rawGame) {
   return projected;
 }
 
+function _attachSoccerTeamLogos(projected, sportShort, rawGame) {
+  if (!projected || !_isSoccerSportKey(sportShort || projected.sport)) return projected;
+  var index = _soccerLogoIndex;
+  if (!index) return projected;
+  try {
+    var homeName = projected.home || (rawGame && (rawGame.home_team || rawGame.home)) || '';
+    var awayName = projected.away || (rawGame && (rawGame.away_team || rawGame.away)) || '';
+    var home = soccerTeamLogos.resolveTeamLogo(homeName, index);
+    var away = soccerTeamLogos.resolveTeamLogo(awayName, index);
+    if (home && home.logoUrl) {
+      projected.homeLogoUrl = home.logoUrl;
+      projected.homeTeamId = home.row && home.row.provider_team_id;
+    }
+    if (away && away.logoUrl) {
+      projected.awayLogoUrl = away.logoUrl;
+      projected.awayTeamId = away.row && away.row.provider_team_id;
+    }
+  } catch (_e) {}
+  return projected;
+}
+
 app.get('/api/team-logos/:sport', async (req, res) => {
   try {
     var sport = String(req.params.sport || '').toLowerCase();
-    if (!_isNcaafSportKey(sport) && sport !== 'ncaaf') {
-      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    var isNcaaf = _isNcaafSportKey(sport) || sport === 'ncaaf';
+    var isSoccer = _isSoccerSportKey(sport);
+    if (!isNcaaf && !isSoccer) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf', 'soccer'] });
     }
     var sb = getSupabase();
-    var rows = await ncaafTeamLogos.loadTeamLogoRows(sb, 'ncaaf');
+    var sportKey = isSoccer ? 'soccer' : 'ncaaf';
+    var loader = isSoccer ? soccerTeamLogos : ncaafTeamLogos;
+    var rows = await loader.loadTeamLogoRows(sb, sportKey);
     res.json({
       ok: true,
-      sport: 'ncaaf',
+      sport: sportKey,
       count: (rows || []).length,
       teams: (rows || []).map(function (r) {
         return {
@@ -17292,20 +17347,24 @@ app.get('/api/team-logos/:sport', async (req, res) => {
 app.get('/api/team-logo/:sport/:name', async (req, res) => {
   try {
     var sport = String(req.params.sport || '').toLowerCase();
-    if (!_isNcaafSportKey(sport)) {
-      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    var isNcaaf = _isNcaafSportKey(sport);
+    var isSoccer = _isSoccerSportKey(sport);
+    if (!isNcaaf && !isSoccer) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf', 'soccer'] });
     }
     var name = decodeURIComponent(String(req.params.name || '')).trim();
     if (!name) return res.status(400).json({ ok: false, error: 'missing_name' });
-    var index = await _getNcaafLogoIndex(false);
-    var resolved = ncaafTeamLogos.resolveTeamLogo(name, index);
+    var index = isSoccer ? await _getSoccerLogoIndex(false) : await _getNcaafLogoIndex(false);
+    var resolver = isSoccer ? soccerTeamLogos : ncaafTeamLogos;
+    var resolved = resolver.resolveTeamLogo(name, index);
     if (resolved && resolved.logoUrl) {
       return res.json({
         ok: true,
         status: resolved.status,
         logoUrl: resolved.logoUrl,
         providerTeamId: resolved.row && resolved.row.provider_team_id,
-        canonicalName: resolved.row && resolved.row.canonical_name
+        canonicalName: resolved.row && resolved.row.canonical_name,
+        classification: resolved.row && resolved.row.classification
       });
     }
     res.json({ ok: false, status: resolved.status || 'unresolved' });
@@ -17322,14 +17381,41 @@ app.post('/api/team-logos/sync/:sport', async (req, res) => {
     if ((ROLE_RANK[actor.role] || 0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
       return res.status(403).json({ ok: false, error: 'insufficient_role', required: 'host/admin' });
     var sport = String(req.params.sport || '').toLowerCase();
-    if (!_isNcaafSportKey(sport)) {
-      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    var isNcaaf = _isNcaafSportKey(sport);
+    var isSoccer = _isSoccerSportKey(sport);
+    if (!isNcaaf && !isSoccer) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf', 'soccer'] });
     }
     var sb = getSupabase();
     if (!sb) return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
-    var includeFcs = !!(req.query && (req.query.fcs === '1' || req.query.fcs === 'true'));
-    var result = await ncaafTeamLogos.syncNcaafTeamLogos(sb, { includeFcs: includeFcs });
-    await _getNcaafLogoIndex(true);
+    var result;
+    if (isSoccer) {
+      var board = !!(req.query && (req.query.board === '1' || req.query.board === 'true'));
+      var extraNames = [];
+      if (board) {
+        var extra = {};
+        var cacheSync = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+        if (cacheSync && Array.isArray(cacheSync.games)) {
+          cacheSync.games.forEach(function (g) {
+            if (!g) return;
+            if (!_isSoccerSportKey(g.sport_key) && String(g.sport || '').toUpperCase() !== 'SOCCER') return;
+            if (g.home_team) extra[String(g.home_team).trim()] = true;
+            if (g.away_team) extra[String(g.away_team).trim()] = true;
+            if (g.home) extra[String(g.home).trim()] = true;
+            if (g.away) extra[String(g.away).trim()] = true;
+          });
+        }
+        extraNames = Object.keys(extra).filter(Boolean);
+      }
+      result = await soccerTeamLogos.syncSoccerTeamLogos(sb, {
+        extraProviderNames: extraNames
+      });
+      await _getSoccerLogoIndex(true);
+    } else {
+      var includeFcs = !!(req.query && (req.query.fcs === '1' || req.query.fcs === 'true'));
+      result = await ncaafTeamLogos.syncNcaafTeamLogos(sb, { includeFcs: includeFcs });
+      await _getNcaafLogoIndex(true);
+    }
     res.json(result);
   } catch (e) {
     console.error('[team-logos/sync]', e.message);
@@ -17340,16 +17426,23 @@ app.post('/api/team-logos/sync/:sport', async (req, res) => {
 app.get('/api/team-logos/audit/:sport', async (req, res) => {
   try {
     var sport = String(req.params.sport || '').toLowerCase();
-    if (!_isNcaafSportKey(sport)) {
-      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    var isNcaaf = _isNcaafSportKey(sport);
+    var isSoccer = _isSoccerSportKey(sport);
+    if (!isNcaaf && !isSoccer) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf', 'soccer'] });
     }
-    var index = await _getNcaafLogoIndex(false);
+    var index = isSoccer ? await _getSoccerLogoIndex(false) : await _getNcaafLogoIndex(false);
+    var resolver = isSoccer ? soccerTeamLogos : ncaafTeamLogos;
     var names = {};
     var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
     if (cache && Array.isArray(cache.games)) {
       cache.games.forEach(function (g) {
         if (!g) return;
-        if (!_isNcaafSportKey(g.sport_key) && !_isMatchingSport(g.sport_key, 'ncaaf', 'americanfootball_ncaaf')) return;
+        if (isSoccer) {
+          if (!_isSoccerSportKey(g.sport_key) && String(g.sport || '').toUpperCase() !== 'SOCCER') return;
+        } else {
+          if (!_isNcaafSportKey(g.sport_key) && !_isMatchingSport(g.sport_key, 'ncaaf', 'americanfootball_ncaaf')) return;
+        }
         if (g.home_team) names[String(g.home_team).trim()] = true;
         if (g.away_team) names[String(g.away_team).trim()] = true;
         if (g.home) names[String(g.home).trim()] = true;
@@ -17357,10 +17450,10 @@ app.get('/api/team-logos/audit/:sport', async (req, res) => {
       });
     }
     var list = Object.keys(names).filter(Boolean).sort();
-    var report = ncaafTeamLogos.auditProviderNames(list, index);
+    var report = resolver.auditProviderNames(list, index);
     res.json({
       ok: true,
-      sport: 'ncaaf',
+      sport: isSoccer ? 'soccer' : 'ncaaf',
       total: report.total,
       matched: report.matched,
       exact: report.exact,

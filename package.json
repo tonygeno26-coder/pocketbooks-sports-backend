@@ -8,7 +8,9 @@
     "test": "jest --runInBand --testTimeout=15000",
     "test:watch": "jest --watch",
     "sync:ncaaf-logos": "node scripts/sync-ncaaf-team-logos.js",
-    "audit:ncaaf-logos": "node scripts/audit-ncaaf-team-logos.js"
+    "audit:ncaaf-logos": "node scripts/audit-ncaaf-team-logos.js",
+    "sync:soccer-logos": "node scripts/sync-soccer-team-logos.js",
+    "audit:soccer-logos": "node scripts/audit-soccer-team-logos.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
