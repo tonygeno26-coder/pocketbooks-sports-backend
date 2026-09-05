@@ -3734,17 +3734,22 @@ const OWLS_SPORT_MAP = {
   cricket_ipl:'cricket_ipl',            ipl:'cricket_ipl',
   cricket_international_t20:'cricket_t20', t20:'cricket_t20',
   rugbyunion_six_nations:'rugby',       rugby_union:'rugby',     rugby:'rugby',
+  'rugby-union':'rugby',
   rugbyleague:'rugby_league',           rugby_league:'rugby_league', nrl:'rugby_league',
+  'rugby-league':'rugby_league',
   aussierules_afl:'afl',                afl:'afl',
   // ── Individual sports (Owls v1 path key is exactly `tennis`; ATP/WTA are leagues) ──
   tennis:'tennis',                      atp:'tennis',              wta:'tennis',
   tennis_atp:'tennis',                  tennis_wta:'tennis',
-  golf_pga_championship:'golf_pga',     pga:'golf_pga',            pga_tour:'golf_pga',
-  golf_masters_tournament:'golf_pga',
-  golf_us_open:'golf_pga',              golf_the_open_championship:'golf_pga',
-  golf:'golf_pga',
-  golf_liv:'golf_liv',                  liv:'golf_liv',
-  golf_european_tour:'golf_european',
+  // Golf: Owls source/v2 slug is `golf`. Unified /v1/{sport}/odds does not
+  // currently list golf — poller skips empty/404 feeds. Tour aliases roll
+  // into the single lobby Golf tab (same pattern as soccer/tennis).
+  golf:'golf',                          golf_pga:'golf',           pga:'golf',
+  pga_tour:'golf',                      golf_pga_championship:'golf',
+  golf_masters_tournament:'golf',
+  golf_us_open:'golf',                  golf_the_open_championship:'golf',
+  golf_liv:'golf',                      liv:'golf',
+  golf_european:'golf',                 golf_european_tour:'golf',
   table_tennis:'table_tennis',          tabletennis:'table_tennis',
   // ── Esports ──
   cs2:'cs2',                            counterstrike:'cs2',     csgo:'cs2',
@@ -3765,6 +3770,16 @@ const OWLS_TENNIS_TAB_KEYS = [
   'tennis'
 ];
 
+// Golf lobby tab: Owls path key is `golf` (tours are event/league fields).
+const OWLS_GOLF_TAB_KEYS = [
+  'golf'
+];
+
+// Rugby lobby tab: Owls path key is `rugby` (union). League is a sibling feed.
+const OWLS_RUGBY_TAB_KEYS = [
+  'rugby'
+];
+
 // The exhaustive list of short keys this backend is willing to surface when
 // OWLS_ENABLED_SPORTS=all. Derived from OWLS_SPORT_MAP values (deduped).
 // Soccer and tennis Owls path keys are included via the map values.
@@ -3773,6 +3788,8 @@ const OWLS_ALL_SPORTS = (function(){
   Object.values(OWLS_SPORT_MAP).forEach(function(v){ if (v && !seen[v]) { seen[v]=true; out.push(v); } });
   if (!seen.soccer) { seen.soccer = true; out.push('soccer'); }
   if (!seen.tennis) { seen.tennis = true; out.push('tennis'); }
+  if (!seen.golf) { seen.golf = true; out.push('golf'); }
+  if (!seen.rugby) { seen.rugby = true; out.push('rugby'); }
   return out;
 })();
 
@@ -3825,14 +3842,14 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   soccer_spain_la_liga:'soccer', soccer_italy_serie_a:'soccer',
   soccer_germany_bundesliga:'soccer', soccer_france_ligue_one:'soccer',
   cricket:'cricket', cricket_ipl:'cricket_ipl', cricket_t20:'cricket_international_t20',
-  rugby:'rugbyunion_six_nations', rugby_league:'rugbyleague', afl:'aussierules_afl',
+  rugby:'rugby', rugby_union:'rugby', rugby_league:'rugby_league', afl:'aussierules_afl',
   tennis:'tennis', tennis_atp:'tennis', tennis_wta:'tennis',
-  golf_pga:'golf_pga_championship', golf_liv:'golf_liv', golf_european:'golf_european_tour',
+  golf:'golf', golf_pga:'golf', golf_liv:'golf', golf_european:'golf',
   table_tennis:'table_tennis',
   cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
-// Build Owls poll list: always include soccer + tennis so lobby tabs can serve
-// from cache (Owls path keys are single feeds, not per-league segments).
+// Build Owls poll list: always include soccer + tennis + golf + rugby so
+// lobby tabs can serve from cache (Owls path keys are single feeds).
 const CACHE_SPORTS = (function() {
   if (ODDS_PROVIDER !== 'owls_insight') return _CACHE_SPORTS_BASE;
   var seen = {}, out = [];
@@ -3843,10 +3860,14 @@ const CACHE_SPORTS = (function() {
   OWLS_SAFE_SPORTS.forEach(function(s) {
     if (s === 'soccer') OWLS_SOCCER_TAB_KEYS.forEach(addShort);
     else if (s === 'tennis') OWLS_TENNIS_TAB_KEYS.forEach(addShort);
+    else if (s === 'golf') OWLS_GOLF_TAB_KEYS.forEach(addShort);
+    else if (s === 'rugby') OWLS_RUGBY_TAB_KEYS.forEach(addShort);
     else addShort(s);
   });
   OWLS_SOCCER_TAB_KEYS.forEach(addShort);
   OWLS_TENNIS_TAB_KEYS.forEach(addShort);
+  OWLS_GOLF_TAB_KEYS.forEach(addShort);
+  OWLS_RUGBY_TAB_KEYS.forEach(addShort);
   return out;
 })();
 
@@ -3872,6 +3893,30 @@ function _isTennisCacheSportKey(gameSportKey) {
   if (g === 'atp' || g === 'wta') return true;
   for (var i = 0; i < OWLS_TENNIS_TAB_KEYS.length; i++) {
     var short = OWLS_TENNIS_TAB_KEYS[i];
+    var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+    if (g === short || g === full) return true;
+  }
+  return false;
+}
+
+function _isGolfCacheSportKey(gameSportKey) {
+  var g = String(gameSportKey || '').toLowerCase();
+  if (!g) return false;
+  if (g === 'golf' || g.indexOf('golf') === 0 || g === 'pga' || g === 'pga_tour' || g === 'liv') return true;
+  for (var i = 0; i < OWLS_GOLF_TAB_KEYS.length; i++) {
+    var short = OWLS_GOLF_TAB_KEYS[i];
+    var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
+    if (g === short || g === full) return true;
+  }
+  return false;
+}
+
+function _isRugbyCacheSportKey(gameSportKey) {
+  var g = String(gameSportKey || '').toLowerCase();
+  if (!g) return false;
+  if (g === 'rugby' || g.indexOf('rugby') === 0 || g === 'nrl') return true;
+  for (var i = 0; i < OWLS_RUGBY_TAB_KEYS.length; i++) {
+    var short = OWLS_RUGBY_TAB_KEYS[i];
     var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
     if (g === short || g === full) return true;
   }
@@ -8856,6 +8901,7 @@ function _compareGamesForBoard(a, b) {
 // Project ALL Owls cache games matching a sport key into the flat shape.
 // For sport=soccer, combine the soccer feed (and any soccer_* keys in cache).
 // For sport=tennis, combine the tennis feed (ATP/WTA share Owls path `tennis`).
+// Golf / rugby lobby tabs likewise roll tour / union+league keys together.
 function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
   var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
   if (!cache || !Array.isArray(cache.games) || !cache.games.length) return [];
@@ -8863,6 +8909,8 @@ function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
   var full  = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
   var combineSoccer = (short === 'soccer');
   var combineTennis = (short === 'tennis');
+  var combineGolf = (short === 'golf');
+  var combineRugby = (short === 'rugby');
   var out = [];
   var seenIds = {};
   for (var i = 0; i < cache.games.length; i++) {
@@ -8871,6 +8919,10 @@ function _owlsCacheFlatGamesForSport(requestedSport, sportLabel) {
       if (!_isSoccerCacheSportKey(g.sport_key)) continue;
     } else if (combineTennis) {
       if (!_isTennisCacheSportKey(g.sport_key)) continue;
+    } else if (combineGolf) {
+      if (!_isGolfCacheSportKey(g.sport_key)) continue;
+    } else if (combineRugby) {
+      if (!_isRugbyCacheSportKey(g.sport_key)) continue;
     } else if (!_isMatchingSport(g.sport_key, short, full)) {
       continue;
     }
@@ -8904,6 +8956,12 @@ app.get('/api/odds/:sport', async (req, res) => {
     if (sportShort === 'tennis') {
       res.setHeader('X-Tennis-Keys', OWLS_TENNIS_TAB_KEYS.join(','));
     }
+    if (sportShort === 'golf') {
+      res.setHeader('X-Golf-Keys', OWLS_GOLF_TAB_KEYS.join(','));
+    }
+    if (sportShort === 'rugby') {
+      res.setHeader('X-Rugby-Keys', OWLS_RUGBY_TAB_KEYS.join(','));
+    }
     if (cache && cache.updatedAt) {
       res.setHeader('X-Cache-Age',   String(Math.max(0, Math.round((Date.now() - new Date(cache.updatedAt).getTime()) / 1000))));
     }
@@ -8913,6 +8971,8 @@ app.get('/api/odds/:sport', async (req, res) => {
       ' live='+flat.filter(function(g){return g.status==='live';}).length+
       (sportShort === 'soccer' ? ' leagues='+OWLS_SOCCER_TAB_KEYS.join('+') : '')+
       (sportShort === 'tennis' ? ' keys='+OWLS_TENNIS_TAB_KEYS.join('+') : '')+
+      (sportShort === 'golf' ? ' keys='+OWLS_GOLF_TAB_KEYS.join('+') : '')+
+      (sportShort === 'rugby' ? ' keys='+OWLS_RUGBY_TAB_KEYS.join('+') : '')+
       ' sourceStatus='+(cache&&cache.sourceStatus||'unknown'));
     return res.json(flat.slice(0, 50));
   }
@@ -8987,6 +9047,8 @@ function _buildOddsComparisonForSport(sportShort) {
   var full = _CACHE_SPORT_KEY_BY_SHORT[short] || short;
   var combineSoccer = (short === 'soccer');
   var combineTennis = (short === 'tennis');
+  var combineGolf = (short === 'golf');
+  var combineRugby = (short === 'rugby');
   var MAIN_BOOKS = { draftkings:1, fanduel:1, betmgm:1, caesars:1 };
 
   for (var i = 0; i < cache.games.length; i++) {
@@ -8996,6 +9058,10 @@ function _buildOddsComparisonForSport(sportShort) {
       if (!_isSoccerCacheSportKey(g.sport_key)) continue;
     } else if (combineTennis) {
       if (!_isTennisCacheSportKey(g.sport_key)) continue;
+    } else if (combineGolf) {
+      if (!_isGolfCacheSportKey(g.sport_key)) continue;
+    } else if (combineRugby) {
+      if (!_isRugbyCacheSportKey(g.sport_key)) continue;
     } else if (!_isMatchingSport(g.sport_key, short, full)) {
       continue;
     }
@@ -10082,13 +10148,14 @@ const SPORT_META = {
   cricket:           { label:'Cricket',          sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/cricket.svg',       sortOrder:61 },
   cricket_ipl:       { label:'IPL',              sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/ipl.svg',           sortOrder:62 },
   cricket_t20:       { label:'T20 Intl',         sportGroup:'international', icon:'🏏',   logoUrl:'/sports/logos/cricket.svg',       sortOrder:63 },
-  rugby:             { label:'Rugby Union',      sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/rugby.svg',         sortOrder:64 },
+  rugby:             { label:'Rugby',            sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/rugby.svg',         sortOrder:64 },
   rugby_league:      { label:'Rugby League',     sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/rugby.svg',         sortOrder:65 },
   afl:               { label:'AFL',              sportGroup:'international', icon:'🏉',   logoUrl:'/sports/logos/afl.svg',           sortOrder:66 },
   // ── Individual (71–80) ──
   tennis:            { label:'Tennis',           sportGroup:'individual',    icon:'🎾',   logoUrl:null,                              sortOrder:71 },
   tennis_atp:        { label:'ATP',              sportGroup:'individual',    icon:'🎾',   logoUrl:'/sports/logos/atp.svg',           sortOrder:72 },
   tennis_wta:        { label:'WTA',              sportGroup:'individual',    icon:'🎾',   logoUrl:'/sports/logos/wta.svg',           sortOrder:73 },
+  golf:              { label:'Golf',             sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/pga.svg',           sortOrder:73 },
   golf_pga:          { label:'PGA Tour',         sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/pga.svg',           sortOrder:74 },
   golf_liv:          { label:'LIV Golf',         sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/liv.svg',           sortOrder:75 },
   golf_european:     { label:'DP World Tour',    sportGroup:'individual',    icon:'⛳',   logoUrl:'/sports/logos/european-tour.svg', sortOrder:76 },
@@ -10102,7 +10169,7 @@ const SPORT_META = {
 };
 
 // "Popular US sports" set used by the DK-style live→upcoming→popular sort.
-const _POPULAR_US_SPORTS = { mlb:1, nba:1, nfl:1, nhl:1, wnba:1, ncaab:1, ncaaf:1, mma:1, boxing:1, nascar:1, golf_pga:1 };
+const _POPULAR_US_SPORTS = { mlb:1, nba:1, nfl:1, nhl:1, wnba:1, ncaab:1, ncaaf:1, mma:1, boxing:1, nascar:1, golf:1, golf_pga:1 };
 
 // ── GET /api/sports ─────────────────────────────────────────────────────────
 // Returns the full sport catalog the backend is willing to advertise. The
@@ -10165,6 +10232,18 @@ app.get('/api/sports', (req, res) => {
       ODDS_PROVIDER === 'owls_insight') {
     enabledSet.tennis = true;
   }
+  // Unified golf / rugby lobby tabs — always advertise when Owls is the provider
+  // so the grid can dim empty cells instead of hiding them.
+  if (enabledSet.golf || OWLS_GOLF_TAB_KEYS.some(function(k){ return !!enabledSet[k]; }) ||
+      enabledSet.golf_pga || enabledSet.golf_liv || enabledSet.golf_european ||
+      ODDS_PROVIDER === 'owls_insight') {
+    enabledSet.golf = true;
+  }
+  if (enabledSet.rugby || OWLS_RUGBY_TAB_KEYS.some(function(k){ return !!enabledSet[k]; }) ||
+      enabledSet.rugby_union || enabledSet.rugby_league ||
+      ODDS_PROVIDER === 'owls_insight') {
+    enabledSet.rugby = true;
+  }
   // Roll league game counts into the unified soccer tab for lobby badges.
   const soccerRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
   for (let si = 0; si < OWLS_SOCCER_TAB_KEYS.length; si++) {
@@ -10213,6 +10292,54 @@ app.get('/api/sports', (req, res) => {
   }
   if (tennisRollup.games > 0 || enabledSet.tennis) {
     counts.tennis = tennisRollup;
+  }
+  // Roll golf_* tour keys into the unified golf tab.
+  const golfRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
+  for (let gi = 0; gi < OWLS_GOLF_TAB_KEYS.length; gi++) {
+    const gc = counts[OWLS_GOLF_TAB_KEYS[gi]];
+    if (!gc) continue;
+    golfRollup.games += gc.games;
+    golfRollup.markets += gc.markets;
+    golfRollup.live += gc.live;
+    golfRollup.upcoming += gc.upcoming;
+    golfRollup.final += gc.final;
+  }
+  for (const ck in counts) {
+    if (ck === 'golf' || OWLS_GOLF_TAB_KEYS.indexOf(ck) >= 0) continue;
+    if (!_isGolfCacheSportKey(ck)) continue;
+    const gc = counts[ck];
+    golfRollup.games += gc.games;
+    golfRollup.markets += gc.markets;
+    golfRollup.live += gc.live;
+    golfRollup.upcoming += gc.upcoming;
+    golfRollup.final += gc.final;
+  }
+  if (golfRollup.games > 0 || enabledSet.golf) {
+    counts.golf = golfRollup;
+  }
+  // Roll rugby / rugby_league cache keys into the unified rugby tab.
+  const rugbyRollup = { games:0, markets:0, live:0, upcoming:0, final:0 };
+  for (let ri = 0; ri < OWLS_RUGBY_TAB_KEYS.length; ri++) {
+    const rc = counts[OWLS_RUGBY_TAB_KEYS[ri]];
+    if (!rc) continue;
+    rugbyRollup.games += rc.games;
+    rugbyRollup.markets += rc.markets;
+    rugbyRollup.live += rc.live;
+    rugbyRollup.upcoming += rc.upcoming;
+    rugbyRollup.final += rc.final;
+  }
+  for (const ck in counts) {
+    if (ck === 'rugby' || OWLS_RUGBY_TAB_KEYS.indexOf(ck) >= 0) continue;
+    if (!_isRugbyCacheSportKey(ck)) continue;
+    const rc = counts[ck];
+    rugbyRollup.games += rc.games;
+    rugbyRollup.markets += rc.markets;
+    rugbyRollup.live += rc.live;
+    rugbyRollup.upcoming += rc.upcoming;
+    rugbyRollup.final += rc.final;
+  }
+  if (rugbyRollup.games > 0 || enabledSet.rugby) {
+    counts.rugby = rugbyRollup;
   }
 
   const allKeys = {};

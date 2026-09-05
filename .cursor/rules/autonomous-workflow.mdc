@@ -1,0 +1,42 @@
+---
+description: Autonomous build-test-commit-push workflow; only ask for risky financial/DB/main merges
+alwaysApply: true
+---
+
+# Autonomous Workflow
+
+> For verified, non-destructive work: build → test → commit → push → continue. Never request approval between these steps.
+
+## Default loop
+
+1. Build and test changes.
+2. Commit on the current feature/working branch.
+3. Push that branch.
+4. Continue to the next task.
+
+Do **not** ask for commit/push permission. Do **not** stop just to show diffs. Do **not** ask "want me to push?" After commit+push, report the commit SHA(s).
+
+Push only the current feature/working branch. Do **not** merge to `main` unless the user explicitly asked for main or to merge.
+
+## Multi-task runs
+
+For each task: complete → test → commit → push → next task. End with a concise report: tasks done, tests run, SHAs, branches, blockers.
+
+## Stop and ask only when
+
+- Production data deletion risk
+- Destructive/irreversible DB migrations
+- Financial/accounting/ledger history would change (including Diamond balance/ledger reconciliation — strong exception)
+- Secrets/credentials are needed
+- Requirements are genuinely ambiguous with materially different outcomes
+- Unauthorized or risky merge to `main`
+- Tests are failing and proceeding could damage existing functionality
+
+## Never commit
+
+- `node_modules/`
+- Unrelated `package-lock.json`
+- Secrets, `.env`, credentials
+- Unrelated local work
+
+Do not overwrite, discard, or stage unrelated changes.
