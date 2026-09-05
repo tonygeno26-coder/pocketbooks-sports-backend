@@ -6,7 +6,9 @@
     "start": "node index.js",
     "dev": "node index.js",
     "test": "jest --runInBand --testTimeout=15000",
-    "test:watch": "jest --watch"
+    "test:watch": "jest --watch",
+    "sync:ncaaf-logos": "node scripts/sync-ncaaf-team-logos.js",
+    "audit:ncaaf-logos": "node scripts/audit-ncaaf-team-logos.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
