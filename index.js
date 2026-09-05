@@ -13106,6 +13106,9 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         p.availableBalance = ticketAvailable;
         p.balanceSource = ticketAvailable != null ? 'tickets' : null;
       }
+      // Canonical aliases so Players tab + Settle tab read the same field names.
+      p.currentBalance = p.availableBalance;
+      p.balance = p.availableBalance;
       p.ticketAvailable = ticketAvailable;
       p.ledgerEntryCount = ledgerCountByPid[k] || 0;
       return p;
@@ -13356,8 +13359,10 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
           byLed[pid].push(r);
         });
         allPids.forEach(function(pid){
-          var start = (memberMap[pid]&&memberMap[pid].balance_start!=null) ? memberMap[pid].balance_start : 0;
-          ledgerBalByPid[pid] = _deriveBalanceFromLedgerEntries(start, byLed[pid]||[]);
+          // Missing balance_start must stay null — do NOT coerce to 0 (false $0.00).
+          var start = (memberMap[pid]&&memberMap[pid].balance_start!=null) ? memberMap[pid].balance_start : null;
+          var derived = _deriveBalanceFromLedgerEntries(start, byLed[pid]||[]);
+          if (derived != null) ledgerBalByPid[pid] = derived;
         });
       }
     } catch(_lb) { console.warn('[settlements-preview] ledger balance error:', _lb.message); }
@@ -13376,6 +13381,9 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       p.startingBalance = start;
       p.balance_start   = start; // alias for clients expecting snake_case
       p.currentBalance = ledgerBalByPid[p.playerId] != null ? rnd(ledgerBalByPid[p.playerId]) : start;
+      p.availableBalance = p.currentBalance;
+      p.balance = p.currentBalance;
+      p.balanceSource = ledgerBalByPid[p.playerId] != null ? 'ledger' : (start != null ? 'balance_start' : null);
       // Next week starts from current available balance (open risk already held in ledger)
       p.startingBalanceNextWeek = p.currentBalance;
       p.settlementCutoffAt = cutoffMap[p.playerId] ? new Date(cutoffMap[p.playerId]).toISOString() : null;
