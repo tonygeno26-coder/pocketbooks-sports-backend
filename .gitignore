@@ -1,1 +1,7 @@
-node_modules/\n.env
+node_modules/
+.env
+scripts/_espn_*.json
+scripts/_ncaaf_*.json
+scripts/_ncaaf_*.js
+scripts/_seed_chunks.json
+package-lock.json

@@ -5,6 +5,7 @@ const bcrypt  = require('bcryptjs');
 const jwt     = require('jsonwebtoken');
 const espnScoreboard = require('./lib/espn-scoreboard');
 const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
+const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -8798,7 +8799,7 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     inning:g.inning, inningHalf:g.inningHalf, outs:g.outs,
     down:g.down, distance:g.distance
   });
-  return {
+  var projected = {
     id:    g.id || g.providerGameId || ((g.away_team||'')+'@'+(g.home_team||'')+'@'+(g.commence_time||'')),
     canonicalGameKey: canonicalGameKey,
     providerGameId: providerGameId,
@@ -8834,6 +8835,9 @@ function _projectOwlsGameToFlat(g, sportLabel) {
     // provide props for this game.
     props:     props
   };
+  // Presentation-only NCAAF logo enrichment — never affects markets/odds/IDs.
+  _attachNcaafTeamLogos(projected, sportShort, g);
+  return projected;
 }
 
 // Format a sport-aware human game-state string for the live scoreboard.
@@ -16914,6 +16918,179 @@ app.post('/api/player-photo/sync/:sport', async (req, res) => {
   } catch (e) {
     console.error('[player-photo/sync]', e.message);
     res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// ── Team logos (NCAAF ESPN mappings) — presentation enrichment only ──────────
+var _ncaafLogoIndex = null;
+var _ncaafLogoIndexAt = 0;
+var _NCAAF_LOGO_INDEX_TTL_MS = 10 * 60 * 1000;
+
+function _isNcaafSportKey(sport) {
+  var s = String(sport || '').toLowerCase();
+  return s === 'ncaaf' || s === 'ncaafb' || s === 'americanfootball_ncaaf' ||
+    s.indexOf('ncaaf') >= 0;
+}
+
+async function _getNcaafLogoIndex(force) {
+  var now = Date.now();
+  if (!force && _ncaafLogoIndex && (now - _ncaafLogoIndexAt) < _NCAAF_LOGO_INDEX_TTL_MS) {
+    return _ncaafLogoIndex;
+  }
+  try {
+    var sb = getSupabase();
+    var rows = await ncaafTeamLogos.loadTeamLogoRows(sb, 'ncaaf');
+    _ncaafLogoIndex = ncaafTeamLogos.buildResolverIndex(rows || []);
+    _ncaafLogoIndexAt = now;
+  } catch (e) {
+    console.warn('[team-logos] index load failed:', e && e.message);
+    if (!_ncaafLogoIndex) _ncaafLogoIndex = ncaafTeamLogos.buildResolverIndex([]);
+  }
+  return _ncaafLogoIndex;
+}
+
+// Warm index shortly after boot (non-blocking).
+setTimeout(function () {
+  _getNcaafLogoIndex(true).catch(function () {});
+}, 2500);
+
+function _attachNcaafTeamLogos(projected, sportShort, rawGame) {
+  if (!projected || !_isNcaafSportKey(sportShort || projected.sport)) return projected;
+  var index = _ncaafLogoIndex;
+  if (!index) return projected;
+  try {
+    var homeName = projected.home || (rawGame && (rawGame.home_team || rawGame.home)) || '';
+    var awayName = projected.away || (rawGame && (rawGame.away_team || rawGame.away)) || '';
+    var home = ncaafTeamLogos.resolveTeamLogo(homeName, index);
+    var away = ncaafTeamLogos.resolveTeamLogo(awayName, index);
+    if (home && home.logoUrl) {
+      projected.homeLogoUrl = home.logoUrl;
+      projected.homeTeamId = home.row && home.row.provider_team_id;
+    }
+    if (away && away.logoUrl) {
+      projected.awayLogoUrl = away.logoUrl;
+      projected.awayTeamId = away.row && away.row.provider_team_id;
+    }
+  } catch (_e) {}
+  return projected;
+}
+
+app.get('/api/team-logos/:sport', async (req, res) => {
+  try {
+    var sport = String(req.params.sport || '').toLowerCase();
+    if (!_isNcaafSportKey(sport) && sport !== 'ncaaf') {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    }
+    var sb = getSupabase();
+    var rows = await ncaafTeamLogos.loadTeamLogoRows(sb, 'ncaaf');
+    res.json({
+      ok: true,
+      sport: 'ncaaf',
+      count: (rows || []).length,
+      teams: (rows || []).map(function (r) {
+        return {
+          providerTeamId: r.provider_team_id,
+          canonicalName: r.canonical_name,
+          displayName: r.display_name,
+          abbreviation: r.abbreviation,
+          mascot: r.mascot,
+          location: r.location,
+          conference: r.conference,
+          classification: r.classification,
+          logoUrl: r.logo_url,
+          aliases: r.aliases || []
+        };
+      })
+    });
+  } catch (e) {
+    console.warn('[team-logos] list failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/team-logo/:sport/:name', async (req, res) => {
+  try {
+    var sport = String(req.params.sport || '').toLowerCase();
+    if (!_isNcaafSportKey(sport)) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    }
+    var name = decodeURIComponent(String(req.params.name || '')).trim();
+    if (!name) return res.status(400).json({ ok: false, error: 'missing_name' });
+    var index = await _getNcaafLogoIndex(false);
+    var resolved = ncaafTeamLogos.resolveTeamLogo(name, index);
+    if (resolved && resolved.logoUrl) {
+      return res.json({
+        ok: true,
+        status: resolved.status,
+        logoUrl: resolved.logoUrl,
+        providerTeamId: resolved.row && resolved.row.provider_team_id,
+        canonicalName: resolved.row && resolved.row.canonical_name
+      });
+    }
+    res.json({ ok: false, status: resolved.status || 'unresolved' });
+  } catch (e) {
+    console.warn('[team-logo] get failed:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/team-logos/sync/:sport', async (req, res) => {
+  try {
+    var actor = req._actor || requireActor(req) || {};
+    if (actor.error) return res.status(actor.status || 401).json({ ok: false, error: actor.error });
+    if ((ROLE_RANK[actor.role] || 0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+      return res.status(403).json({ ok: false, error: 'insufficient_role', required: 'host/admin' });
+    var sport = String(req.params.sport || '').toLowerCase();
+    if (!_isNcaafSportKey(sport)) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    }
+    var sb = getSupabase();
+    if (!sb) return res.status(503).json({ ok: false, error: 'supabase_not_configured' });
+    var includeFcs = !!(req.query && (req.query.fcs === '1' || req.query.fcs === 'true'));
+    var result = await ncaafTeamLogos.syncNcaafTeamLogos(sb, { includeFcs: includeFcs });
+    await _getNcaafLogoIndex(true);
+    res.json(result);
+  } catch (e) {
+    console.error('[team-logos/sync]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/team-logos/audit/:sport', async (req, res) => {
+  try {
+    var sport = String(req.params.sport || '').toLowerCase();
+    if (!_isNcaafSportKey(sport)) {
+      return res.status(400).json({ ok: false, error: 'unsupported_sport', supported: ['ncaaf'] });
+    }
+    var index = await _getNcaafLogoIndex(false);
+    var names = {};
+    var cache = (typeof LIVE_MARKET_CACHE !== 'undefined') ? LIVE_MARKET_CACHE : null;
+    if (cache && Array.isArray(cache.games)) {
+      cache.games.forEach(function (g) {
+        if (!g) return;
+        if (!_isNcaafSportKey(g.sport_key) && !_isMatchingSport(g.sport_key, 'ncaaf', 'americanfootball_ncaaf')) return;
+        if (g.home_team) names[String(g.home_team).trim()] = true;
+        if (g.away_team) names[String(g.away_team).trim()] = true;
+        if (g.home) names[String(g.home).trim()] = true;
+        if (g.away) names[String(g.away).trim()] = true;
+      });
+    }
+    var list = Object.keys(names).filter(Boolean).sort();
+    var report = ncaafTeamLogos.auditProviderNames(list, index);
+    res.json({
+      ok: true,
+      sport: 'ncaaf',
+      total: report.total,
+      matched: report.matched,
+      exact: report.exact,
+      alias: report.alias,
+      normalized: report.normalized,
+      unresolved: report.unresolved.map(function (x) { return x.name; }),
+      ambiguous: report.ambiguous.map(function (x) { return x.name; })
+    });
+  } catch (e) {
+    console.warn('[team-logos/audit]', e.message);
+    res.status(500).json({ ok: false, error: e.message });
   }
 });
 
