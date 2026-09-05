@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Owls Bookmaker v2 adapter — Golf / Rugby only.
+ * Owls Bookmaker v2 adapter — Golf / Rugby / NASCAR.
  * Run: node tests/owls-bookmaker-adapter.test.js
  * Pure logic — no network.
  */
@@ -19,16 +19,43 @@ function assertEq(a, b, m) {
 }
 
 console.log('\n── Bookmaker sport routing ──');
-test('golf and rugby are bookmaker v2 sports', function() {
+test('golf, rugby, and nascar are bookmaker v2 sports', function() {
   assert(adapter.isBookmakerV2Sport('golf'));
   assert(adapter.isBookmakerV2Sport('rugby'));
+  assert(adapter.isBookmakerV2Sport('nascar'));
   assert(adapter.isBookmakerV2Sport('GOLF'));
+});
+test('nascar maps to Bookmaker motorsport slug', function() {
+  assertEq(adapter.bookmakerSportSlug('nascar'), 'motorsport');
+  assertEq(adapter.bookmakerSportSlug('golf'), 'golf');
 });
 test('nfl/mlb are NOT bookmaker v2 sports', function() {
   assert(!adapter.isBookmakerV2Sport('nfl'));
   assert(!adapter.isBookmakerV2Sport('mlb'));
   assert(!adapter.isBookmakerV2Sport('nba'));
   assert(!adapter.isBookmakerV2Sport('soccer'));
+  assert(!adapter.isBookmakerV2Sport('motorsport'));
+});
+
+console.log('\n── NASCAR league filter ──');
+test('filters motorsport leagues to nascar-* only', function() {
+  var filtered = adapter.filterLeaguesForLobbySport('nascar', [
+    { leagueKey: 'nascar-cup-series-matchups', leagueName: 'nascar-cup-series-matchups' },
+    { leagueKey: 'f1-race-winner', leagueName: 'f1-race-winner' },
+    { leagueKey: 'indycar-race-winner', leagueName: 'indycar-race-winner' },
+    { leagueKey: 'nascar-oreilly-auto-parts-series-race-winner', leagueName: 'nascar-oreilly-auto-parts-series-race-winner' }
+  ]);
+  assertEq(filtered.length, 2);
+  assertEq(filtered[0].leagueKey, 'nascar-cup-series-matchups');
+  assertEq(filtered[1].leagueKey, 'nascar-oreilly-auto-parts-series-race-winner');
+});
+test('golf/rugby keep all leagues (no filter)', function() {
+  var leagues = [
+    { leagueKey: 'ru-france-top-14' },
+    { leagueKey: 'euro-omega-european-masters-matchups' }
+  ];
+  assertEq(adapter.filterLeaguesForLobbySport('golf', leagues).length, 2);
+  assertEq(adapter.filterLeaguesForLobbySport('rugby', leagues).length, 2);
 });
 
 console.log('\n── Price / line parsing ──');
@@ -127,6 +154,19 @@ test('golf matchup → moneyline event', function() {
   assertEq(g.sport_key, 'golf');
   assertEq(g.markets.length, 2);
   assert(g.markets.every(function(m) { return m.sportsbook === 'bookmaker'; }));
+});
+
+test('nascar matchup stamps lobby sport_key nascar', function() {
+  var g = adapter.normalizeBookmakerMarket('9-07-driver-a-driver-b', {
+    kind: 'game',
+    section: 'NASCAR CUP SERIES MATCHUPS',
+    startTime: '9/07 12:00pm PT',
+    visitor: { team: 'Driver A', spread: '-', total: '-', moneyline: '+150' },
+    home: { team: 'Driver B', spread: '-', total: '-', moneyline: '-180' }
+  }, { sportKey: 'nascar', leagueKey: 'nascar-cup-series-matchups', nowMs: Date.parse('2026-09-05T16:00:00Z') });
+  assert(g, 'nascar game');
+  assertEq(g.sport_key, 'nascar');
+  assert(String(g.canonicalKey).indexOf('nascar|') === 0);
 });
 
 test('futures board → outright moneyline list', function() {
