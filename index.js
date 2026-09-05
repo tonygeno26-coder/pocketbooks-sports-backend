@@ -6853,26 +6853,34 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   }
   // Hard blocks — game is over or market is unavailable. Live is allowed.
   if (state === 'final')
-    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_final' };
+    return {
+      ok:false,
+      code:'market_unavailable',
+      leg:leg.pick,
+      reason:'game_final',
+      userMessage:'game is final'
+    };
   if (state === 'canceled')
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
   if (state === 'suspended')
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
 
-  // Live betting is structurally disabled for now. This is server-derived:
-  // never trust client leg.isLive. A fresh live snapshot or a snapshot whose
-  // commence_time has passed is rejected before payout/risk/placement.
+  // Live / in-progress: server-authoritative (never trust client leg.isLive).
+  // isFinal already rejected above. When LIVE_BETTING_ENABLED, allow live bets;
+  // otherwise reject with an explicit live-betting-disabled message.
   const commenceTime = snap.commence_time||snap.commenceTime;
   const commenceMs = commenceTime ? new Date(commenceTime).getTime() : NaN;
   const hasCommenced = !isNaN(commenceMs) && nowMs >= commenceMs;
-  if (state === 'live' || hasCommenced) {
+  const isLiveMarket = state === 'live' || hasCommenced;
+  if (isLiveMarket) {
     if (!LIVE_BETTING_ENABLED) {
       return {
         ok:false,
         code:'live_betting_disabled',
         leg:leg.pick,
         reason: state === 'live' ? 'server_live' : 'event_started',
-        commenceTime: commenceTime || null
+        commenceTime: commenceTime || null,
+        userMessage:'live betting disabled'
       };
     }
   }
@@ -13809,10 +13817,12 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (!payoutResult.userMessage) {
         if (payoutResult.code === 'market_unavailable') {
           payoutResult.userMessage =
-            payoutResult.reason === 'game_final'    ? 'Market unavailable: game is final.' :
+            payoutResult.reason === 'game_final'    ? 'game is final' :
             payoutResult.reason === 'game_canceled' ? 'Market unavailable: game canceled.' :
             payoutResult.reason === 'suspended'     ? 'Market unavailable: temporarily suspended.' :
                                                       'Market unavailable.';
+        } else if (payoutResult.code === 'live_betting_disabled') {
+          payoutResult.userMessage = 'live betting disabled';
         } else if (payoutResult.code === 'odds_changed') {
           payoutResult.userMessage = 'Odds changed — please review and confirm.';
         } else if (payoutResult.code === 'line_changed') {
