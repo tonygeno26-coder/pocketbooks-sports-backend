@@ -11149,14 +11149,27 @@ async function _pollOwlsLiveScores(trigger) {
   _liveScorePollInFlight = true;
   const start = Date.now();
   try {
+    const prevBySport = (LIVE_SCORE_CACHE && LIVE_SCORE_CACHE.bySport) || {};
     const bySport = {};
     let eventCount = 0;
+    let anyFresh = false;
     await Promise.all(OWLS_LIVE_SCORE_SPORTS.map(async function(sport) {
       const raw = await _fetchOwlsScores(sport);
+      // null = transport/API failure — keep prior valid index for this sport.
+      // [] = successful empty live board — clear that sport (no stale forever).
+      if (raw == null) {
+        if (prevBySport[sport]) {
+          bySport[sport] = prevBySport[sport];
+          eventCount += (prevBySport[sport].list || []).length;
+          console.warn('OWLS_SCORES_LIVE_KEEP sport='+sport+' reason=fetch_null trigger='+trigger);
+        }
+        return;
+      }
       const events = Array.isArray(raw) ? raw : [];
       const idx = owlsLiveScores.indexOwlsLiveScores(events, sport);
       bySport[sport] = idx;
       eventCount += idx.list.length;
+      anyFresh = true;
       if (idx.list.length) {
         console.log('OWLS_SCORES_LIVE_OK sport='+sport+' events='+idx.list.length+
           ' live='+idx.list.filter(function(e){ return e.status==='live'; }).length+
@@ -11164,10 +11177,10 @@ async function _pollOwlsLiveScores(trigger) {
       }
     }));
     LIVE_SCORE_CACHE = {
-      updatedAt: new Date().toISOString(),
+      updatedAt: anyFresh ? new Date().toISOString() : (LIVE_SCORE_CACHE.updatedAt || new Date().toISOString()),
       bySport: bySport,
       eventCount: eventCount,
-      lastError: null
+      lastError: anyFresh ? null : (LIVE_SCORE_CACHE.lastError || 'all_sports_fetch_null')
     };
     const hyd = _hydrateLiveMarketCacheWithScores();
     console.log('OWLS_SCORES_LIVE_HYDRATE trigger='+trigger+' events='+eventCount+
@@ -11175,6 +11188,7 @@ async function _pollOwlsLiveScores(trigger) {
       ' ms='+(Date.now()-start));
     return { ok:true, eventCount:eventCount, matched:hyd.matched, unmatchedLive:hyd.unmatchedLive };
   } catch(e) {
+    // Do not wipe bySport — outer failure leaves prior LIVE_SCORE_CACHE intact.
     LIVE_SCORE_CACHE.lastError = e && e.message ? e.message : String(e);
     console.warn('OWLS_SCORES_LIVE_FAIL trigger='+trigger+' err='+LIVE_SCORE_CACHE.lastError);
     return { ok:false, reason:'error', error:LIVE_SCORE_CACHE.lastError };
@@ -11194,6 +11208,11 @@ function _scheduleLiveScorePoll() {
 
 function _startLiveScorePoller() {
   if (!OWLS_KEY || ODDS_PROVIDER !== 'owls_insight') return;
+  // Idempotent: avoid duplicate interval chains on accidental re-entry.
+  if (_liveScorePollTimer) {
+    clearTimeout(_liveScorePollTimer);
+    _liveScorePollTimer = null;
+  }
   setImmediate(function() {
     _pollOwlsLiveScores('boot').catch(function(){});
   });
