@@ -6,6 +6,7 @@ const jwt     = require('jsonwebtoken');
 const espnScoreboard = require('./lib/espn-scoreboard');
 const unresolvedGradingMonitor = require('./lib/unresolved-grading-monitor');
 const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
+const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -3742,9 +3743,9 @@ const OWLS_SPORT_MAP = {
   // ── Individual sports (Owls v1 path key is exactly `tennis`; ATP/WTA are leagues) ──
   tennis:'tennis',                      atp:'tennis',              wta:'tennis',
   tennis_atp:'tennis',                  tennis_wta:'tennis',
-  // Golf: Owls source/v2 slug is `golf`. Unified /v1/{sport}/odds does not
-  // currently list golf — poller skips empty/404 feeds. Tour aliases roll
-  // into the single lobby Golf tab (same pattern as soccer/tennis).
+  // Golf / Rugby: NOT on unified GET /api/v1/{sport}/odds (404). Polled via
+  // Bookmaker Source API v2 (/api/v2/bookmaker/{sport}/leagues + ?league=).
+  // Tour / competition aliases roll into the lobby golf / rugby tabs.
   golf:'golf',                          golf_pga:'golf',           pga:'golf',
   pga_tour:'golf',                      golf_pga_championship:'golf',
   golf_masters_tournament:'golf',
@@ -3771,12 +3772,12 @@ const OWLS_TENNIS_TAB_KEYS = [
   'tennis'
 ];
 
-// Golf lobby tab: Owls path key is `golf` (tours are event/league fields).
+// Golf lobby tab: Bookmaker v2 sport group `golf` (tours discovered via /leagues).
 const OWLS_GOLF_TAB_KEYS = [
   'golf'
 ];
 
-// Rugby lobby tab: Owls path key is `rugby` (union). League is a sibling feed.
+// Rugby lobby tab: Bookmaker v2 sport group `rugby` (comps discovered via /leagues).
 const OWLS_RUGBY_TAB_KEYS = [
   'rugby'
 ];
@@ -3850,7 +3851,7 @@ const _CACHE_SPORT_KEY_BY_SHORT = {
   cs2:'cs2', valorant:'valorant', lol:'lol', dota2:'dota2', rocketleague:'rocketleague'
 };
 // Build Owls poll list: always include soccer + tennis + golf + rugby so
-// lobby tabs can serve from cache (Owls path keys are single feeds).
+// lobby tabs can serve from cache. Golf/rugby use Bookmaker v2 (not v1 odds).
 const CACHE_SPORTS = (function() {
   if (ODDS_PROVIDER !== 'owls_insight') return _CACHE_SPORTS_BASE;
   var seen = {}, out = [];
@@ -4486,6 +4487,178 @@ function _normalizeOwlsResponse(owlsData, sportKey) {
     sourceStatus:games.length?'live':'empty', warnings, meta:owlsData.meta||{} };
 }
 
+// Owls HTTP GET with status — used by Bookmaker v2 (golf/rugby) so we can
+// distinguish 401/403 (no access), 404 (unsupported), and empty-but-ok.
+function _owlsHttpGetJson(pathAndQuery) {
+  if (!OWLS_KEY) {
+    return Promise.resolve({ ok:false, status:0, error:'owls_insight_not_configured' });
+  }
+  var url = OWLS_BASE_URL + pathAndQuery;
+  return new Promise(function(resolve) {
+    var parsed;
+    try { parsed = new URL(url); } catch(_e) {
+      return resolve({ ok:false, status:0, error:'invalid_url', url:pathAndQuery });
+    }
+    var reqPath = parsed.pathname + parsed.search;
+    var driver = parsed.protocol === 'https:' ? https : require('http');
+    var chunks = [];
+    var req = driver.request({
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: reqPath, method: 'GET',
+      headers: {
+        Authorization: 'Bearer ' + OWLS_KEY,
+        Accept: 'application/json',
+        'User-Agent': 'PocketBooksSports/2.0'
+      }
+    }, function(res) {
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString('utf8');
+        var preview = body.slice(0, 160).replace(/\s+/g, ' ');
+        if (res.statusCode === 401 || res.statusCode === 403) {
+          return resolve({ ok:false, status:res.statusCode, error:'owls_insight_unauthorized', url:reqPath, bodyPreview:preview });
+        }
+        if (res.statusCode === 429) {
+          return resolve({ ok:false, status:429, error:'provider_rate_limited', url:reqPath, bodyPreview:preview });
+        }
+        if (res.statusCode === 404) {
+          return resolve({ ok:false, status:404, error:'owls_insight_not_found', url:reqPath, bodyPreview:preview });
+        }
+        if (res.statusCode >= 500) {
+          return resolve({ ok:false, status:res.statusCode, error:'owls_insight_server_error', url:reqPath, bodyPreview:preview });
+        }
+        if (res.statusCode !== 200) {
+          return resolve({ ok:false, status:res.statusCode, error:'owls_insight_http_error', url:reqPath, bodyPreview:preview });
+        }
+        try {
+          resolve({ ok:true, status:200, data: JSON.parse(body), url:reqPath });
+        } catch(e) {
+          resolve({ ok:false, status:200, error:'json_parse_error', detail:e.message, url:reqPath, bodyPreview:preview });
+        }
+      });
+    });
+    req.setTimeout(15000, function() {
+      req.destroy();
+      resolve({ ok:false, status:0, error:'timeout', url:reqPath });
+    });
+    req.on('error', function(e) {
+      resolve({ ok:false, status:0, error:e.message, url:reqPath });
+    });
+    req.end();
+  });
+}
+
+function _stampBookmakerMarketEntry(entry, game) {
+  if (!entry || !game) return;
+  var ck = game.canonicalKey || entry.canonicalKey || null;
+  entry.canonicalMarketKey = _buildCanonicalMarketKey({
+    canonicalGameKey: ck,
+    marketType: entry.marketType,
+    propType: entry.propType,
+    team: entry.teamOrSide
+  });
+  entry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+    marketType: entry.marketType,
+    team: entry.teamOrSide,
+    player: entry.playerName,
+    side: entry.overUnder || entry.teamOrSide,
+    line: entry.line
+  });
+}
+
+/**
+ * Golf + Rugby only: poll Owls Bookmaker.eu Source API v2.
+ * Discovers all leagues dynamically — never hardcodes a single competition.
+ * Empty boards → ok + games:[] (not 404). Auth/tier failures → !ok.
+ */
+async function fetchOddsFromOwlsBookmakerV2(sportKey) {
+  var bmSport = owlsBookmakerAdapter.bookmakerSportSlug(sportKey);
+  if (!bmSport) {
+    return { ok:false, error:'unsupported_bookmaker_sport:' + sportKey };
+  }
+  if (!OWLS_KEY) {
+    return { ok:false, error:'owls_insight_not_configured' };
+  }
+
+  var leaguesPath = '/api/v2/bookmaker/' + bmSport + '/leagues';
+  var leaguesRes = await _owlsHttpGetJson(leaguesPath);
+  if (!leaguesRes.ok) {
+    console.warn('[owls-bookmaker] leagues failed sport=' + bmSport +
+      ' status=' + (leaguesRes.status || '?') +
+      ' error=' + (leaguesRes.error || 'unknown') +
+      ' url=' + (leaguesRes.url || leaguesPath));
+    return {
+      ok: false,
+      error: leaguesRes.error || 'bookmaker_leagues_failed',
+      status: leaguesRes.status,
+      url: leaguesRes.url || leaguesPath,
+      source: 'bookmaker-v2'
+    };
+  }
+
+  var leagueList = owlsBookmakerAdapter.extractLeagueKeys(leaguesRes.data);
+  console.log('[owls-bookmaker] leagues sport=' + bmSport +
+    ' count=' + leagueList.length +
+    ' keys=' + JSON.stringify(leagueList.map(function(l){ return l.leagueKey; }).slice(0, 12)));
+
+  if (!leagueList.length) {
+    return owlsBookmakerAdapter.buildBookmakerFetchResult([], {
+      warnings: ['no_leagues'],
+      meta: { sport: bmSport, leagueCount: 0, source: 'bookmaker-v2' },
+      stampMarket: _stampBookmakerMarketEntry
+    });
+  }
+
+  var allGames = [];
+  var warnings = [];
+  var leagueErrors = [];
+  var nowMs = Date.now();
+
+  // Sequential per-league fetches keep us polite on Bookmaker's slower cycle.
+  for (var i = 0; i < leagueList.length; i++) {
+    var league = leagueList[i];
+    var mktPath = '/api/v2/bookmaker/' + bmSport +
+      '?league=' + encodeURIComponent(league.leagueKey);
+    var mktRes = await _owlsHttpGetJson(mktPath);
+    if (!mktRes.ok) {
+      leagueErrors.push(league.leagueKey + ':' + (mktRes.error || mktRes.status || 'err'));
+      warnings.push('league_fetch_failed:' + league.leagueKey);
+      continue;
+    }
+    var normalized = owlsBookmakerAdapter.normalizeBookmakerLeaguePayload(mktRes.data, {
+      sportKey: bmSport,
+      leagueKey: league.leagueKey,
+      leagueName: league.leagueName || league.leagueKey,
+      nowMs: nowMs
+    });
+    (normalized.games || []).forEach(function(g) { allGames.push(g); });
+    (normalized.warnings || []).forEach(function(w) { warnings.push(w); });
+  }
+
+  var result = owlsBookmakerAdapter.buildBookmakerFetchResult(allGames, {
+    warnings: warnings,
+    meta: {
+      sport: bmSport,
+      leagueCount: leagueList.length,
+      leagueErrors: leagueErrors.length ? leagueErrors : undefined,
+      source: 'bookmaker-v2'
+    },
+    stampMarket: _stampBookmakerMarketEntry
+  });
+
+  var mktCount = 0;
+  result.games.forEach(function(g) { mktCount += (g.markets || []).length; });
+  console.log('[owls-bookmaker] fetch ok sport=' + bmSport +
+    ' leagues=' + leagueList.length +
+    ' games=' + result.games.length +
+    ' markets=' + mktCount +
+    ' sourceStatus=' + result.sourceStatus +
+    (leagueErrors.length ? ' leagueErrors=' + JSON.stringify(leagueErrors.slice(0, 5)) : ''));
+
+  return result;
+}
+
 async function fetchOddsFromOwlsInsight(sportKey) {
   if (!OWLS_KEY) {
     console.warn('[owls] OWLS_INSIGHT_API_KEY not set');
@@ -4493,6 +4666,13 @@ async function fetchOddsFromOwlsInsight(sportKey) {
   }
   var owlsSport = _mapToOwlsSport(sportKey);
   if (!owlsSport) return { ok:false, error:'unsupported_sport:'+sportKey };
+
+  // Golf + Rugby are NOT on the unified v1 odds endpoint (confirmed 404).
+  // Route only these sports through Bookmaker v2. NFL/MLB/etc stay on v1.
+  if (owlsBookmakerAdapter.isBookmakerV2Sport(owlsSport)) {
+    return fetchOddsFromOwlsBookmakerV2(owlsSport);
+  }
+
   var url = OWLS_BASE_URL+'/api/v1/'+owlsSport+'/odds?books='+OWLS_BOOKS+'&alternates='+OWLS_ALTERNATES;
   return new Promise(function(resolve){
     var parsed; try { parsed = new URL(url); } catch(_){
