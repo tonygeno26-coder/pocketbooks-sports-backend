@@ -11104,13 +11104,52 @@ async function _fetchOwlsScores(sport) {
     const owlsSport = _mapSportToOwls(_oddsApiSportKey(sport));
     if (!owlsSport || !OWLS_KEY) return null;
     // Canonical live-score path. Legacy /api/v1/scores/{sport} returns 404.
-    // Scores endpoints are slower under multi-sport parallel poll than odds —
-    // use a longer timeout so 8s defaults don't empty the cache every tick.
-    const data = await _owlsApiGetJson(
-      '/api/v1/' + owlsSport + '/scores/live',
-      null,
-      { timeoutMs: 20000 }
-    );
+    // Use curl (not Node https): with OWLS_USE_WEBSOCKET=true Owls enforces a
+    // 1-connection limit, and in-process https.request to /scores/live hangs
+    // until timeout (~15–20s/sport) while curl to the same URL succeeds.
+    const url = OWLS_BASE_URL + '/api/v1/' + owlsSport + '/scores/live';
+    const timeoutMs = 15000;
+    const start = Date.now();
+    const data = await new Promise(function(resolve) {
+      var { execFile } = require('child_process');
+      execFile(
+        'curl',
+        [
+          '-sS', '-L', '--max-time', String(Math.ceil(timeoutMs / 1000)),
+          '-H', 'Authorization: Bearer ' + OWLS_KEY,
+          '-H', 'Accept: application/json',
+          '-A', 'PocketBooksSports/2.0',
+          '-w', '\n__HTTP__%{http_code}',
+          url
+        ],
+        { timeout: timeoutMs + 2000, maxBuffer: 4 * 1024 * 1024 },
+        function(err, stdout, stderr) {
+          var ms = Date.now() - start;
+          if (err) {
+            console.warn('OWLS_SCORES_FETCH_FAIL sport=' + owlsSport +
+              ' reason=' + (err.killed ? 'timeout' : (err.message || 'exec_error')) +
+              ' ms=' + ms + (stderr ? ' stderr=' + String(stderr).slice(0, 120) : ''));
+            return resolve(null);
+          }
+          var raw = String(stdout || '');
+          var m = raw.match(/\n__HTTP__(\d+)\s*$/);
+          var status = m ? parseInt(m[1], 10) : 0;
+          var body = m ? raw.slice(0, m.index) : raw;
+          if (status !== 200) {
+            console.warn('OWLS_SCORES_FETCH_FAIL sport=' + owlsSport +
+              ' reason=http_' + status + ' ms=' + ms);
+            return resolve(null);
+          }
+          try {
+            resolve(JSON.parse(body));
+          } catch (_e) {
+            console.warn('OWLS_SCORES_FETCH_FAIL sport=' + owlsSport +
+              ' reason=bad_json ms=' + ms + ' bytes=' + body.length);
+            resolve(null);
+          }
+        }
+      );
+    });
     if (!data) return null;
     if (Array.isArray(data.events)) return data.events;
     if (data.data && Array.isArray(data.data.events)) return data.data.events;
@@ -11153,7 +11192,8 @@ function _owlsScoresToOddsScores(owlsGames, sportKey) {
 // ── Live score cache (Owls /scores/live → hydrate lobby cards) ──────────────
 // Independent of odds WebSocket: odds-update payloads do not carry scoreboard
 // fields, so scores must poll even when OWLS_USE_WEBSOCKET skips REST odds.
-const OWLS_LIVE_SCORE_SPORTS = ['mlb','nfl','nba','nhl','ncaaf','ncaab','soccer','tennis'];
+// Soccer/tennis first — they usually carry live boards; empty US majors finish fast.
+const OWLS_LIVE_SCORE_SPORTS = ['soccer','tennis','mlb','nfl','nba','nhl','ncaaf','ncaab'];
 const LIVE_SCORE_POLL_MS = _envMs('LIVE_SCORE_POLL_MS', 10 * 1000);
 let LIVE_SCORE_CACHE = {
   updatedAt: null,
