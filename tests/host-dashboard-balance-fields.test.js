@@ -57,6 +57,33 @@ test('index.js dashboard exposes currentBalance/balance aliases', function () {
   assert.ok(src.indexOf('p.balance = p.availableBalance') !== -1, 'dashboard balance alias');
 });
 
+test('host dashboard uses shared per-player ledger helper', function () {
+  var src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.ok(src.indexOf('async function _ledgerAvailableForPlayer') !== -1, 'helper defined');
+  assert.ok(src.indexOf('_ledgerAvailableForPlayer(sb, clubId, pid, start)') !== -1, 'host dashboard calls helper');
+  assert.ok(src.indexOf("await _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance)") !== -1
+    || src.indexOf('_ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance)') !== -1,
+    'player dashboard reuses helper');
+  assert.ok(!/from\('ledger_entries'\)[\s\S]{0,220}\.in\('player_id',\s*balPids\)/.test(src),
+    'host dashboard no longer batches ledger by balPids');
+});
+
+test('multi-player ledger map keeps distinct balances', function () {
+  var ledgerBalByPid = {
+    '2a3e6819-be2f-4df3-8112-54ce19d0929e': 705.19,
+    '12bb68f1-bcca-4e63-8ae4-7065dbb19172': 1176.43,
+    'bc767309-6fc7-4585-9077-3de7b898df13': 1042.30,
+    '0a1885b8-0fe3-4e75-aeda-f89662c87d49': 1807.85
+  };
+  Object.keys(ledgerBalByPid).forEach(function (pid) {
+    assert.ok(ledgerBalByPid[pid] > 0);
+  });
+  assert.notStrictEqual(
+    ledgerBalByPid['2a3e6819-be2f-4df3-8112-54ce19d0929e'],
+    ledgerBalByPid['12bb68f1-bcca-4e63-8ae4-7065dbb19172']
+  );
+});
+
 test('settlements-preview no longer defaults missing start to 0', function () {
   var src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
   assert.ok(src.indexOf('Missing balance_start must stay null') !== -1, 'null-start comment present');

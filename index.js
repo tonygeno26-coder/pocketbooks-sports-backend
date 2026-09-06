@@ -5428,6 +5428,31 @@ function _deriveBalanceFromLedgerEntries(startingBalance, entries) {
   return Math.round(bal*100)/100;
 }
 
+// Same available-balance path as GET /api/player/dashboard (per-player ledger).
+// Host dashboard must call this per roster player — a single batched .in() query
+// can truncate / miss players and leave availableBalance null → UI shows $0.00.
+async function _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance) {
+  var ledgerAvailable = null;
+  var ledgerEntryCount = 0;
+  if (!sb || !playerId) return { ledgerAvailable: null, ledgerEntryCount: 0 };
+  try {
+    var lq = sb.from('ledger_entries')
+      .select('id,type,amount,balance_before,balance_after,created_at,ticket_id')
+      .eq('player_id', playerId)
+      .order('created_at', { ascending: true });
+    if (clubId) lq = lq.eq('club_id', clubId);
+    var { data: ledgerRows, error: lErr } = await lq;
+    if (lErr) throw lErr;
+    ledgerEntryCount = (ledgerRows || []).length;
+    if (ledgerEntryCount > 0) {
+      ledgerAvailable = _deriveBalanceFromLedgerEntries(startingBalance, ledgerRows);
+    }
+  } catch (_le) {
+    console.warn('[ledger-available] player=' + playerId + ':', (_le && _le.message) || _le);
+  }
+  return { ledgerAvailable: ledgerAvailable, ledgerEntryCount: ledgerEntryCount };
+}
+
 // Write a ledger entry to Supabase
 async function _writeLedgerEntry(params) {
   const { clubId, playerId, ticketId, settlementId, eventType, amount,
@@ -13058,34 +13083,20 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       }
     });
 
-    // Ledger is source of truth for available balance (matches /api/player/dashboard).
-    // Ticket formula is fallback only when a player has no ledger rows.
+    // Ledger is source of truth for available balance — same per-player fetch as
+    // /api/player/dashboard (do NOT batch .in() all pids; that path missed balances).
     var ledgerBalByPid = {};
     var ledgerCountByPid = {};
     try {
       var balPids = Object.keys(byPlayer);
-      if (balPids.length && clubId) {
-        const { data: ledRows, error: ledErr } = await sb.from('ledger_entries')
-          .select('player_id,amount,balance_after,created_at,type')
-          .eq('club_id', clubId)
-          .in('player_id', balPids)
-          .order('created_at', { ascending: true });
-        if (ledErr) throw ledErr;
-        var byLed = {};
-        (ledRows||[]).forEach(function(r){
-          var pid = String(r.player_id||'');
-          if (!pid) return;
-          if (!byLed[pid]) byLed[pid] = [];
-          byLed[pid].push(r);
-        });
-        balPids.forEach(function(pid){
-          var rows = byLed[pid] || [];
-          ledgerCountByPid[pid] = rows.length;
-          if (!rows.length) return;
+      if (balPids.length) {
+        await Promise.all(balPids.map(async function(pid) {
           var start = (memberMap[pid] && memberMap[pid].balance_start != null)
             ? memberMap[pid].balance_start : null;
-          ledgerBalByPid[pid] = _deriveBalanceFromLedgerEntries(start, rows);
-        });
+          var led = await _ledgerAvailableForPlayer(sb, clubId, pid, start);
+          ledgerCountByPid[pid] = led.ledgerEntryCount || 0;
+          if (led.ledgerAvailable != null) ledgerBalByPid[pid] = led.ledgerAvailable;
+        }));
       }
     } catch(_lb) {
       console.warn('[host/dashboard] ledger balance error:', _lb.message||_lb);
@@ -13096,6 +13107,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       p.openRisk = rnd(p.openRisk);
       p.settledGains = rnd(p.settledGains);
       p.settledLosses = rnd(p.settledLosses);
+      // Same fallback chain as /api/player/dashboard:
+      // ledger → ticket formula (start - openRisk - losses + gains).
       var ticketAvailable = p.startingBalance != null
         ? rnd(p.startingBalance - p.openRisk - p.settledLosses + p.settledGains)
         : null;
@@ -13343,27 +13356,21 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       else if (s==='lost')       { p.settledNet -= risk; p.weekLost += risk; p.weekWagered += risk; }
     });
 
-    // Ledger-derived current balances
+    // Ledger-derived current balances — per-player (same as /api/player/dashboard).
     var ledgerBalByPid = {};
     try {
       var allPids = Object.keys(byPlayer);
       if (allPids.length) {
-        const { data: ledRows } = await sb.from('ledger_entries')
-          .select('player_id,amount,balance_after,created_at,type')
-          .eq('club_id', clubId).in('player_id', allPids)
-          .order('created_at', { ascending:true });
-        var byLed = {};
-        (ledRows||[]).forEach(function(r){
-          var pid=String(r.player_id||'');
-          if (!byLed[pid]) byLed[pid]=[];
-          byLed[pid].push(r);
-        });
-        allPids.forEach(function(pid){
+        await Promise.all(allPids.map(async function(pid) {
           // Missing balance_start must stay null — do NOT coerce to 0 (false $0.00).
           var start = (memberMap[pid]&&memberMap[pid].balance_start!=null) ? memberMap[pid].balance_start : null;
-          var derived = _deriveBalanceFromLedgerEntries(start, byLed[pid]||[]);
+          var led = await _ledgerAvailableForPlayer(sb, clubId, pid, start);
+          // Empty ledger + valid start → treat start as available (derive helper).
+          var derived = led.ledgerAvailable != null
+            ? led.ledgerAvailable
+            : _deriveBalanceFromLedgerEntries(start, []);
           if (derived != null) ledgerBalByPid[pid] = derived;
-        });
+        }));
       }
     } catch(_lb) { console.warn('[settlements-preview] ledger balance error:', _lb.message); }
 
@@ -14963,21 +14970,13 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
       ? rnd(startingBalance - openRisk - settledLosses + settledGains)
       : null;
 
-    // Ledger is source of truth (ledger_entries: risk debited at place).
+    // Ledger is source of truth (shared helper — same as host/dashboard players).
     var ledgerAvailable = null;
     var ledgerEntryCount = 0;
     try {
-      var lq = sb.from('ledger_entries')
-        .select('id,type,amount,balance_before,balance_after,created_at,ticket_id')
-        .eq('player_id', playerId)
-        .order('created_at', { ascending:true });
-      if (clubId) lq = lq.eq('club_id', clubId);
-      var { data: ledgerRows, error: lErr } = await lq;
-      if (lErr) throw lErr;
-      ledgerEntryCount = (ledgerRows||[]).length;
-      if (ledgerEntryCount > 0) {
-        ledgerAvailable = _deriveBalanceFromLedgerEntries(startingBalance, ledgerRows);
-      }
+      var led = await _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance);
+      ledgerAvailable = led.ledgerAvailable;
+      ledgerEntryCount = led.ledgerEntryCount || 0;
     } catch(_le) {
       console.warn('[player/dashboard] ledger_entries fetch error:', _le.message||_le);
       warnings.push('ledger_fetch_error');

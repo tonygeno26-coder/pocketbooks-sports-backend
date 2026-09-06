@@ -58,10 +58,16 @@ describe('GET /api/host/dashboard', () => {
   });
 
   test('availableBalance prefers ledger over ticket formula', () => {
-    expect(dash).toContain("_deriveBalanceFromLedgerEntries");
+    expect(dash).toContain("_ledgerAvailableForPlayer");
+    expect(src).toContain("_deriveBalanceFromLedgerEntries");
     expect(dash).toContain("p.balanceSource = 'ledger'");
     expect(dash).toContain('ticketAvailable');
     expect(dash).toContain('weekly:         weeklyStats');
+  });
+
+  test('host dashboard loads ledger per player like player/dashboard', () => {
+    expect(dash).toContain('_ledgerAvailableForPlayer(sb, clubId, pid, start)');
+    expect(dash).not.toMatch(/\.in\('player_id',\s*balPids\)/);
   });
 
   test('weekly stats are computed from graded won/lost tickets', () => {
