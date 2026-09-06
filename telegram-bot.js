@@ -6,7 +6,7 @@ const TZ = 'America/New_York';
 const WEBHOOK_PATH = '/api/survivor/telegram/webhook';
 const DEFAULT_PUBLIC_BASE = 'https://pocketbooks-sports-backend-production.up.railway.app';
 const PICK_URL = 'pocketbookssports.com';
-const WELCOME_MSG = "Welcome to PocketBooks Sports! 🏈 You'll receive survivor pool pick reminders and results here.";
+const WELCOME_MSG = 'Welcome to PocketBooks Sports! 🏈 Send your PocketBooks username to link your account for survivor pool notifications.';
 const WED_DOW = 3;
 const SUN_DOW = 0;
 
@@ -39,14 +39,44 @@ function getSb() {
   if (!url || !key) return null;
   try {
     const { createClient } = require('@supabase/supabase-js');
-    _sb = createClient(url, key, {
-      auth: { persistSession: false, autoRefreshToken: false }
-    });
+    const clientOpts = { auth: { persistSession: false, autoRefreshToken: false } };
+    // Node < 22 has no native WebSocket; @supabase/realtime-js requires transport: ws
+    // (same workaround as index.js getSupabase — without it Railway Node 18 throws and /start fails)
+    const nodeMajor = parseInt(String(process.versions && process.versions.node || '99').split('.')[0], 10);
+    if (nodeMajor < 22 || typeof globalThis.WebSocket === 'undefined') {
+      clientOpts.realtime = { transport: require('ws') };
+    }
+    _sb = createClient(url, key, clientOpts);
   } catch (e) {
     console.warn('[telegram] supabase init failed:', e.message);
     return null;
   }
   return _sb;
+}
+
+function pendingPlayerId(chatId) {
+  return 'tg:' + String(chatId);
+}
+
+function isLinkedAccount(row) {
+  const pid = row && row.player_id != null ? String(row.player_id) : '';
+  return !!pid && !pid.startsWith('tg:');
+}
+
+function logIncomingUpdate(update) {
+  const msg = update && (update.message || update.edited_message);
+  if (!msg) {
+    console.log('[telegram] inbound update_id=' + (update && update.update_id) + ' (no message body)');
+    return;
+  }
+  const from = msg.from || {};
+  const text = String(msg.text || '').slice(0, 120);
+  console.log(
+    '[telegram] inbound update_id=' + (update && update.update_id) +
+    ' chat_id=' + maskChatId(msg.chat && msg.chat.id) +
+    ' from=@' + (from.username || '(none)') +
+    ' text=' + JSON.stringify(text)
+  );
 }
 
 function escapeIlike(s) {
@@ -234,35 +264,49 @@ async function linkedPlayerForChat(sb, chatId) {
   return data || null;
 }
 
-async function handleStart(sb, chatId, payload) {
-  const help =
-    'Link your PocketBooks Sports account by sending:\n' +
-    '/start YourUsername\n\n' +
-    'Or send /start with the one-time code from player settings.\n\n' +
-    'Commands: /pick  /standings';
+/** Persist chat_id + Telegram username before PocketBooks account is linked (pending player_id). */
+async function saveTelegramChat(sb, chatId, telegramUsername) {
+  const cid = String(chatId);
+  const existing = await linkedPlayerForChat(sb, cid);
+  if (isLinkedAccount(existing)) return existing;
+  const pid = pendingPlayerId(cid);
+  const uname = String(telegramUsername || '').trim() || pid;
+  await sb.from('telegram_links').delete().eq('chat_id', cid).neq('player_id', pid);
+  const { error } = await sb.from('telegram_links').upsert({
+    player_id: pid,
+    username: uname,
+    chat_id: cid,
+    linked_at: new Date().toISOString()
+  }, { onConflict: 'player_id' });
+  if (error) throw error;
+  return { player_id: pid, username: uname, chat_id: cid };
+}
+
+async function handleStart(sb, chatId, payload, telegramUsername) {
+  await saveTelegramChat(sb, chatId, telegramUsername);
   if (!payload) {
     const existing = await linkedPlayerForChat(sb, chatId);
-    if (existing) {
+    if (isLinkedAccount(existing)) {
       await sendMessage(chatId, WELCOME_MSG + '\n\nLinked as ' + (existing.username || 'your account') + '.\nUse /pick or /standings anytime.');
       return;
     }
-    await sendMessage(chatId, help);
+    await sendMessage(chatId, WELCOME_MSG);
     return;
   }
   const codeHit = consumeLinkCode(payload);
   if (codeHit) {
     await linkChat(sb, codeHit.playerId, codeHit.username, chatId);
-    await sendMessage(chatId, WELCOME_MSG);
+    await sendMessage(chatId, 'Linked to ' + (codeHit.username || 'your account') + '. You will get survivor pick reminders here.\nUse /pick or /standings anytime.');
     return;
   }
   const matches = await findAccountsByUsername(sb, payload);
   if (!matches.length) {
-    await sendMessage(chatId, 'No account found for "' + payload + '". Send /start YourUsername exactly as it appears on PocketBooks Sports.');
+    await sendMessage(chatId, 'No account found for "' + payload + '". Send your PocketBooks username exactly as it appears on PocketBooks Sports.');
     return;
   }
   if (matches.length === 1) {
     await linkChat(sb, matches[0].playerId, matches[0].username, chatId);
-    await sendMessage(chatId, WELCOME_MSG);
+    await sendMessage(chatId, 'Linked to ' + matches[0].username + '. You will get survivor pick reminders here.\nUse /pick or /standings anytime.');
     return;
   }
   pendingConfirm.set(String(chatId), {
@@ -297,13 +341,13 @@ async function handleConfirm(sb, chatId, arg) {
   const chosen = p.choices[n - 1];
   pendingConfirm.delete(String(chatId));
   await linkChat(sb, chosen.playerId, chosen.username, chatId);
-  await sendMessage(chatId, WELCOME_MSG);
+  await sendMessage(chatId, 'Linked to ' + chosen.username + '. You will get survivor pick reminders here.\nUse /pick or /standings anytime.');
 }
 
 async function handlePick(sb, chatId) {
   const link = await linkedPlayerForChat(sb, chatId);
-  if (!link) {
-    await sendMessage(chatId, 'Not linked yet. Send /start YourUsername to connect your PocketBooks Sports account.');
+  if (!isLinkedAccount(link)) {
+    await sendMessage(chatId, 'Not linked yet. Send your PocketBooks username to connect your account.');
     return;
   }
   const playerId = String(link.player_id);
@@ -360,8 +404,8 @@ async function handlePick(sb, chatId) {
 
 async function handleStandings(sb, chatId) {
   const link = await linkedPlayerForChat(sb, chatId);
-  if (!link) {
-    await sendMessage(chatId, 'Not linked yet. Send /start YourUsername to connect your PocketBooks Sports account.');
+  if (!isLinkedAccount(link)) {
+    await sendMessage(chatId, 'Not linked yet. Send your PocketBooks username to connect your account.');
     return;
   }
   const playerId = String(link.player_id);
@@ -414,6 +458,7 @@ async function processUpdate(update) {
   if (!msg || !msg.chat) return;
   const chatId = msg.chat.id;
   const text = String(msg.text || '').trim();
+  const telegramUsername = msg.from && msg.from.username ? String(msg.from.username) : '';
   const sb = getSb();
   if (!sb) {
     await sendMessage(chatId, 'Bot is not fully configured. Try again later.');
@@ -421,7 +466,7 @@ async function processUpdate(update) {
   }
   const startMatch = text.match(/^\/start(?:@\w+)?(?:\s+(.+))?$/i);
   if (startMatch) {
-    await handleStart(sb, chatId, (startMatch[1] || '').trim());
+    await handleStart(sb, chatId, (startMatch[1] || '').trim(), telegramUsername);
     return;
   }
   const confirmMatch = text.match(/^\/confirm(?:@\w+)?(?:\s+(.+))?$/i);
@@ -440,9 +485,17 @@ async function processUpdate(update) {
   if (/^\/help(?:@\w+)?$/i.test(text)) {
     await sendMessage(chatId,
       'PocketBooks Sports survivor bot\n\n' +
-      '/start YourUsername — link account\n' +
+      'Send your PocketBooks username to link your account\n' +
       '/pick — current week pick status\n' +
       '/standings — pool standings');
+    return;
+  }
+  // After /start welcome, plain text is treated as PocketBooks username to link.
+  if (text && !text.startsWith('/')) {
+    const existing = await linkedPlayerForChat(sb, chatId);
+    if (!isLinkedAccount(existing)) {
+      await handleStart(sb, chatId, text, telegramUsername);
+    }
   }
 }
 
@@ -467,6 +520,7 @@ function handleWebhook(req, res) {
   if (!verifyWebhook(req)) {
     return res.status(401).json({ ok: false, error: 'unauthorized' });
   }
+  try { logIncomingUpdate(req.body); } catch (_e) {}
   res.status(200).json({ ok: true });
   Promise.resolve(processUpdate(req.body)).catch(function(e) {
     console.warn('[telegram] update failed:', e && e.message);

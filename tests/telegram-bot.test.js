@@ -27,12 +27,16 @@ describe('telegram-bot survivor wiring', function() {
   test('command handlers and copy match product spec', function() {
     expect(src).toMatch(/\/pick/);
     expect(src).toMatch(/\/standings/);
-    expect(src).toContain("Welcome to PocketBooks Sports! 🏈 You'll receive survivor pool pick reminders and results here.");
+    expect(src).toContain('Welcome to PocketBooks Sports! 🏈 Send your PocketBooks username to link your account for survivor pool notifications.');
     expect(src).toContain('pick locked in —');
     expect(src).toContain('picks open — deadline Sunday 1PM ET at');
     expect(src).toContain('pocketbookssports.com');
     expect(src).toMatch(/won — you are still alive/);
     expect(src).toMatch(/lost — you have been eliminated/);
+    expect(src).toContain("clientOpts.realtime = { transport: require('ws') }");
+    expect(src).toContain('logIncomingUpdate');
+    expect(src).toContain('saveTelegramChat');
+    expect(src).toContain('msg.from.username');
   });
 
   test('does not hardcode a live bot token', function() {
