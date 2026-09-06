@@ -3981,8 +3981,9 @@ function _isMmaCacheSportKey(gameSportKey) {
 // Cache: { "sport:name" -> canonical }
 const _teamNormCache = new Map();
 
-async function _owlsApiGetJson(path, queryParams) {
+async function _owlsApiGetJson(path, queryParams, opts) {
   if (!OWLS_KEY) return null;
+  var timeoutMs = (opts && opts.timeoutMs != null) ? opts.timeoutMs : 8000;
   var qs = '';
   if (queryParams && typeof queryParams === 'object') {
     qs = '?' + Object.keys(queryParams).map(function(k) {
@@ -4011,7 +4012,7 @@ async function _owlsApiGetJson(path, queryParams) {
       });
     });
     req.on('error', function() { resolve(null); });
-    req.setTimeout(8000, function() { req.destroy(); resolve(null); });
+    req.setTimeout(timeoutMs, function() { req.destroy(); resolve(null); });
   });
 }
 
@@ -11103,7 +11104,13 @@ async function _fetchOwlsScores(sport) {
     const owlsSport = _mapSportToOwls(_oddsApiSportKey(sport));
     if (!owlsSport || !OWLS_KEY) return null;
     // Canonical live-score path. Legacy /api/v1/scores/{sport} returns 404.
-    const data = await _owlsApiGetJson('/api/v1/' + owlsSport + '/scores/live');
+    // Scores endpoints are slower under multi-sport parallel poll than odds —
+    // use a longer timeout so 8s defaults don't empty the cache every tick.
+    const data = await _owlsApiGetJson(
+      '/api/v1/' + owlsSport + '/scores/live',
+      null,
+      { timeoutMs: 20000 }
+    );
     if (!data) return null;
     if (Array.isArray(data.events)) return data.events;
     if (data.data && Array.isArray(data.data.events)) return data.data.events;
@@ -11178,29 +11185,39 @@ async function _pollOwlsLiveScores(trigger) {
     const bySport = {};
     let eventCount = 0;
     let anyFresh = false;
-    await Promise.all(OWLS_LIVE_SCORE_SPORTS.map(async function(sport) {
-      const raw = await _fetchOwlsScores(sport);
-      // null = transport/API failure — keep prior valid index for this sport.
-      // [] = successful empty live board — clear that sport (no stale forever).
-      if (raw == null) {
-        if (prevBySport[sport]) {
-          bySport[sport] = prevBySport[sport];
-          eventCount += (prevBySport[sport].list || []).length;
-          console.warn('OWLS_SCORES_LIVE_KEEP sport='+sport+' reason=fetch_null trigger='+trigger);
+    // Bound concurrency: full parallel 8× scores/live was timing out at 8s
+    // on Railway; fetch in small batches with the longer per-request timeout.
+    const SCORE_FETCH_BATCH = 3;
+    for (var bi = 0; bi < OWLS_LIVE_SCORE_SPORTS.length; bi += SCORE_FETCH_BATCH) {
+      const batch = OWLS_LIVE_SCORE_SPORTS.slice(bi, bi + SCORE_FETCH_BATCH);
+      await Promise.all(batch.map(async function(sport) {
+        const raw = await _fetchOwlsScores(sport);
+        // null = transport/API failure — keep prior valid index for this sport.
+        // [] = successful empty live board — clear that sport (no stale forever).
+        if (raw == null) {
+          if (prevBySport[sport]) {
+            bySport[sport] = prevBySport[sport];
+            eventCount += (prevBySport[sport].list || []).length;
+            console.warn('OWLS_SCORES_LIVE_KEEP sport='+sport+' reason=fetch_null trigger='+trigger);
+          } else {
+            console.warn('OWLS_SCORES_LIVE_EMPTY sport='+sport+' reason=fetch_null trigger='+trigger);
+          }
+          return;
         }
-        return;
-      }
-      const events = Array.isArray(raw) ? raw : [];
-      const idx = owlsLiveScores.indexOwlsLiveScores(events, sport);
-      bySport[sport] = idx;
-      eventCount += idx.list.length;
-      anyFresh = true;
-      if (idx.list.length) {
-        console.log('OWLS_SCORES_LIVE_OK sport='+sport+' events='+idx.list.length+
-          ' live='+idx.list.filter(function(e){ return e.status==='live'; }).length+
-          ' trigger='+trigger);
-      }
-    }));
+        const events = Array.isArray(raw) ? raw : [];
+        const idx = owlsLiveScores.indexOwlsLiveScores(events, sport);
+        bySport[sport] = idx;
+        eventCount += idx.list.length;
+        anyFresh = true;
+        if (idx.list.length) {
+          console.log('OWLS_SCORES_LIVE_OK sport='+sport+' events='+idx.list.length+
+            ' live='+idx.list.filter(function(e){ return e.status==='live'; }).length+
+            ' trigger='+trigger);
+        } else {
+          console.log('OWLS_SCORES_LIVE_OK sport='+sport+' events=0 trigger='+trigger);
+        }
+      }));
+    }
     LIVE_SCORE_CACHE = {
       updatedAt: anyFresh ? new Date().toISOString() : (LIVE_SCORE_CACHE.updatedAt || new Date().toISOString()),
       bySport: bySport,
