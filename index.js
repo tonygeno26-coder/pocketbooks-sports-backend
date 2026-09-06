@@ -17218,27 +17218,42 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
   for (var qi = 0; qi < queries.length; qi++) {
     var q = queries[qi];
     if (!q) continue;
-    // ESPN returns empty items when `sport=` is set for tennis/MMA. Query by
-    // name + type=player, then filter the result's sport field.
-    var url = 'https://site.api.espn.com/apis/common/v3/search?query=' +
-      encodeURIComponent(q) + '&type=player&limit=5';
-    var data = await _httpsJson(url, 8000);
-    var items = (data && data.items) || [];
-    var exactHits = [];
-    for (var i = 0; i < items.length; i++) {
-      var it = items[i];
-      if (!it || !it.id) continue;
-      var itemSport = String(it.sport || '').toLowerCase();
-      if (itemSport && itemSport !== searchSport && itemSport !== s) continue;
-      var dn = _photoNormName(it.displayName || it.name || '');
-      if (want && dn && dn === want) exactHits.push(it);
-      else if (s !== 'mma' && want && dn && (dn.indexOf(want) >= 0 || want.indexOf(dn) >= 0)) {
-        // Non-MMA: keep legacy soft match for tennis/team sports
-        exactHits.push(it);
-      }
+    // Prefer site.web.api — site.api is often Akamai-blocked. For MMA also try
+    // the athlete+sport query shape requested for fighter photo sync.
+    var urls = [];
+    if (s === 'mma') {
+      urls.push('https://site.web.api.espn.com/apis/common/v3/search?query=' +
+        encodeURIComponent(q) + '&sport=mma&type=athlete&limit=3');
+      urls.push('https://site.api.espn.com/apis/common/v3/search?query=' +
+        encodeURIComponent(q.indexOf('mma') >= 0 ? q : (q + ' mma')) + '&sport=mma&type=athlete&limit=3');
     }
-    if (s === 'mma' && exactHits.length !== 1) continue;
-    var chosen = exactHits[0];
+    urls.push('https://site.web.api.espn.com/apis/common/v3/search?query=' +
+      encodeURIComponent(q) + '&type=player&limit=5');
+    // ESPN returns empty items when `sport=` is set for tennis/MMA on some hosts.
+    // Query by name + type=player, then filter the result's sport field.
+    urls.push('https://site.api.espn.com/apis/common/v3/search?query=' +
+      encodeURIComponent(q) + '&type=player&limit=5');
+
+    var chosen = null;
+    for (var ui = 0; ui < urls.length && !chosen; ui++) {
+      var data = await _httpsJson(urls[ui], 8000);
+      var items = (data && data.items) || [];
+      var exactHits = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        if (!it || !it.id) continue;
+        var itemSport = String(it.sport || '').toLowerCase();
+        if (itemSport && itemSport !== searchSport && itemSport !== s) continue;
+        var dn = _photoNormName(it.displayName || it.name || '');
+        if (want && dn && dn === want) exactHits.push(it);
+        else if (s !== 'mma' && want && dn && (dn.indexOf(want) >= 0 || want.indexOf(dn) >= 0)) {
+          // Non-MMA: keep legacy soft match for tennis/team sports
+          exactHits.push(it);
+        }
+      }
+      if (s === 'mma' && exactHits.length !== 1) continue;
+      if (exactHits[0]) chosen = exactHits[0];
+    }
     if (!chosen) continue;
     var espnId = String(chosen.id);
     var photoUrl = _espnHeadshotUrl(s, espnId);
