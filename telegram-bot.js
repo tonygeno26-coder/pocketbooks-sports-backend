@@ -5,7 +5,8 @@ const crypto = require('crypto');
 const TZ = 'America/New_York';
 const WEBHOOK_PATH = '/api/survivor/telegram/webhook';
 const DEFAULT_PUBLIC_BASE = 'https://pocketbooks-sports-backend-production.up.railway.app';
-const PICK_URL = 'pocketbookssports.com/survivor.html';
+const PICK_URL = 'pocketbookssports.com';
+const WELCOME_MSG = "Welcome to PocketBooks Sports! 🏈 You'll receive survivor pool pick reminders and results here.";
 const WED_DOW = 3;
 const SUN_DOW = 0;
 
@@ -224,29 +225,44 @@ function consumeLinkCode(payload) {
   return row;
 }
 
+async function linkedPlayerForChat(sb, chatId) {
+  const { data, error } = await sb.from('telegram_links')
+    .select('player_id,username,chat_id')
+    .eq('chat_id', String(chatId))
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
 async function handleStart(sb, chatId, payload) {
   const help =
-    'Link your Pocketbooks Sports account by sending:\n' +
+    'Link your PocketBooks Sports account by sending:\n' +
     '/start YourUsername\n\n' +
-    'Or send /start with the one-time code shown on the survivor page.';
+    'Or send /start with the one-time code from player settings.\n\n' +
+    'Commands: /pick  /standings';
   if (!payload) {
+    const existing = await linkedPlayerForChat(sb, chatId);
+    if (existing) {
+      await sendMessage(chatId, WELCOME_MSG + '\n\nLinked as ' + (existing.username || 'your account') + '.\nUse /pick or /standings anytime.');
+      return;
+    }
     await sendMessage(chatId, help);
     return;
   }
   const codeHit = consumeLinkCode(payload);
   if (codeHit) {
     await linkChat(sb, codeHit.playerId, codeHit.username, chatId);
-    await sendMessage(chatId, 'Linked to ' + (codeHit.username || 'your account') + '. You will get survivor pick reminders here.');
+    await sendMessage(chatId, WELCOME_MSG);
     return;
   }
   const matches = await findAccountsByUsername(sb, payload);
   if (!matches.length) {
-    await sendMessage(chatId, 'No account found for "' + payload + '". Send /start YourUsername exactly as it appears on Pocketbooks Sports.');
+    await sendMessage(chatId, 'No account found for "' + payload + '". Send /start YourUsername exactly as it appears on PocketBooks Sports.');
     return;
   }
   if (matches.length === 1) {
     await linkChat(sb, matches[0].playerId, matches[0].username, chatId);
-    await sendMessage(chatId, 'Linked to ' + matches[0].username + '. You will get survivor pick reminders here.');
+    await sendMessage(chatId, WELCOME_MSG);
     return;
   }
   pendingConfirm.set(String(chatId), {
@@ -281,7 +297,116 @@ async function handleConfirm(sb, chatId, arg) {
   const chosen = p.choices[n - 1];
   pendingConfirm.delete(String(chatId));
   await linkChat(sb, chosen.playerId, chosen.username, chatId);
-  await sendMessage(chatId, 'Linked to ' + chosen.username + '. You will get survivor pick reminders here.');
+  await sendMessage(chatId, WELCOME_MSG);
+}
+
+async function handlePick(sb, chatId) {
+  const link = await linkedPlayerForChat(sb, chatId);
+  if (!link) {
+    await sendMessage(chatId, 'Not linked yet. Send /start YourUsername to connect your PocketBooks Sports account.');
+    return;
+  }
+  const playerId = String(link.player_id);
+  const { data: entries, error: eErr } = await sb.from('survivor_entries')
+    .select('id,pool_id,entry_number,entry_label,player_username,status')
+    .eq('player_id', playerId)
+    .eq('status', 'alive');
+  if (eErr) throw eErr;
+  if (!entries || !entries.length) {
+    await sendMessage(chatId, 'No active survivor entries. Join a pool at ' + PICK_URL);
+    return;
+  }
+  const poolIds = [];
+  const seenPools = Object.create(null);
+  entries.forEach(function(e) {
+    if (seenPools[e.pool_id]) return;
+    seenPools[e.pool_id] = true;
+    poolIds.push(e.pool_id);
+  });
+  const { data: pools, error: pErr } = await sb.from('survivor_pools')
+    .select('id,name,current_week,status')
+    .in('id', poolIds);
+  if (pErr) throw pErr;
+  const poolById = Object.create(null);
+  (pools || []).forEach(function(p) { poolById[p.id] = p; });
+  const lines = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const pool = poolById[e.pool_id];
+    if (!pool || pool.status !== 'active') continue;
+    const week = pool.current_week;
+    const en = entryNum(e);
+    const { data: pick } = await sb.from('survivor_picks')
+      .select('team,result')
+      .eq('pool_id', pool.id)
+      .eq('player_id', playerId)
+      .eq('week', week)
+      .eq('entry_number', en)
+      .maybeSingle();
+    const label = e.entry_label || (e.player_username || link.username || 'You') + (en > 1 ? ' #' + en : '');
+    const poolName = pool.name || 'Survivor';
+    if (pick && pick.team) {
+      lines.push(poolName + ' · ' + label + '\nWeek ' + week + ': ✅ ' + pick.team + (pick.result && pick.result !== 'pending' ? ' (' + pick.result + ')' : ' locked'));
+    } else {
+      lines.push(poolName + ' · ' + label + '\nWeek ' + week + ': ⚠️ no pick yet — deadline Sunday 1PM ET');
+    }
+  }
+  if (!lines.length) {
+    await sendMessage(chatId, 'No active survivor pools for your account.');
+    return;
+  }
+  await sendMessage(chatId, 'Your Week picks:\n\n' + lines.join('\n\n'));
+}
+
+async function handleStandings(sb, chatId) {
+  const link = await linkedPlayerForChat(sb, chatId);
+  if (!link) {
+    await sendMessage(chatId, 'Not linked yet. Send /start YourUsername to connect your PocketBooks Sports account.');
+    return;
+  }
+  const playerId = String(link.player_id);
+  const { data: myEntries, error: meErr } = await sb.from('survivor_entries')
+    .select('pool_id')
+    .eq('player_id', playerId);
+  if (meErr) throw meErr;
+  if (!myEntries || !myEntries.length) {
+    await sendMessage(chatId, 'You are not in any survivor pools yet.');
+    return;
+  }
+  const poolIds = [];
+  const seen = Object.create(null);
+  myEntries.forEach(function(e) {
+    if (seen[e.pool_id]) return;
+    seen[e.pool_id] = true;
+    poolIds.push(e.pool_id);
+  });
+  const { data: pools, error: pErr } = await sb.from('survivor_pools')
+    .select('id,name,current_week,status')
+    .in('id', poolIds);
+  if (pErr) throw pErr;
+  const blocks = [];
+  for (let i = 0; i < (pools || []).length; i++) {
+    const pool = pools[i];
+    const { data: entries, error: eErr } = await sb.from('survivor_entries')
+      .select('player_id,player_username,entry_number,entry_label,status,eliminated_week')
+      .eq('pool_id', pool.id);
+    if (eErr) throw eErr;
+    const alive = [];
+    const out = [];
+    (entries || []).forEach(function(e) {
+      const en = entryNum(e);
+      const label = e.entry_label || (e.player_username || 'Player') + (en > 1 ? ' #' + en : '');
+      const mine = String(e.player_id) === playerId ? ' ← you' : '';
+      if (e.status === 'alive') alive.push('• ' + label + mine);
+      else out.push('• ' + label + ' (out W' + (e.eliminated_week || '?') + ')' + mine);
+    });
+    const title = (pool.name || 'Survivor') + ' — Week ' + pool.current_week +
+      (pool.status === 'active' ? '' : ' [' + pool.status + ']');
+    let body = title + '\nAlive (' + alive.length + '):\n' + (alive.length ? alive.join('\n') : '• none');
+    if (out.length) body += '\n\nEliminated:\n' + out.slice(0, 20).join('\n');
+    blocks.push(body);
+  }
+  await sendMessage(chatId, blocks.join('\n\n————————\n\n'));
 }
 
 async function processUpdate(update) {
@@ -304,8 +429,20 @@ async function processUpdate(update) {
     await handleConfirm(sb, chatId, (confirmMatch[1] || '').trim());
     return;
   }
+  if (/^\/pick(?:@\w+)?$/i.test(text)) {
+    await handlePick(sb, chatId);
+    return;
+  }
+  if (/^\/standings(?:@\w+)?$/i.test(text)) {
+    await handleStandings(sb, chatId);
+    return;
+  }
   if (/^\/help(?:@\w+)?$/i.test(text)) {
-    await sendMessage(chatId, 'Send /start YourUsername to link your account for survivor pick reminders.');
+    await sendMessage(chatId,
+      'PocketBooks Sports survivor bot\n\n' +
+      '/start YourUsername — link account\n' +
+      '/pick — current week pick status\n' +
+      '/standings — pool standings');
   }
 }
 
@@ -427,8 +564,8 @@ async function sendPickReminders(isFinal) {
   for (let i = 0; i < targets.length; i++) {
     const t = targets[i];
     const text = isFinal
-      ? ('⚠️ Week ' + t.week + ' picks close in 2 hours (1PM ET) — make your pick at ' + PICK_URL)
-      : ('⚠️ Week ' + t.week + ' picks are open — make your pick before Sunday 1PM ET at ' + PICK_URL);
+      ? ('⚠️ Week ' + t.week + ' picks close in 2 hours — deadline Sunday 1PM ET at ' + PICK_URL)
+      : ('⚠️ Week ' + t.week + ' picks open — deadline Sunday 1PM ET at ' + PICK_URL);
     await sendMessage(t.chatId, text);
   }
   console.log('[telegram] sent ' + targets.length + (isFinal ? ' final' : ' open') + ' reminders');
@@ -447,7 +584,7 @@ async function notifySurvivorPick(args) {
       .eq('player_id', String(playerId))
       .maybeSingle();
     if (error || !data || !data.chat_id) return;
-    const text = '✅ Week ' + week + ' pick locked: ' + team + '\nDeadline Sunday 1PM ET — ' + PICK_URL;
+    const text = '✅ Week ' + week + ' pick locked in — ' + team;
     await sendMessage(data.chat_id, text);
   } catch (e) {
     console.warn('[telegram] pick notify failed:', e && e.message);
@@ -496,9 +633,8 @@ async function maybeSetWebhook() {
 
 function logMissingTokenHelp() {
   console.warn('[telegram] TELEGRAM_BOT_TOKEN not set — bot disabled.');
-  console.warn('[telegram] Create a bot with @BotFather, then set Railway var TELEGRAM_BOT_TOKEN on service pocketbooks-sports-backend (perceptive-youthfulness). Optional: TELEGRAM_WEBHOOK_SECRET.');
-  console.warn('[telegram] Then set the webhook (replace TOKEN and SECRET, do not commit them):');
-  console.warn('[telegram]   curl -sS -X POST "https://api.telegram.org/botTOKEN/setWebhook" -H "Content-Type: application/json" -d \'{"url":"https://pocketbooks-sports-backend-production.up.railway.app/api/survivor/telegram/webhook","secret_token":"SECRET"}\'');
+  console.warn('[telegram] Create a bot with @BotFather, then set Railway var TELEGRAM_BOT_TOKEN on service pocketbooks-sports-backend. Optional: TELEGRAM_WEBHOOK_SECRET.');
+  console.warn('[telegram] Then setWebhook to https://pocketbooks-sports-backend-production.up.railway.app/api/survivor/telegram/webhook (do not commit the token).');
 }
 
 function startTelegramBot() {
