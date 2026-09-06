@@ -13296,26 +13296,75 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Load balance_start from club_members — canonical balance table (PL-3 fix).
-    // player_limits holds risk controls only; it has no balance_start column.
+    // Load roster + balance_start. Exclude host/admin actors (same as /api/host/dashboard)
+    // so Settle never shows actor "16" as a $0.00 player row.
     var memberMap = {};
+    var skippedHostIds = {};
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start');
+      var memQ = sb.from('club_memberships').select('actor_id,role,status');
+      if (clubId) memQ = memQ.eq('club_id', clubId);
+      const { data: memRows, error: memErr } = await memQ;
+      if (memErr) throw memErr;
+      (memRows||[]).forEach(function(r) {
+        if (!r || r.actor_id == null) return;
+        var st = String(r.status||'').toLowerCase();
+        var role = String(r.role||'player').toLowerCase();
+        if (st !== 'active' && st !== 'approved') return;
+        if (role === 'host' || role === 'admin' || role === 'owner' || role === 'full_admin') {
+          skippedHostIds[String(r.actor_id)] = true;
+          return;
+        }
+        memberMap[String(r.actor_id)] = { balance_start: null, role: r.role || 'player', status: r.status };
+      });
+    } catch(_e) { console.warn('[settlements-preview] club_memberships fetch error:', _e.message); }
+
+    try {
+      let plq = sb.from('club_members').select('player_id,balance_start,status');
       if (clubId) plq = plq.eq('club_id', clubId);
       const { data: plRows } = await plq;
       (plRows||[]).forEach(function(r) {
-        if (r.player_id != null) memberMap[String(r.player_id)] = { balance_start: r.balance_start != null ? parseFloat(r.balance_start) : null };
+        if (r.player_id == null) return;
+        var pid = String(r.player_id);
+        if (skippedHostIds[pid]) return;
+        var start = r.balance_start != null ? parseFloat(r.balance_start) : null;
+        if (memberMap[pid]) {
+          memberMap[pid].balance_start = start;
+          return;
+        }
+        if (String(r.status||'').toLowerCase() === 'approved') {
+          memberMap[pid] = { balance_start: start, role: 'player', status: r.status };
+        }
       });
     } catch(_e) { console.warn('[settlements-preview] club_members balance fetch error:', _e.message); }
+
+    // Resolve usernames (uuid ids only — never pass Railway numeric host ids).
+    var nameById = {};
+    var uuidPids = Object.keys(memberMap).filter(function(pid){ return !!_uuidOrNull(String(pid)); });
+    if (uuidPids.length) {
+      try {
+        const { data: userRows } = await sb.from('users').select('id,username,display_name').in('id', uuidPids);
+        (userRows||[]).forEach(function(u) {
+          if (!u || u.id == null) return;
+          nameById[String(u.id)] = u.username || u.display_name || '';
+        });
+      } catch(_ue) {
+        console.warn('[settlements-preview] users lookup failed:', _ue && _ue.message);
+      }
+    }
 
     // Derive per-player settlement from tickets
     var byPlayer = {};
     function getOrCreate(pid, username) {
       if (!byPlayer[pid]) {
         var meta = memberMap[pid] || {};
+        var resolved = nameById[pid] || '';
+        var uname = resolved || username || pid;
+        if (uname && String(uname) === String(pid) && _uuidOrNull(String(pid))) {
+          uname = resolved || pid;
+        }
         byPlayer[pid] = {
           playerId:     pid,
-          username:     username || pid,
+          username:     uname,
           balance:      meta.balance_start != null ? parseFloat(meta.balance_start) : null,
           openRisk:     0,
           settledNet:   0,
@@ -13327,23 +13376,29 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
           hostOwes:     0,
           lastTicketAt: null
         };
+      } else if (username && byPlayer[pid].username === pid && username !== pid) {
+        byPlayer[pid].username = nameById[pid] || username;
       }
       return byPlayer[pid];
     }
 
     function rnd(v){ return Math.round((isNaN(v)?0:v)*100)/100; }
 
-    // Ensure roster players appear even with zero tickets
-    Object.keys(memberMap).forEach(function(pid){ getOrCreate(pid, pid); });
+    // Ensure roster players appear even with zero tickets (players only — not hosts)
+    Object.keys(memberMap).forEach(function(pid){
+      if (skippedHostIds[pid]) return;
+      getOrCreate(pid, nameById[pid] || pid);
+    });
 
     var cutoffMap = await _loadSettlementCutoffs(sb, clubId, Object.keys(byPlayer).concat(Object.keys(memberMap)));
 
     (tickets||[]).forEach(function(t) {
       var pid  = String(t.player_id || 'unknown');
+      if (skippedHostIds[pid]) return;
       var s    = (t.status||'').toLowerCase();
       var risk = parseFloat(t.risk_amount)||0;
       var prof = parseFloat(t.potential_profit)||0;
-      var p    = getOrCreate(pid, t.player_username);
+      var p    = getOrCreate(pid, nameById[pid] || t.player_username);
       var pMs  = t.placed_at ? new Date(t.placed_at).getTime() : 0;
       if (pMs && (!p.lastTicketAt || pMs > new Date(p.lastTicketAt).getTime())) p.lastTicketAt = t.placed_at;
       if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
@@ -13396,7 +13451,9 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       p.settlementCutoffAt = cutoffMap[p.playerId] ? new Date(cutoffMap[p.playerId]).toISOString() : null;
     });
 
-    var players = Object.values(byPlayer).sort(function(a,b){ return (b.owesHost+b.hostOwes)-(a.owesHost+a.hostOwes); });
+    var players = Object.values(byPlayer)
+      .filter(function(p){ return p && p.playerId && !skippedHostIds[String(p.playerId)]; })
+      .sort(function(a,b){ return (b.owesHost+b.hostOwes)-(a.owesHost+a.hostOwes); });
     var playersOweTot = players.reduce(function(s,p){ return s+p.owesHost; },0);
     var hostOwesTot   = players.reduce(function(s,p){ return s+p.hostOwes; },0);
 

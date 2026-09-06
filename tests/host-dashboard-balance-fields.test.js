@@ -91,6 +91,15 @@ test('settlements-preview no longer defaults missing start to 0', function () {
   assert.ok(!/balance_start!=null\) \? memberMap\[pid\]\.balance_start : 0;/.test(src), 'removed : 0 coerce');
 });
 
+test('settlements-preview excludes hosts and resolves usernames', function () {
+  var src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
+  assert.ok(src.indexOf("skippedHostIds[String(r.actor_id)] = true") !== -1
+    || src.indexOf('skippedHostIds[String(r.actor_id)] = true') !== -1,
+    'host actors skipped in settlements roster');
+  assert.ok(src.indexOf("!skippedHostIds[String(p.playerId)]") !== -1, 'final players filter hosts');
+  assert.ok(src.indexOf("[settlements-preview] users lookup failed") !== -1, 'username lookup present');
+});
+
 console.log('\n──────────────────────────────────────────────────────');
 console.log('Host dashboard balance fields: ' + pass + ' passed, ' + fail + ' failed');
 if (fail) { console.error('❌ FAILED'); process.exit(1); }
