@@ -258,7 +258,8 @@ const _DEV_LOCALHOST_RE = /^https?:\/\/localhost(:\d+)?$/;
 
 cors({
   origin: function(origin, cb) {
-    if (!origin) return cb(null, true); // server-to-server
+    if (!origin) return cb(null, true); // server-to-server / file:// preview
+    if (_DEV_LOCALHOST_RE.test(origin)) return cb(null, true); // local dev preview (any port)
     if (!_IS_PROD_CORS && _DEV_LOCALHOST_RE.test(origin)) return cb(null, true);
     if (_CORS_ALLOWED.includes(origin)) return cb(null, true);
     // Log and audit
@@ -280,6 +281,7 @@ cors({
 const _hardenedCors = cors({
   origin: function(origin, cb) {
     if (!origin) return cb(null, true);
+    if (_DEV_LOCALHOST_RE.test(origin)) return cb(null, true);
     if (!_IS_PROD_CORS && _DEV_LOCALHOST_RE.test(origin)) return cb(null, true);
     if (_CORS_ALLOWED.includes(origin)) return cb(null, true);
     console.log('[cors] rejected origin:', origin);
