@@ -6474,6 +6474,19 @@ function _collapseSportPrefixOnGameKey(cKey) {
   return parts.join('|');
 }
 
+// Parse sport|away|home|date from a canonical_game_key (grading + leg backfill).
+function _parseCanonicalGameKey(cKey) {
+  if (!cKey) return { sport: null, awayTeam: null, homeTeam: null, date: null };
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return { sport: parts[0] || null, awayTeam: null, homeTeam: null, date: null };
+  return {
+    sport:     parts[0] || null,
+    awayTeam:  parts[1] || null,
+    homeTeam:  parts[2] || null,
+    date:      parts[3] || null
+  };
+}
+
 function _gameKeyLookupCandidates(cKey) {
   const seen = {};
   const out = [];
@@ -14523,11 +14536,14 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       // snapshot verifier uses, so the persisted ticket leg carries the
       // exact identity tuple grading + SGP will need later.
       var ident = _normalizeLegIdentity(leg) || {};
+      var parsedKey = _parseCanonicalGameKey(leg.canonicalGameKey);
       return {
         id: crypto.randomUUID(), ticket_id: ticketId, leg_index: i,
         provider_name: leg.providerName||'odds-api', provider_game_id: leg.providerGameId||leg.gameId||null,
-        canonical_game_key: leg.canonicalGameKey, sport: leg.sport||null,
-        home_team: leg.homeTeam||null, away_team: leg.awayTeam||null,
+        canonical_game_key: leg.canonicalGameKey,
+        sport: leg.sport || parsedKey.sport || null,
+        home_team: leg.homeTeam || parsedKey.homeTeam || null,
+        away_team: leg.awayTeam || parsedKey.awayTeam || null,
         scheduled_start: leg.scheduledStart||leg.commenceTime||null,
         market: leg.market, pick: leg.pick,
         odds: leg.accepted_odds_american || leg.odds,
