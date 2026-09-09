@@ -5,7 +5,7 @@
 **BE tip:** `cursor/settlement-option-a` (this doc + cash-flag scaffolding default OFF)  
 **T0:** **NOT APPROVED.** Do **not** use `2026-09-09T08:00:00.000Z`. Re-pick immediately before actual bootstrap.
 
-Hard rules honored: no invented financial amounts; lifetime / bankroll are **context only**; Category C not auto-zeroed.
+Hard rules honored: no invented financial amounts; lifetime / bankroll are **context only**. **Owner morning-gate (2026-09-09):** Category C all three approved **OPEN AT $0** for settlement position planning only — **NOT WRITTEN**; do not change bankroll/balance_start/tickets/P&L/historical ledger.
 
 ---
 
@@ -24,9 +24,9 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Last activity | Club tickets last grade **2026-05-28**; null-club smoke **2026-09-01** |
 | Why Ambiguous | Non-trivial lifetime (+1037.85); **no** settlement records / opening / epoch / legacy settlement rows; bankroll ≠ cash carry; null-club smoke does not prove square or a signed residue |
 | Evidence square vs owed | **Neither proven.** No cash ledger proves $0 square; lifetime must **not** be treated as host-owes +1037.85 |
-| Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT only if owner has an external signed cash residue). Do **not** OPEN AT $0 without written rationale |
+| Recommended Owner Decision | **OPEN AT $0** (owner morning-gate 2026-09-09). Settlement position ONLY — no bankroll/balance_start/tickets/P&L/ledger changes. **NOT WRITTEN.** |
 
-`OWNER CHOICE: [ $0 / signed amount / DEFER ]`
+`OWNER CHOICE: $0` ✅ **approved (planning only — NOT WRITTEN)**
 
 ---
 
@@ -43,9 +43,9 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Last activity | Last grade **2026-09-06T00:30:20Z**; last place 2026-09-05 |
 | Why Ambiguous | \|lifetime\| ≥ 100 bootstrap heuristic; 0 epoch / 0 settlement records / 0 legacy settlements; no signed cash residue |
 | Evidence square vs owed | **Neither proven.** Not square by record; not an explicit owed amount |
-| Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT with signed external amount). Do **not** OPEN AT $0 without written rationale |
+| Recommended Owner Decision | **OPEN AT $0** (owner morning-gate 2026-09-09). Settlement position ONLY — no bankroll/balance_start/tickets/P&L/ledger changes. **NOT WRITTEN.** |
 
-`OWNER CHOICE: [ $0 / signed amount / DEFER ]`
+`OWNER CHOICE: $0` ✅ **approved (planning only — NOT WRITTEN)**
 
 ---
 
@@ -62,9 +62,9 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Last activity | Last grade **2026-09-09T01:40:02Z**; last place 2026-09-08 22:15Z |
 | Why Ambiguous | \|lifetime\| ≥ 100; recent graded play; 0 epoch / 0 settlement records / 0 legacy settlements; must not infer player-owes from P&L |
 | Evidence square vs owed | **Neither proven.** Do **not** treat −163.94 as opening debt |
-| Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT with signed external amount). Do **not** OPEN AT $0 without written rationale |
+| Recommended Owner Decision | **OPEN AT $0** (owner morning-gate 2026-09-09). Settlement position ONLY — no bankroll/balance_start/tickets/P&L/ledger changes. **NOT WRITTEN.** |
 
-`OWNER CHOICE: [ $0 / signed amount / DEFER ]`
+`OWNER CHOICE: $0` ✅ **approved (planning only — NOT WRITTEN)**
 
 ---
 
@@ -134,12 +134,32 @@ Tentative owner stance (prior): approved at **$0** **if** evidence still confirm
 
 ---
 
+
+---
+
+## MORNING GATE OWNER DECISION — 2026-09-09 (planning only)
+
+Owner approved settlement **opening position $0.00** for all five Test Club accounts below. This is **documentation only**.
+
+| Account | Role | Opening (settlement position) | Written? |
+|---|---|---|---|
+| host `16` | Category A | $0.00 | **NO** |
+| testplayer3 | Category A | $0.00 | **NO** |
+| test-player-001 | Category C | $0.00 | **NO** |
+| testplayer2 | Category C | $0.00 | **NO** |
+| testplayer1 | Category C | $0.00 | **NO** |
+
+**Scope:** settlement opening position ONLY.  
+**Do NOT:** bootstrap RPCs, apply migrations, enable `SETTLEMENT_RECORDING_ENABLED`, mutate bankroll / `balance_start` / tickets / P&L / historical ledger.
+
 ## STATUS BLOCK
 
 ```
 STATUS: OWNER SETTLEMENT DECISION TABLE
 CATEGORY A: 2 still $0-eligible (host 16; bc767309/testplayer3) — tentative only; not written
-CATEGORY C: 3 require owner choice — recommend DEFER (no auto-zero); blanks below
+CATEGORY C: 3/3 owner-approved OPEN AT $0 (planning only — NOT WRITTEN)
+CATEGORY A+C OPENINGS: 5/5 approved at $0 — NOT WRITTEN
+BOOTSTRAP/WRITE: DO NOT RUN until separate owner go-ahead + T0 re-pick
 SCHEMA-WITH-FLAG-OFF SAFETY: SAFE IF flag remains false (scaffolded default OFF); tables/RPC additive; settle writes gated; place/grade unchanged
 PRODUCTION DATA TOUCHED: NO
 ```
