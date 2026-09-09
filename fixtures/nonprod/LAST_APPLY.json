@@ -1,0 +1,75 @@
+{
+  "appliedAt": "2026-09-09T06:29:09.003Z",
+  "database": "postgres://localhost:5432/pb_settlement_nonprod",
+  "productionTouched": false,
+  "files": [
+    "fixtures/nonprod/schema_minimal.sql",
+    "migrations/PROPOSED_settlement_payments.sql",
+    "migrations/PROPOSED_cancel_bet_tx_club_isolation.sql"
+  ],
+  "cancelResults": {
+    "valid": {
+      "ok": true,
+      "refund": 100,
+      "status": "canceled",
+      "ticket_id": "tA1",
+      "idempotent": false,
+      "balance_after": 988,
+      "balance_before": 888,
+      "ledger_entry_id": "CAN_A1",
+      "previous_status": "active"
+    },
+    "wrong_club": {
+      "ok": false,
+      "error": "ticket_club_mismatch",
+      "ticket_id": "tB1",
+      "ticket_club_id": "clubB",
+      "requested_club_id": "clubA"
+    },
+    "wrong_player": {
+      "ok": false,
+      "error": "ticket_player_mismatch",
+      "ticket_id": "tB1"
+    },
+    "missing_member": {
+      "ok": false,
+      "code": "no_club_member_balance_found",
+      "hint": "No balance record found for this player at this club",
+      "error": "no_club_member_balance_found"
+    },
+    "two_club_B": {
+      "ok": true,
+      "refund": 50,
+      "status": "canceled",
+      "ticket_id": "tB1",
+      "idempotent": false,
+      "balance_after": 500,
+      "balance_before": 450,
+      "ledger_entry_id": "CAN_B1",
+      "previous_status": "active"
+    },
+    "dup": {
+      "ok": true,
+      "refund": 100,
+      "status": "canceled",
+      "replay_of": "CAN_A1",
+      "ticket_id": "tA1",
+      "idempotent": true,
+      "balance_after": 988,
+      "ledger_entry_id": "CAN_A1"
+    },
+    "already_canceled": {
+      "ok": false,
+      "error": "invalid_transition",
+      "status": "canceled",
+      "ticket_id": "tA1"
+    },
+    "already_graded": {
+      "ok": false,
+      "error": "invalid_transition",
+      "status": "won",
+      "ticket_id": "tA_won"
+    }
+  },
+  "settlementPaymentsCount": 1
+}

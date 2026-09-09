@@ -54,11 +54,15 @@ Apply returns authoritative `balanceBefore` / `balanceAfter`. FE must reconcile 
 
 **Removed hard dependency:** `settle_player_tx` (absent in prod). If `settlement_payments` table missing → `503 settlement_payments_missing` (do not invent RPC).
 
-## Proposed DB (NOT APPLIED)
+## Proposed DB
 
 1. `migrations/PROPOSED_settlement_payments.sql` — minimal append-only table + rollback  
 2. `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` — hard club lock + remove phantom `$1000`  
 3. ~~`PROPOSED_settle_player_tx_club_scope.sql`~~ — **deleted** (Option A)
+
+**Non-prod apply status:** both proposed files applied to local Postgres fixture `pb_settlement_nonprod` via `fixtures/nonprod/apply_and_test.js` (see `fixtures/nonprod/LAST_APPLY.json`). **Not** applied to production `padgicwrrzmukahfsyhk`.
+
+Full epoch / opening / go-live / concurrency audit: `docs/SETTLEMENT_NONPROD_VALIDATION.md`.
 
 ## P0 club isolation (this branch)
 

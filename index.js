@@ -13763,9 +13763,10 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       .eq('club_id', clubId).eq('player_id', playerId);
     if (tErr) throw tErr;
 
-    const carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
-    const before = carryInfo.settlementBalance;
-    const applied = settlementCarry.applyPartialSettlement(before, amt);
+    // Authoritative carry — never trust FE balance_before / stale preview.
+    var carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
+    var before = carryInfo.settlementBalance;
+    var applied = settlementCarry.applyPartialSettlement(before, amt);
 
     if (!applied.ok) {
       if (applied.error === 'overpay_blocked') {
@@ -13786,7 +13787,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     }
 
     // Direction must match carry sign (or omit — server derives)
-    const derivedDir = applied.direction;
+    var derivedDir = applied.direction;
     if (direction && direction !== derivedDir) {
       return res.status(400).json({
         ok:false, error:'direction_mismatch',
@@ -13795,7 +13796,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
         owesHost: carryInfo.owesHost, hostOwes: carryInfo.hostOwes
       });
     }
-    const finalDir = derivedDir;
+    var finalDir = derivedDir;
 
     // Option A: settlement_payments is the authoritative payment SoT.
     // Do NOT call settle_player_tx (absent in prod) and do NOT rewrite bankroll.
@@ -13829,6 +13830,40 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     }
 
     if (!idempotent) {
+      // Pre-insert recompute — shrink concurrency window vs stale FE preview.
+      // Full serialization still needs DB advisory lock (see SETTLEMENT_NONPROD_VALIDATION.md).
+      carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
+      before = carryInfo.settlementBalance;
+      applied = settlementCarry.applyPartialSettlement(before, amt);
+      if (!applied.ok) {
+        if (applied.error === 'overpay_blocked') {
+          return res.status(400).json({
+            ok:false, error:'overpay_blocked',
+            amount: amt, maxAmount: applied.maxAmount,
+            balanceBefore: before,
+            message: applied.message || ('Settlement cannot cross zero. Max $'+applied.maxAmount.toFixed(2)),
+            stalePreviewRejected: true
+          });
+        }
+        return res.status(400).json({
+          ok:false, error: applied.error,
+          balanceBefore: before, maxAmount: applied.maxAmount || 0,
+          stalePreviewRejected: true
+        });
+      }
+      derivedDir = applied.direction;
+      if (direction && direction !== derivedDir) {
+        return res.status(400).json({
+          ok:false, error:'direction_mismatch',
+          expected: derivedDir, got: direction,
+          balanceBefore: before,
+          owesHost: carryInfo.owesHost, hostOwes: carryInfo.hostOwes,
+          stalePreviewRejected: true
+        });
+      }
+      finalDir = derivedDir;
+      balanceAfter = applied.after;
+
       const payRow = {
         payment_id: paymentId,
         period_id: settlementWeek || 'DIRECT',

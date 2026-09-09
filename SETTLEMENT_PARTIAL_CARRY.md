@@ -153,4 +153,8 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 
 ## Option A redesign (cursor/settlement-option-a)
 
-See `docs/SETTLEMENT_OPTION_A.md`. Hard dependency on `settle_player_tx` **removed**. Authoritative apply path writes `settlement_payments` only (proposed migration not applied). Cancel club isolation + phantom1000 fix proposed in `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` (not applied). Null-club ledger: `docs/NULL_CLUB_LEDGER_AUDIT.md` (read-only, no backfill).
+See `docs/SETTLEMENT_OPTION_A.md`. Hard dependency on `settle_player_tx` **removed**. Authoritative apply path writes `settlement_payments` only.
+
+**Non-prod validation:** `docs/SETTLEMENT_NONPROD_VALIDATION.md`  
+**Local fixture apply (never prod):** `fixtures/nonprod/apply_and_test.js` → DB `pb_settlement_nonprod`  
+Cancel club isolation + phantom1000: `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` (applied on local fixture only). Null-club ledger: `docs/NULL_CLUB_LEDGER_AUDIT.md` (read-only, no backfill).
