@@ -72,20 +72,19 @@ test('stale −500 preview vs actual −200: pay 200 → ok → 0', function() {
   assert.strictEqual(r.after, 0);
 });
 
-test('settle-player recomputes _calcPlayerSettlementCarry (never trusts FE balance_before)', function() {
-  assert.ok(settleFn.indexOf('_calcPlayerSettlementCarry') !== -1);
-  assert.ok(settleFn.indexOf('applyPartialSettlement(before, amt)') !== -1 ||
-            settleFn.indexOf('applyPartialSettlement(before') !== -1);
+test('settle-player recomputes via serialized RPC (never trusts FE balance_before)', function() {
+  assert.ok(settleFn.indexOf("_callMoneyRpc('settle_payment_option_a_tx'") !== -1);
+  assert.ok(settleFn.indexOf('serialized: true') !== -1);
   // Must not read req.body.balance_before / balanceBefore as authority
   assert.ok(!/const before = .*req\.body/.test(settleFn));
   assert.ok(settleFn.indexOf('balanceBefore: before') !== -1);
 });
 
-test('pre-insert recompute present (concurrency window shrink)', function() {
-  assert.ok(settleFn.indexOf('Pre-insert recompute') !== -1);
-  assert.ok(settleFn.indexOf('stalePreviewRejected') !== -1);
-  assert.ok((settleFn.split('_calcPlayerSettlementCarry').length - 1) >= 2,
-    'settle-player should recompute carry more than once');
+test('advisory lock + lock_timeout wiring present', function() {
+  assert.ok(settleFn.indexOf('settlementLock') !== -1 || src.indexOf("require('./lib/settlement-lock')") !== -1);
+  assert.ok(settleFn.indexOf('lock_timeout') !== -1);
+  assert.ok(settleFn.indexOf('p_lock_timeout_ms') !== -1);
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql')));
 });
 
 test('concurrent overpay race documented: two×400 on −500 must not both succeed unchecked', function() {
@@ -102,6 +101,9 @@ test('concurrent overpay race documented: two×400 on −500 must not both succe
   var sequential2 = sc.applyPartialSettlement(-100, 400);
   assert.strictEqual(sequential2.ok, false);
   assert.strictEqual(sequential2.error, 'overpay_blocked');
+  // Serialization RPC must exist to prevent the raced outcome
+  var sql = fs.readFileSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql'), 'utf8');
+  assert.ok(sql.indexOf('pg_advisory_xact_lock') !== -1);
 });
 
 console.log('\n── Idempotency ──');
@@ -110,6 +112,14 @@ test('club-scoped payment_id and settlementId', function() {
   assert.ok(settleFn.indexOf("'SETTLE_DIRECT_'+clubId+'_'+idempotencyKey") !== -1);
   assert.ok(settleFn.indexOf("String(clubId) + '::' + String(idempotencyKey)") !== -1);
   assert.ok(settleFn.indexOf('idempotent') !== -1);
+});
+
+test('opening balance included in derive formula', function() {
+  assert.strictEqual(sc.deriveSettlementCarry(0, 0, 0, -500), -500);
+  assert.strictEqual(sc.deriveSettlementCarry(50, 0, 0, -500), -450);
+  assert.ok(src.indexOf('_loadSettlementOpenings') !== -1);
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settlement_opening_balances.sql')));
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_bootstrap_settlement_opening_epoch.sql')));
 });
 
 console.log('\n── Multi-club ──');
@@ -129,7 +139,8 @@ test('settle path declares bankrollMutated false and no settle_player_tx', funct
   assert.ok(settleFn.indexOf('bankrollMutated: false') !== -1);
   assert.ok(settleFn.indexOf('settlePlayerTxUsed: false') !== -1);
   assert.ok(settleFn.indexOf("_callMoneyRpc('settle_player_tx'") === -1);
-  assert.ok(settleFn.indexOf("from('settlement_payments')") !== -1);
+  assert.ok(settleFn.indexOf("_callMoneyRpc('settle_payment_option_a_tx'") !== -1);
+  assert.ok(paySql.indexOf('settlement_payments') !== -1);
 });
 
 test('settlement_payments comment: does not rewrite ticket bankroll', function() {
@@ -137,9 +148,10 @@ test('settlement_payments comment: does not rewrite ticket bankroll', function()
             paySql.indexOf('does not rewrite') !== -1);
 });
 
-test('epoch cutoff uses historical markers only; cash settle type settlement_payment', function() {
+test('epoch cutoff uses historical markers only; cash settle type settlement_payment in SQL', function() {
   assert.ok(src.indexOf('isHistoricalEpochMarker') !== -1);
-  assert.ok(settleFn.indexOf("type: 'settlement_payment'") !== -1);
+  var settleSql = fs.readFileSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql'), 'utf8');
+  assert.ok(settleSql.indexOf("'settlement_payment'") !== -1);
   assert.ok(settleFn.indexOf("type: 'SETTLEMENT_APPLIED'") === -1);
 });
 

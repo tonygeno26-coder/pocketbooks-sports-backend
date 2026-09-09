@@ -1,0 +1,138 @@
+{
+  "ranAt": "2026-09-09T07:39:24.800Z",
+  "database": "postgres://localhost:5432/pb_settlement_nonprod",
+  "productionTouched": false,
+  "productionMigration": false,
+  "merged": false,
+  "advisoryLock": "pg_advisory_xact_lock(key1,key2) via settle_payment_option_a_tx",
+  "lockKey": {
+    "algorithm": "md5(settle_v1|club_id|player_id) → int4 pair",
+    "namespace": "settle_v1",
+    "scope": "club_id+player_id (NOT global)",
+    "exampleClubA_p1": {
+      "key1": 485812327,
+      "key2": 1618015860
+    }
+  },
+  "concurrentOverpay": {
+    "scenario": "−500 concurrent 400+400",
+    "results": [
+      {
+        "ok": false,
+        "error": "overpay_blocked",
+        "amount": 400,
+        "message": "Settlement cannot cross zero. Max applicable is $100.00",
+        "maxAmount": 100,
+        "serialized": true,
+        "balanceBefore": -100,
+        "bankrollMutated": false
+      },
+      {
+        "ok": true,
+        "amount": 400,
+        "lockKey": {
+          "key1": 1128691047,
+          "key2": -2096565613,
+          "scope": "club_id+player_id"
+        },
+        "executed": true,
+        "hostOwes": 0,
+        "owesHost": 100,
+        "direction": "player_paid_host",
+        "maxAmount": 500,
+        "paymentId": "SETTLE_DIRECT_clubA_CONC_B",
+        "idempotent": false,
+        "serialized": true,
+        "balanceAfter": -100,
+        "settlementId": "clubA::CONC_B",
+        "balanceBefore": -500,
+        "bankrollMutated": false,
+        "carryComponents": {
+          "cutoffMs": 0,
+          "hostPaidPlayer": 0,
+          "openingBalance": 0,
+          "playerPaidHost": 0,
+          "ticketSettledNet": -500,
+          "settlementBalance": -500
+        },
+        "settlementBalance": -100,
+        "settlePlayerTxUsed": false
+      }
+    ],
+    "finalBalance": -100,
+    "paymentSum": 400,
+    "neverPlus100Or600": true
+  },
+  "idempotency": {
+    "sameKeyConcurrent": {
+      "executed": 1,
+      "idempotent": 1,
+      "rows": 1
+    },
+    "crossClubIndependent": true
+  },
+  "lockTimeout": {
+    "ms": 500,
+    "defaultMs": 3000,
+    "error": "lock_timeout",
+    "paymentRowWritten": false,
+    "retry": {
+      "message": "Settlement lock busy; retry with same Idempotency-Key. No payment was written.",
+      "backoffMs": 250,
+      "maxAttempts": 3,
+      "recommended": true
+    }
+  },
+  "bootstrap": {
+    "model": "T0 epoch marker (SETTLEMENT_APPLIED_BOOTSTRAP_*) + settlement_opening_balances",
+    "t0": "2026-09-01T00:00:00.000Z",
+    "t0Rule": "gradeMs <= T0 excluded; gradeMs > T0 included; at-boundary = before",
+    "openingPrimitive": "settlement_opening_balances.opening_balance (signed player POV)",
+    "clubA": {
+      "opening": -500,
+      "afterTickets": {
+        "cutoffMs": 1788220800000,
+        "hostPaidPlayer": 0,
+        "openingBalance": -500,
+        "playerPaidHost": 0,
+        "ticketSettledNet": 50,
+        "settlementBalance": -450
+      }
+    },
+    "clubB": {
+      "opening": 300,
+      "afterTickets": {
+        "cutoffMs": 1788220800000,
+        "hostPaidPlayer": 0,
+        "openingBalance": 300,
+        "playerPaidHost": 0,
+        "ticketSettledNet": 0,
+        "settlementBalance": 300
+      }
+    },
+    "idempotent": true,
+    "historicalPnLOpensAt": 0,
+    "bankrollMutated": false
+  },
+  "ambiguous": {
+    "ok": false,
+    "error": "needs_human_review",
+    "clubId": "clubA",
+    "message": "Ambiguous go-live opening — human review required before bootstrap.",
+    "reasons": [
+      "lifetime_net_nonzero_opening_zero_no_rationale"
+    ],
+    "playerId": "pAmb",
+    "ambiguous": true,
+    "lifetimeNet": -500,
+    "requestedOpening": 0
+  },
+  "regression": {
+    "ticketsUnmutatedBySettlement": true,
+    "bankrollUnmutated": true,
+    "pureMathIntact": true
+  },
+  "pass": 29,
+  "fail": 0,
+  "testTotalThisHarness": 29
+}

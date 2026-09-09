@@ -10,6 +10,7 @@ const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const owlsLiveScores = require('./lib/owls-live-scores');
 const settlementCarry = require('./lib/settlement-carry');
+const settlementLock = require('./lib/settlement-lock');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -13414,16 +13415,44 @@ async function _loadSettlementPaymentsAfter(sb, clubId, playerIds, cutoffMap) {
   return byPid;
 }
 
+/** Explicit bootstrap opening balances (signed player POV). Missing table → zeros. */
+async function _loadSettlementOpenings(sb, clubId, playerIds) {
+  var byPid = {};
+  (playerIds||[]).forEach(function(pid){ byPid[String(pid)] = 0; });
+  if (!sb || !(playerIds||[]).length) return byPid;
+  try {
+    const { data: rows, error } = await sb.from('settlement_opening_balances')
+      .select('player_id,opening_balance')
+      .eq('club_id', clubId)
+      .in('player_id', playerIds);
+    if (error) {
+      if (/settlement_opening_balances|Could not find the table/i.test(String(error.message||error))) return byPid;
+      throw error;
+    }
+    (rows||[]).forEach(function(r){
+      var pid = String(r.player_id||'');
+      if (!pid) return;
+      byPid[pid] = settlementCarry.rnd(parseFloat(r.opening_balance)||0);
+    });
+  } catch(_e) {
+    console.warn('[settlement-openings] read failed:', _e.message||_e);
+  }
+  return byPid;
+}
+
 /** Authoritative carried settlement balance for one player. */
 async function _calcPlayerSettlementCarry(sb, clubId, playerId, ticketsForPlayer, cutoffMs) {
   var net = _ticketNetAfterCutoff(ticketsForPlayer || [], cutoffMs || 0);
   var pays = await _loadSettlementPaymentsAfter(sb, clubId, [playerId], cutoffMs ? { [String(playerId)]: cutoffMs } : {});
+  var openings = await _loadSettlementOpenings(sb, clubId, [playerId]);
   var p = pays[String(playerId)] || { playerPaidHost: 0, hostPaidPlayer: 0 };
-  var carry = settlementCarry.deriveSettlementCarry(net.settledNet, p.playerPaidHost, p.hostPaidPlayer);
+  var opening = openings[String(playerId)] || 0;
+  var carry = settlementCarry.deriveSettlementCarry(net.settledNet, p.playerPaidHost, p.hostPaidPlayer, opening);
   var split = settlementCarry.splitOwes(carry);
   return Object.assign({ ticketSettledNet: net.settledNet, openRisk: net.openRisk,
     weekWagered: net.weekWagered, weekWon: net.weekWon, weekLost: net.weekLost,
     playerPaidHost: p.playerPaidHost, hostPaidPlayer: p.hostPaidPlayer,
+    openingBalance: opening,
     settlementBalance: carry }, split);
 }
 
@@ -13551,12 +13580,14 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     });
 
     var payMap = await _loadSettlementPaymentsAfter(sb, clubId, Object.keys(byPlayer), cutoffMap);
+    var openMap = await _loadSettlementOpenings(sb, clubId, Object.keys(byPlayer));
 
     Object.keys(byPlayer).forEach(function(pid) {
       var cut = cutoffMap[pid] || 0;
       var net = _ticketNetAfterCutoff(ticketsByPid[pid] || [], cut);
       var pays = payMap[pid] || { playerPaidHost: 0, hostPaidPlayer: 0 };
-      var carry = settlementCarry.deriveSettlementCarry(net.settledNet, pays.playerPaidHost, pays.hostPaidPlayer);
+      var opening = openMap[pid] || 0;
+      var carry = settlementCarry.deriveSettlementCarry(net.settledNet, pays.playerPaidHost, pays.hostPaidPlayer, opening);
       var split = settlementCarry.splitOwes(carry);
       var p = byPlayer[pid];
       p.settledNet = net.settledNet;
@@ -13568,6 +13599,7 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       p.ticketSettledNet = net.settledNet;
       p.playerPaidHost = pays.playerPaidHost;
       p.hostPaidPlayer = pays.hostPaidPlayer;
+      p.openingBalance = opening;
       p.settlementBalance = split.settlementBalance;
       p.owesHost = split.owesHost;
       p.hostOwes = split.hostOwes;
@@ -13721,13 +13753,13 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
 });
 
 // POST /api/host/settle-player — partial/full settlement toward zero (never crosses zero)
+// Serialized via settle_payment_option_a_tx (pg_advisory_xact_lock per club_id+player_id).
 app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
 
-  const VALID_DIR = new Set(['player_paid_host','host_paid_player']);
   const errors = [];
   if (!clubId)         errors.push('missing_clubId');
   if (!playerId)       errors.push('missing_playerId');
@@ -13735,6 +13767,9 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
   const amt = parseFloat(amount);
   if (isNaN(amt) || amt <= 0) errors.push('invalid_amount'); // blank/$0 = no-op
   if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  const lockMeta = settlementLock.settlementLockKeys(clubId, playerId);
+  const lockTimeoutMs = settlementLock.lockTimeoutMs();
 
   try {
     // Authorize: player must belong to this club (club_members or club_memberships).
@@ -13755,167 +13790,110 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     if (!memberOk)
       return res.status(403).json({ ok:false, error:'player_not_in_club', clubId, playerId });
 
-    const cutoffMap = await _loadSettlementCutoffs(sb, clubId, [playerId]);
-    const cutoffMs = cutoffMap[String(playerId)] || 0;
-
-    const { data: tickets, error: tErr } = await sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,graded_at,placed_at')
-      .eq('club_id', clubId).eq('player_id', playerId);
-    if (tErr) throw tErr;
-
-    // Authoritative carry — never trust FE balance_before / stale preview.
-    var carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
-    var before = carryInfo.settlementBalance;
-    var applied = settlementCarry.applyPartialSettlement(before, amt);
-
-    if (!applied.ok) {
-      if (applied.error === 'overpay_blocked') {
-        return res.status(400).json({
-          ok:false, error:'overpay_blocked',
-          amount: amt, maxAmount: applied.maxAmount,
-          balanceBefore: before,
-          message: applied.message || ('Settlement cannot cross zero. Max $'+applied.maxAmount.toFixed(2))
-        });
-      }
-      if (applied.error === 'balance_already_zero' || applied.error === 'no_op_zero_or_blank') {
-        return res.status(400).json({
-          ok:false, error: applied.error,
-          balanceBefore: before, maxAmount: 0
-        });
-      }
-      return res.status(400).json({ ok:false, error: applied.error, balanceBefore: before });
-    }
-
-    // Direction must match carry sign (or omit — server derives)
-    var derivedDir = applied.direction;
-    if (direction && direction !== derivedDir) {
-      return res.status(400).json({
-        ok:false, error:'direction_mismatch',
-        expected: derivedDir, got: direction,
-        balanceBefore: before,
-        owesHost: carryInfo.owesHost, hostOwes: carryInfo.hostOwes
-      });
-    }
-    var finalDir = derivedDir;
-
-    // Option A: settlement_payments is the authoritative payment SoT.
-    // Do NOT call settle_player_tx (absent in prod) and do NOT rewrite bankroll.
-    const settlementId = String(clubId) + '::' + String(idempotencyKey);
-    const paymentId = 'SETTLE_DIRECT_'+clubId+'_'+idempotencyKey;
     const actorId = (req._actor&&req._actor.actorId)||'host';
-    var executedAt = new Date().toISOString();
-    var balanceAfter = applied.after;
-    var idempotent = false;
 
-    // Idempotent replay if this club-scoped payment already exists.
+    // Authoritative serialized path: lock → recompute → validate → insert → before/after.
+    // Never trusts FE preview amount as SoT.
+    var rpcResult;
     try {
-      const { data: priorPay } = await sb.from('settlement_payments')
-        .select('payment_id,amount,direction,status,confirmed_at')
-        .eq('payment_id', paymentId)
-        .eq('club_id', clubId)
-        .limit(1);
-      if (priorPay && priorPay[0] && String(priorPay[0].status||'') === 'confirmed') {
-        idempotent = true;
-        balanceAfter = (await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs)).settlementBalance;
+      rpcResult = await _callMoneyRpc('settle_payment_option_a_tx', {
+        p_club_id: clubId,
+        p_player_id: playerId,
+        p_amount: amt,
+        p_idempotency_key: idempotencyKey,
+        p_direction: direction || null,
+        p_note: note || null,
+        p_created_by: actorId,
+        p_period_id: settlementWeek || 'DIRECT',
+        p_lock_timeout_ms: lockTimeoutMs
+      });
+    } catch (rpcErr) {
+      var msg = String((rpcErr && rpcErr.message) || rpcErr || '');
+      if (/settle_payment_option_a_tx|Could not find the function|schema cache/i.test(msg)) {
+        return res.status(503).json({
+          ok:false,
+          error:'settlement_serialize_rpc_missing',
+          hint:'Apply migrations/PROPOSED_settle_payment_option_a_tx.sql (+ opening balances) after approval. Unlocked settle path disabled.',
+          lockKey: { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
+          lockTimeoutMs: lockTimeoutMs
+        });
       }
-    } catch(_idErr) {
-      // Table may be absent until proposed migration is approved/applied.
-      if (_idErr && /relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(_idErr.message||_idErr))) {
+      if (/settlement_payments|does not exist|Could not find the table/i.test(msg)) {
         return res.status(503).json({
           ok:false,
           error:'settlement_payments_missing',
           hint:'Apply migrations/PROPOSED_settlement_payments.sql after approval. settle_player_tx is intentionally not used.'
         });
       }
+      throw rpcErr;
     }
 
-    if (!idempotent) {
-      // Pre-insert recompute — shrink concurrency window vs stale FE preview.
-      // Full serialization still needs DB advisory lock (see SETTLEMENT_NONPROD_VALIDATION.md).
-      carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
-      before = carryInfo.settlementBalance;
-      applied = settlementCarry.applyPartialSettlement(before, amt);
-      if (!applied.ok) {
-        if (applied.error === 'overpay_blocked') {
-          return res.status(400).json({
-            ok:false, error:'overpay_blocked',
-            amount: amt, maxAmount: applied.maxAmount,
-            balanceBefore: before,
-            message: applied.message || ('Settlement cannot cross zero. Max $'+applied.maxAmount.toFixed(2)),
-            stalePreviewRejected: true
-          });
-        }
-        return res.status(400).json({
-          ok:false, error: applied.error,
-          balanceBefore: before, maxAmount: applied.maxAmount || 0,
-          stalePreviewRejected: true
+    if (!rpcResult || rpcResult.ok === false) {
+      var err = (rpcResult && rpcResult.error) || 'settle_failed';
+      if (err === 'lock_timeout') {
+        return res.status(409).json({
+          ok:false,
+          error:'lock_timeout',
+          lockTimeoutMs: (rpcResult && rpcResult.lockTimeoutMs) || lockTimeoutMs,
+          lockKey: (rpcResult && rpcResult.lockKey) || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
+          retry: (rpcResult && rpcResult.retry) || {
+            recommended: true, backoffMs: 250, maxAttempts: 3,
+            message: 'Settlement lock busy; retry with same Idempotency-Key. No payment was written.'
+          },
+          bankrollMutated: false,
+          message: 'Could not acquire settlement lock in time. No payment row written. Retry.'
         });
       }
-      derivedDir = applied.direction;
-      if (direction && direction !== derivedDir) {
+      if (err === 'overpay_blocked') {
+        return res.status(400).json({
+          ok:false, error:'overpay_blocked',
+          amount: amt,
+          maxAmount: rpcResult.maxAmount,
+          balanceBefore: rpcResult.balanceBefore,
+          message: rpcResult.message || ('Settlement cannot cross zero. Max $'+Number(rpcResult.maxAmount||0).toFixed(2)),
+          serialized: true
+        });
+      }
+      if (err === 'balance_already_zero' || err === 'no_op_zero_or_blank' || err === 'invalid_amount') {
+        return res.status(400).json({
+          ok:false, error: err,
+          balanceBefore: rpcResult.balanceBefore,
+          maxAmount: rpcResult.maxAmount || 0,
+          serialized: true
+        });
+      }
+      if (err === 'direction_mismatch') {
         return res.status(400).json({
           ok:false, error:'direction_mismatch',
-          expected: derivedDir, got: direction,
-          balanceBefore: before,
-          owesHost: carryInfo.owesHost, hostOwes: carryInfo.hostOwes,
-          stalePreviewRejected: true
+          expected: rpcResult.expected, got: rpcResult.got,
+          balanceBefore: rpcResult.balanceBefore,
+          serialized: true
         });
       }
-      finalDir = derivedDir;
-      balanceAfter = applied.after;
-
-      const payRow = {
-        payment_id: paymentId,
-        period_id: settlementWeek || 'DIRECT',
-        revision: 0,
-        club_id: clubId,
-        player_id: playerId,
-        direction: finalDir,
-        amount: applied.applied,
-        amount_cents: Math.round(applied.applied * 100),
-        method: 'direct',
-        status: 'confirmed',
-        note: (note||'') + (note ? ' | ' : '') +
-          'carry:'+before.toFixed(2)+'→'+balanceAfter.toFixed(2),
-        created_at: executedAt,
-        created_by: actorId,
-        confirmed_at: executedAt,
-        confirmed_by: actorId,
-        ledger_written: false,
-        ledger_settlement_id: settlementId,
-        balance_before: before,
-        balance_after: balanceAfter
-      };
-      const { error: payErr } = await sb.from('settlement_payments').upsert(payRow, { onConflict: 'payment_id' });
-      if (payErr) {
-        if (/relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(payErr.message||payErr))) {
-          return res.status(503).json({
-            ok:false,
-            error:'settlement_payments_missing',
-            hint:'Apply migrations/PROPOSED_settlement_payments.sql after approval. settle_player_tx is intentionally not used.'
-          });
-        }
-        // Unique race → treat as idempotent replay
-        if (payErr.code === '23505') {
-          idempotent = true;
-          balanceAfter = (await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs)).settlementBalance;
-        } else {
-          throw payErr;
-        }
-      }
+      return res.status(400).json({ ok:false, error: err, serialized: true, detail: rpcResult });
     }
 
-    // Audit-only ledger_entries mirror. Never writes balance_after bankroll fields —
-    // settlement cash must not contaminate ticket-derived bankroll presentation.
-    if (!idempotent) {
-      sb.from('ledger_entries').upsert({
-        id: settlementId, club_id: clubId, player_id: playerId,
-        type: 'settlement_payment',
-        amount: Math.round((finalDir==='host_paid_player'?applied.applied:-applied.applied)*100)/100,
-        reason: finalDir+' carry '+before.toFixed(2)+'→'+balanceAfter.toFixed(2)+(note?': '+note:''),
-        created_at: executedAt, created_by: actorId
-      }, { onConflict:'id' }).then(function(){}, function(){});
-    }
+    var before = rpcResult.balanceBefore;
+    var balanceAfter = rpcResult.balanceAfter;
+    var finalDir = rpcResult.direction;
+    var appliedAmt = rpcResult.amount;
+    var idempotent = !!rpcResult.idempotent;
+    var paymentId = rpcResult.paymentId || ('SETTLE_DIRECT_'+clubId+'_'+idempotencyKey);
+    var settlementId = rpcResult.settlementId || (String(clubId) + '::' + String(idempotencyKey));
+    var splitAfter = settlementCarry.splitOwes(balanceAfter);
+
+    // Open risk for previewAfter (read-only; not part of settle mutation)
+    var openRisk = 0;
+    try {
+      const { data: tickets } = await sb.from('tickets')
+        .select('status,risk_amount')
+        .eq('club_id', clubId).eq('player_id', playerId);
+      (tickets||[]).forEach(function(t){
+        var s = String(t.status||'').toLowerCase();
+        if (s === 'active' || s === 'open') openRisk += parseFloat(t.risk_amount)||0;
+      });
+      openRisk = settlementCarry.rnd(openRisk);
+    } catch(_tr) {}
 
     try {
       await sb.from('audit_events').insert({
@@ -13924,8 +13902,8 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
         payload: {
           option: 'A',
           direction: finalDir,
-          amount: applied.applied,
-          maxAmount: applied.maxAmount,
+          amount: appliedAmt,
+          maxAmount: rpcResult.maxAmount,
           settlementWeek,
           idempotencyKey,
           settlementId,
@@ -13937,15 +13915,17 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
           period: settlementWeek || null,
           bankrollMutated: false,
           settlePlayerTxUsed: false,
+          serialized: true,
+          lockKey: rpcResult.lockKey || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
+          lockTimeoutMs: lockTimeoutMs,
           idempotent: idempotent
         }
       });
     } catch(_ae) { console.warn('[settle-player] audit error:', _ae.message); }
 
-    const splitAfter = settlementCarry.splitOwes(balanceAfter);
-    console.log('[settle-player] optionA club='+clubId+' paymentId='+paymentId+
-      ' dir='+finalDir+' amt='+applied.applied+' carry '+before+'→'+balanceAfter+
-      ' idempotent='+idempotent);
+    console.log('[settle-player] optionA serialized club='+clubId+' paymentId='+paymentId+
+      ' dir='+finalDir+' amt='+appliedAmt+' carry '+before+'→'+balanceAfter+
+      ' idempotent='+idempotent+' lock='+lockMeta.key1+','+lockMeta.key2);
 
     res.json({
       ok: true,
@@ -13954,7 +13934,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       settlementId,
       paymentId,
       direction: finalDir,
-      amount: applied.applied,
+      amount: appliedAmt,
       settlementWeek,
       clubId,
       balanceBefore: before,
@@ -13962,15 +13942,18 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       settlementBalance: balanceAfter,
       owesHost: splitAfter.owesHost,
       hostOwes: splitAfter.hostOwes,
-      maxAmount: applied.maxAmount,
+      maxAmount: rpcResult.maxAmount != null ? rpcResult.maxAmount : Math.abs(before),
       bankrollMutated: false,
       settlePlayerTxUsed: false,
+      serialized: true,
+      lockKey: rpcResult.lockKey || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
+      lockTimeoutMs: lockTimeoutMs,
       previewAfter: {
         [playerId]: {
           owesHost: splitAfter.owesHost,
           hostOwes: splitAfter.hostOwes,
           settlementBalance: balanceAfter,
-          openRisk: carryInfo.openRisk
+          openRisk: openRisk
         }
       }
     });

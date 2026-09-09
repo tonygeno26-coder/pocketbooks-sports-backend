@@ -18,17 +18,16 @@ Product default confirmed: settlement tracks cash toward zero; it does **not** r
 ```
 sign: − player owes host · + host owes player · 0 settled
 
+settlementBalance =
+  openingBalance                          # explicit bootstrap only (default 0)
+  + ticketSettledNet(after historical epoch)
+  + Σ confirmed player_paid_host (after epoch)
+  − Σ confirmed host_paid_player (after epoch)
+
 ticketSettledNet(after historical epoch) =
   Σ potential_profit(won) − Σ risk(lost)
   for tickets in (club_id, player_id) with grade time > epoch
   (each ticket counted exactly once)
-
-paymentsTowardZero =
-  + Σ confirmed player_paid_host (after epoch)
-  − Σ confirmed host_paid_player (after epoch)
-
-settlementBalance = ticketSettledNet + paymentsTowardZero
-                 = ticketSettledNet + playerPaidHost − hostPaidPlayer
 
 apply(payment):
   reject if payment ≤ 0 or balance == 0
@@ -57,12 +56,21 @@ Apply returns authoritative `balanceBefore` / `balanceAfter`. FE must reconcile 
 ## Proposed DB
 
 1. `migrations/PROPOSED_settlement_payments.sql` — minimal append-only table + rollback  
-2. `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` — hard club lock + remove phantom `$1000`  
-3. ~~`PROPOSED_settle_player_tx_club_scope.sql`~~ — **deleted** (Option A)
+2. `migrations/PROPOSED_settlement_opening_balances.sql` — explicit opening primitive  
+3. `migrations/PROPOSED_settle_payment_option_a_tx.sql` — advisory-lock serialized settle  
+4. `migrations/PROPOSED_bootstrap_settlement_opening_epoch.sql` — nonprod/approved bootstrap  
+5. `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` — hard club lock + remove phantom `$1000`  
+6. ~~`PROPOSED_settle_player_tx_club_scope.sql`~~ — **deleted** (Option A)
 
-**Non-prod apply status:** both proposed files applied to local Postgres fixture `pb_settlement_nonprod` via `fixtures/nonprod/apply_and_test.js` (see `fixtures/nonprod/LAST_APPLY.json`). **Not** applied to production `padgicwrrzmukahfsyhk`.
+**Non-prod apply status:** proposed files applied to local Postgres fixture `pb_settlement_nonprod` via `fixtures/nonprod/apply_and_test.js` + `concurrency_and_bootstrap_rehearsal.js`. **Not** applied to production `padgicwrrzmukahfsyhk`.
 
-Full epoch / opening / go-live / concurrency audit: `docs/SETTLEMENT_NONPROD_VALIDATION.md`.
+Final gate: `docs/SETTLEMENT_FINAL_NONPROD_GATE.md`.
+
+Formula:
+
+```
+settlementBalance = openingBalance + ticketSettledNet(after epoch) + playerPaid − hostPaid
+```
 
 ## P0 club isolation (this branch)
 

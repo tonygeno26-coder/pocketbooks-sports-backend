@@ -7,10 +7,11 @@
 Formula (authoritative):
 
 ```
-settlementBalance = ticketSettledNet(after epoch) + playerPaid − hostPaid
+settlementBalance = openingBalance + ticketSettledNet(after epoch) + playerPaid − hostPaid
 ```
 
 Toward zero only; reject overpay; tickets may cross zero; settlement does **not** rewrite bankroll; `settlement_payments` is SoT for cash; bankroll = `balance_start` + tickets.
+`openingBalance` comes only from explicit `settlement_opening_balances` bootstrap (default 0).
 
 ---
 
@@ -152,7 +153,7 @@ Harness: `fixtures/nonprod/apply_and_test.js` (local Postgres) + JS sim fallback
 - Backend **recomputes** authoritative `settlementBalance` inside `settle-player`; FE preview amount is not trusted as SoT.
 - Stale FE preview −500 with actual −200 and pay 500 → `overpay_blocked` with `maxAmount: 200` (cap/reject against **−200**).
 - FE does not send `balance_before` as authority; server returns `balanceBefore` / `balanceAfter`.
-- **Remaining race:** two concurrent large pays can both pass pre-check against the same snapshot (e.g. two × $400 on −$500 → +$300). Mitigation in this branch: **pre-insert recompute**; full serialization needs DB advisory lock / transaction (listed as blocker for SAFE FOR PRODUCTION).
+- **Remaining race (resolved on this branch):** serialize settle via `settle_payment_option_a_tx` + `pg_advisory_xact_lock(club,player)` with lock_timeout. See `docs/SETTLEMENT_FINAL_NONPROD_GATE.md`.
 
 ---
 
@@ -203,4 +204,4 @@ Asserted in tests + `bankrollMutated: false` on settle response.
 
 - `PRODUCTION DATA TOUCHED: NO` (this validation)
 - `PRODUCTION MIGRATION: NO`
-- `SAFE FOR PRODUCTION: NO` until concurrency lock + non-prod SQL apply green + opening bootstrap rehearsal signed off
+- Final gate + remaining blockers: `docs/SETTLEMENT_FINAL_NONPROD_GATE.md`

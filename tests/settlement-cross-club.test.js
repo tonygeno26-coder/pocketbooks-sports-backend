@@ -74,10 +74,14 @@ test('settle-player does not call settle_player_tx', function() {
   const fn = src.slice(start, end);
   assert.ok(fn.indexOf("_callMoneyRpc('settle_player_tx'") === -1,
     'Option A must not hard-depend on settle_player_tx');
-  assert.ok(fn.indexOf("from('settlement_payments')") !== -1);
+  assert.ok(fn.indexOf("_callMoneyRpc('settle_payment_option_a_tx'") !== -1,
+    'Option A must serialize via settle_payment_option_a_tx');
   assert.ok(fn.indexOf('settlePlayerTxUsed: false') !== -1);
   assert.ok(fn.indexOf('bankrollMutated: false') !== -1);
-  assert.ok(fn.indexOf('settlement_payments_missing') !== -1);
+  assert.ok(fn.indexOf('settlement_payments_missing') !== -1 ||
+            fn.indexOf('settlement_serialize_rpc_missing') !== -1);
+  assert.ok(fn.indexOf('serialized: true') !== -1);
+  assert.ok(fn.indexOf('lock_timeout') !== -1);
 });
 
 test('settlement-payments history endpoint exists and requires clubId', function() {
@@ -123,7 +127,7 @@ test('settle-player uses club-scoped settlementId and payment_id', function() {
   assert.ok(fn.indexOf("String(clubId) + '::' + String(idempotencyKey)") !== -1);
   assert.ok(fn.indexOf("'SETTLE_DIRECT_'+clubId+'_'+idempotencyKey") !== -1);
   assert.ok(fn.indexOf('player_not_in_club') !== -1);
-  assert.ok(fn.indexOf(".eq('club_id', clubId).eq('player_id', playerId)") !== -1);
+  assert.ok(fn.indexOf('settlementLockKeys') !== -1 || fn.indexOf('settlementLock.settlementLockKeys') !== -1);
 });
 
 test('settlements-preview hard-requires clubId on tickets', function() {

@@ -136,20 +136,21 @@ test('index.js stops writing SETTLEMENT_APPLIED on weekly-rollover', function() 
   assert.ok(rolloverFn.indexOf("type: 'SETTLEMENT_APPLIED'") === -1);
 });
 
-test('settle-player uses applyPartialSettlement / overpay_blocked message', function() {
+test('settle-player uses serialized RPC + overpay_blocked', function() {
   const fs = require('fs');
-  const src = fs.readFileSync(require('path').join(__dirname, '..', 'index.js'), 'utf8');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
   const start = src.indexOf("app.post('/api/host/settle-player'");
   const end = src.indexOf("app.post('/api/host/weekly-rollover'");
   assert.ok(start !== -1 && end !== -1 && end > start);
   const settleFn = src.slice(start, end);
-  assert.ok(settleFn.indexOf('applyPartialSettlement') !== -1);
+  assert.ok(settleFn.indexOf("settle_payment_option_a_tx") !== -1);
   assert.ok(settleFn.indexOf('balanceBefore') !== -1);
   assert.ok(settleFn.indexOf('overpay_blocked') !== -1);
-  assert.ok(settleFn.indexOf('_calcPlayerSettlementCarry') !== -1);
-  assert.ok(settleFn.indexOf('Settlement cannot cross zero') !== -1 ||
-            settleFn.indexOf('cannot cross zero') !== -1 ||
-            src.indexOf('Settlement cannot cross zero') !== -1);
+  assert.ok(settleFn.indexOf('serialized: true') !== -1);
+  assert.ok(settleFn.indexOf('lock_timeout') !== -1);
+  const lib = fs.readFileSync(path.join(__dirname, '..', 'lib', 'settlement-carry.js'), 'utf8');
+  assert.ok(lib.indexOf('function applyPartialSettlement') !== -1);
 });
 
 console.log('\n── Results: ' + pass + ' passed, ' + fail + ' failed ──');

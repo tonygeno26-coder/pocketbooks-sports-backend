@@ -1,10 +1,13 @@
 {
-  "appliedAt": "2026-09-09T06:29:09.003Z",
+  "appliedAt": "2026-09-09T07:39:20.590Z",
   "database": "postgres://localhost:5432/pb_settlement_nonprod",
   "productionTouched": false,
   "files": [
     "fixtures/nonprod/schema_minimal.sql",
     "migrations/PROPOSED_settlement_payments.sql",
+    "migrations/PROPOSED_settlement_opening_balances.sql",
+    "migrations/PROPOSED_settle_payment_option_a_tx.sql",
+    "migrations/PROPOSED_bootstrap_settlement_opening_epoch.sql",
     "migrations/PROPOSED_cancel_bet_tx_club_isolation.sql"
   ],
   "cancelResults": {
@@ -71,5 +74,36 @@
       "ticket_id": "tA_won"
     }
   },
-  "settlementPaymentsCount": 1
+  "settlementPaymentsCount": 1,
+  "settleSmoke": {
+    "ok": true,
+    "amount": 200,
+    "lockKey": {
+      "key1": 1494905890,
+      "key2": 1343165889,
+      "scope": "club_id+player_id"
+    },
+    "executed": true,
+    "hostOwes": 0,
+    "owesHost": 300,
+    "direction": "player_paid_host",
+    "maxAmount": 500,
+    "paymentId": "SETTLE_DIRECT_clubA_APPLY_SMOKE",
+    "idempotent": false,
+    "serialized": true,
+    "balanceAfter": -300,
+    "settlementId": "clubA::APPLY_SMOKE",
+    "balanceBefore": -500,
+    "bankrollMutated": false,
+    "carryComponents": {
+      "cutoffMs": 0,
+      "hostPaidPlayer": 0,
+      "openingBalance": 0,
+      "playerPaidHost": 0,
+      "ticketSettledNet": -500,
+      "settlementBalance": -500
+    },
+    "settlementBalance": -300,
+    "settlePlayerTxUsed": false
+  }
 }

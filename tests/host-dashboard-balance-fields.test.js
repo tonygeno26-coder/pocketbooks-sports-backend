@@ -87,7 +87,9 @@ test('multi-player ledger map keeps distinct balances', function () {
 test('settlements-preview no longer defaults missing start to 0', function () {
   var src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
   assert.ok(src.indexOf('Missing balance_start must stay null') !== -1, 'null-start comment present');
-  assert.ok(src.indexOf('p.availableBalance = p.currentBalance') !== -1, 'settle availableBalance alias');
+  // Option A: availableBalance = bankroll; currentBalance = settlement carry (not aliased together)
+  assert.ok(src.indexOf('p.availableBalance = p.bankrollBalance') !== -1, 'settle availableBalance = bankroll');
+  assert.ok(src.indexOf('p.currentBalance = p.settlementBalance') !== -1, 'settle currentBalance = carry');
   assert.ok(!/balance_start!=null\) \? memberMap\[pid\]\.balance_start : 0;/.test(src), 'removed : 0 coerce');
 });
 

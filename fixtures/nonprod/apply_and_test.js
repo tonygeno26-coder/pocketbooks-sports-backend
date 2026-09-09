@@ -52,6 +52,9 @@ async function main() {
   var files = [
     path.join(__dirname, 'schema_minimal.sql'),
     path.join(root, 'migrations', 'PROPOSED_settlement_payments.sql'),
+    path.join(root, 'migrations', 'PROPOSED_settlement_opening_balances.sql'),
+    path.join(root, 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql'),
+    path.join(root, 'migrations', 'PROPOSED_bootstrap_settlement_opening_epoch.sql'),
     path.join(root, 'migrations', 'PROPOSED_cancel_bet_tx_club_isolation.sql')
   ];
 
@@ -137,6 +140,22 @@ async function main() {
   expect('already graded', by.already_graded && by.already_graded.error === 'invalid_transition', JSON.stringify(by.already_graded));
   expect('settlement_payments row', payCount.rows[0].c === 1);
 
+  // Serialized settle smoke (advisory lock path) — isolated player
+  await client.query(`
+    INSERT INTO club_members (club_id, player_id, balance_start) VALUES ('clubA','pSettle',1000)
+    ON CONFLICT (club_id, player_id) DO UPDATE SET balance_start=1000;
+    INSERT INTO tickets (id, club_id, player_id, status, risk_amount, potential_profit, graded_at)
+    VALUES ('tSettle','clubA','pSettle','lost',500,0, now())
+    ON CONFLICT (id) DO UPDATE SET status='lost', risk_amount=500, player_id='pSettle', graded_at=now()
+  `);
+  var settleJ = await client.query(
+    `SELECT public.settle_payment_option_a_tx('clubA','pSettle',200,'APPLY_SMOKE',NULL,NULL,'test','DIRECT',3000) AS j`
+  );
+  expect('serialized settle 200 on −500 → −300',
+    settleJ.rows[0].j && settleJ.rows[0].j.ok === true && Number(settleJ.rows[0].j.balanceAfter) === -300,
+    JSON.stringify(settleJ.rows[0].j));
+  expect('serialized flag', settleJ.rows[0].j && settleJ.rows[0].j.serialized === true);
+
   // Record exact SQL paths used
   var record = {
     appliedAt: new Date().toISOString(),
@@ -144,7 +163,8 @@ async function main() {
     productionTouched: false,
     files: files.map(function(f){ return path.relative(root, f); }),
     cancelResults: by,
-    settlementPaymentsCount: payCount.rows[0].c
+    settlementPaymentsCount: payCount.rows[0].c,
+    settleSmoke: settleJ.rows[0].j
   };
   fs.writeFileSync(path.join(__dirname, 'LAST_APPLY.json'), JSON.stringify(record, null, 2));
   console.log('[nonprod] Wrote fixtures/nonprod/LAST_APPLY.json');
