@@ -105,12 +105,44 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 **BE:** `lib/settlement-carry.js`, `index.js`, `tests/settlement-carry.test.js`  
 **FE:** `index.html`, `tests/settlement-partial-carry-ui.test.js`
 
-**Migrations:** none required (derived carry + existing payment/ledger tables)
+**Migrations:** none applied. Proposed (not applied): `migrations/PROPOSED_settle_player_tx_club_scope.sql` — add `club_id` to RPC settlement_id idempotency lookup (app already prefixes `clubId::key`).
 
 ---
 
-## 5. Safety
+## 5. Cross-club isolation (MERGE BLOCKER)
+
+**Invariant:** all financial state scoped by `club_id + player_id`.
+
+### Unsafe queries found + fixed
+| Location | Issue | Fix |
+|---|---|---|
+| `_ledgerAvailableForPlayer` | `club_id` optional | Require both; always `.eq(club_id).eq(player_id)` |
+| `_creditPlayerAccount` ledger read | optional club | Require club; dual eq |
+| `_deriveAvailableBalance` tickets | **player_id only** | Add `.eq('club_id', clubId)` |
+| `_calcTotalPaid` | period+player, no club | Require clubId; refuse if missing |
+| `requireIdempotency` storage | global key | Store as `clubId::clientKey` |
+| settle-player settlement/payment ids | bare idempotencyKey | `clubId::key` / `SETTLE_DIRECT_${club}_${key}` |
+| settle-player auth | no membership check | Reject `player_not_in_club` |
+| settlements-preview / player dashboard tickets | optional club | Hard-require clubId |
+| period payment | no period.club check | `period_club_mismatch` |
+
+### DB constraints (existing)
+- `club_members` / memberships: `UNIQUE(club_id, player_id)`
+- canonical `ledger`: `UNIQUE(club_id, idempotency_key, event_type)`
+- `idempotency_keys`: still PK on key alone — mitigated by club-prefixed storage key
+- `settlement_payments.payment_id` PK — mitigated by club-prefixed payment_id
+
+### Rollover proven (post-change)
+- Does **NOT** write `SETTLEMENT_APPLIED` epoch markers
+- Returns `carryPreserved: true`
+- Snapshots outstanding carry; tickets continue to count post-rollover
+- Historical `SETTLEMENT_APPLIED_*` markers still act as epoch floor (no resurrection)
+
+---
+
+## 6. Safety
 - No production financial row mutations for debug
 - No history rewrite; historical epoch markers retained
 - No Diamonds/grading/tickets/odds/placement changes
 - Dedicated branch only — do not merge to main without host review
+- **Do not merge while origin/main still contains incomplete orphan commit `0fb6a6b` (lib/tests without index wiring) — revert that main commit separately**
