@@ -8,7 +8,7 @@
 
 ```
 STATUS: SETTLEMENT FINAL NON-PROD GATE
-BRANCHES: BE cursor/settlement-option-a · FE cursor/settlement-option-a
+BRANCHES: BE `e430aa9` on cursor/settlement-option-a · FE `46da895` on cursor/settlement-option-a
 ADVISORY LOCK: YES — pg_advisory_xact_lock(key1,key2) inside settle_payment_option_a_tx (one txn)
 LOCK KEY: md5('settle_v1|'||club_id||'|'||player_id) → two signed int4 (lib/settlement-lock.js ↔ SQL settlement_lock_keys). Scope=club_id+player_id NOT global. Different players concurrent; same player×different clubs independent.
 CONCURRENT OVERPAY: −500 + concurrent 400+400 → one payment / final −100 (never +300 / never $600). Sequential 200+200 → −100. −500+600 rejected.
