@@ -105,7 +105,9 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 **BE:** `lib/settlement-carry.js`, `index.js`, `tests/settlement-carry.test.js`  
 **FE:** `index.html`, `tests/settlement-partial-carry-ui.test.js`
 
-**Migrations:** none applied. Proposed (not applied): `migrations/PROPOSED_settle_player_tx_club_scope.sql` — add `club_id` to RPC settlement_id idempotency lookup (app already prefixes `clubId::key`).
+**Migrations:** none applied. Proposed (not applied): `migrations/PROPOSED_settle_player_tx_club_scope.sql`.
+
+**2026-09-08 live RPC audit (`padgicwrrzmukahfsyhk`, read-only):** `settle_player_tx` **ABSENT**; `public.ledger` / `settlement_payments` / `idempotency_keys` **ABSENT**. Money RPCs present: `place_bet_tx`, `grade_ticket_tx`, `cancel_bet_tx`. Club-scope idempotency patch **cannot** be generated from a live body — **DO NOT APPLY** stub; regenerate from `pg_get_functiondef` when RPC exists. App-layer `clubId::key` defense remains on this branch.
 
 ---
 
