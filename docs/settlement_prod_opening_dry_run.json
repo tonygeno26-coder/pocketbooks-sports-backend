@@ -129,18 +129,18 @@
   },
   "sql_order_no_execute": [
     "PROPOSED_cancel_bet_tx_club_isolation.sql",
-    "PROPOSED_settlement_payments.sql",
+    "PROPOSED_settlement_records.sql",
     "PROPOSED_settlement_opening_balances.sql",
-    "PROPOSED_settle_payment_option_a_tx.sql",
+    "PROPOSED_record_settlement_option_a_tx.sql",
     "PROPOSED_bootstrap_settlement_opening_epoch.sql"
   ],
   "feature_flag": {
-    "name": "SETTLEMENT_OPTION_A_CASH_ENABLED",
+    "name": "SETTLEMENT_RECORDING_ENABLED",
     "default": false,
     "enabled": false,
     "scaffolded_in_be": true,
     "enable_requires": "exact string 'true' after signed bootstrap",
-    "settle_player_when_off": "503 settlement_cash_disabled"
+    "settle_player_when_off": "503 settlement_recording_disabled"
   },
   "schema_with_flag_off_safety": {
     "existing_balances_mutated": false,

@@ -4,7 +4,7 @@
   "productionTouched": false,
   "productionMigration": false,
   "merged": false,
-  "advisoryLock": "pg_advisory_xact_lock(key1,key2) via settle_payment_option_a_tx",
+  "advisoryLock": "pg_advisory_xact_lock(key1,key2) via record_settlement_option_a_tx",
   "lockKey": {
     "algorithm": "md5(settle_v1|club_id|player_id) → int4 pair",
     "namespace": "settle_v1",
@@ -19,7 +19,7 @@
     "results": [
       {
         "ok": false,
-        "error": "overpay_blocked",
+        "error": "over_settlement_blocked",
         "amount": 400,
         "message": "Settlement cannot cross zero. Max applicable is $100.00",
         "maxAmount": 100,
@@ -77,7 +77,7 @@
     "error": "lock_timeout",
     "paymentRowWritten": false,
     "retry": {
-      "message": "Settlement lock busy; retry with same Idempotency-Key. No payment was written.",
+      "message": "Settlement lock busy; retry with same Idempotency-Key. No settlement record was written.",
       "backoffMs": 250,
       "maxAttempts": 3,
       "recommended": true

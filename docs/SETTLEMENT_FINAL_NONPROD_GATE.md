@@ -9,7 +9,7 @@
 ```
 STATUS: SETTLEMENT FINAL NON-PROD GATE
 BRANCHES: BE `48c89f6` on cursor/settlement-option-a · FE `46da895` on cursor/settlement-option-a
-ADVISORY LOCK: YES — pg_advisory_xact_lock(key1,key2) inside settle_payment_option_a_tx (one txn)
+ADVISORY LOCK: YES — pg_advisory_xact_lock(key1,key2) inside record_settlement_option_a_tx (one txn)
 LOCK KEY: md5('settle_v1|'||club_id||'|'||player_id) → two signed int4 (lib/settlement-lock.js ↔ SQL settlement_lock_keys). Scope=club_id+player_id NOT global. Different players concurrent; same player×different clubs independent.
 CONCURRENT OVERPAY: −500 + concurrent 400+400 → one payment / final −100 (never +300 / never $600). Sequential 200+200 → −100. −500+600 rejected.
 IDEMPOTENCY: Same Idempotency-Key concurrent → one payment row + one executed / one idempotent replay. Cross-club same client key independent (SETTLE_DIRECT_{club}_{key}).
@@ -35,14 +35,14 @@ EXACT PRODUCTION RUNBOOK:
   1. Deploy BE/FE from this branch (no DB migrate yet).
   2. Backup: pg_dump settlement-relevant schema; save pg_get_functiondef for cancel_bet_tx.
   3. Apply in order (staging first): 
-     PROPOSED_settlement_payments.sql →
+     PROPOSED_settlement_records.sql →
      PROPOSED_settlement_opening_balances.sql →
-     PROPOSED_settle_payment_option_a_tx.sql →
+     PROPOSED_record_settlement_option_a_tx.sql →
      PROPOSED_bootstrap_settlement_opening_epoch.sql →
      PROPOSED_cancel_bet_tx_club_isolation.sql
   4. Rehearse bootstrap on staging clone with real anonymized balances; verify audit report.
   5. On prod (separate approval): apply same SQL order; run bootstrap ONLY for signed clubs/players; never lifetime-default.
-  6. Smoke: one settle serialized; concurrent overpay blocked; bankroll unchanged.
+  6. Smoke: one settle serialized; concurrent over-settlement blocked; bankroll unchanged.
   7. Enable host settle UI.
   ROLLBACK: drop new functions/tables by documented ROLLBACK comments; restore cancel_bet_tx body; do not delete historical ledger markers casually.
 ```
@@ -58,15 +58,15 @@ settlementBalance = openingBalance
                   − hostPaidPlayer
 ```
 
-Toward zero only; reject overpay; settle never mutates `balance_start` / tickets.
+Toward zero only; reject over-settlement; settle never mutates `balance_start` / tickets.
 
-## Transaction order (settle_payment_option_a_tx)
+## Transaction order (record_settlement_option_a_tx)
 
 1. Acquire `pg_advisory_xact_lock(key1,key2)` with `SET LOCAL lock_timeout`
 2. Recompute position
 3. Validate payment
-4. Reject overpay / zero / direction mismatch
-5. Insert `settlement_payments`
+4. Reject over-settlement / zero / direction mismatch
+5. Insert `settlement_records`
 6. Return authoritative before/after
 7. Commit (end of xact)
 

@@ -16,7 +16,7 @@ function test(name, fn) {
 }
 
 const root = path.join(__dirname, '..');
-const settleSql = fs.readFileSync(path.join(root, 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql'), 'utf8');
+const settleSql = fs.readFileSync(path.join(root, 'migrations', 'PROPOSED_record_settlement_option_a_tx.sql'), 'utf8');
 const bootSql = fs.readFileSync(path.join(root, 'migrations', 'PROPOSED_bootstrap_settlement_opening_epoch.sql'), 'utf8');
 const src = fs.readFileSync(path.join(root, 'index.js'), 'utf8');
 
@@ -74,11 +74,11 @@ test('opening + tickets formula', function() {
 });
 
 test('API uses serialized RPC only (no unlocked settle write path)', function() {
-  var start = src.indexOf("app.post('/api/host/settle-player'");
-  var end = src.indexOf("app.get('/api/host/settlement-payments'");
+  var start = src.indexOf('async function _handleRecordSettlement');
+  var end = src.indexOf("app.get('/api/host/settlement-records'");
   var fn = src.slice(start, end);
-  assert.ok(fn.indexOf("settle_payment_option_a_tx") !== -1);
-  assert.ok(fn.indexOf("from('settlement_payments').upsert") === -1);
+  assert.ok(fn.indexOf("record_settlement_option_a_tx") !== -1);
+  assert.ok(fn.indexOf("from('settlement_records').upsert") === -1);
   assert.ok(fn.indexOf('_callMoneyRpc(\'settle_player_tx\'') === -1);
 });
 

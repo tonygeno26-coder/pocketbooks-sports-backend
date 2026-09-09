@@ -57,7 +57,7 @@ test('Partial both clubs independently', function() {
 test('Overpay crossing zero rejected', function() {
   var r = sc.applyPartialSettlement(-100, 150);
   assert.strictEqual(r.ok, false);
-  assert.strictEqual(r.error, 'overpay_blocked');
+  assert.strictEqual(r.error, 'over_settlement_blocked');
 });
 
 test('deriveSettlementCarry tickets counted once via net+payments', function() {
@@ -68,27 +68,30 @@ test('deriveSettlementCarry tickets counted once via net+payments', function() {
 
 console.log('\n── Option A: no settle_player_tx hard dependency ──');
 
-test('settle-player does not call settle_player_tx', function() {
-  const start = src.indexOf("app.post('/api/host/settle-player'");
-  const end = src.indexOf("app.get('/api/host/settlement-payments'");
+test('record-settlement does not call settle_player_tx', function() {
+  const start = src.indexOf('async function _handleRecordSettlement');
+  const end = src.indexOf("app.get('/api/host/settlement-records'");
   const fn = src.slice(start, end);
   assert.ok(fn.indexOf("_callMoneyRpc('settle_player_tx'") === -1,
     'Option A must not hard-depend on settle_player_tx');
-  assert.ok(fn.indexOf("_callMoneyRpc('settle_payment_option_a_tx'") !== -1,
-    'Option A must serialize via settle_payment_option_a_tx');
+  assert.ok(fn.indexOf("_callMoneyRpc('record_settlement_option_a_tx'") !== -1,
+    'Option A must serialize via record_settlement_option_a_tx');
   assert.ok(fn.indexOf('settlePlayerTxUsed: false') !== -1);
   assert.ok(fn.indexOf('bankrollMutated: false') !== -1);
-  assert.ok(fn.indexOf('settlement_payments_missing') !== -1 ||
+  assert.ok(fn.indexOf('settlement_records_missing') !== -1 ||
             fn.indexOf('settlement_serialize_rpc_missing') !== -1);
   assert.ok(fn.indexOf('serialized: true') !== -1);
   assert.ok(fn.indexOf('lock_timeout') !== -1);
 });
 
-test('settlement-payments history endpoint exists and requires clubId', function() {
-  const start = src.indexOf("app.get('/api/host/settlement-payments'");
+test('settlement-records history endpoint exists and requires clubId', function() {
+  assert.ok(src.indexOf("app.get('/api/host/settlement-records'") !== -1);
+  assert.ok(src.indexOf("app.get('/api/host/settlement-payments'") !== -1); // legacy alias
+  const start = src.indexOf('async function _handleSettlementRecordsList');
   assert.ok(start !== -1);
-  const fn = src.slice(start, start + 1200);
+  const fn = src.slice(start, start + 1600);
   assert.ok(fn.indexOf("error:'missing_clubId'") !== -1);
+  assert.ok(fn.indexOf(".from('settlement_records')") !== -1);
   assert.ok(fn.indexOf(".eq('club_id', clubId)") !== -1);
 });
 
@@ -120,9 +123,9 @@ test('idempotency storage key is club-scoped (clubId::clientKey)', function() {
   assert.ok(fn.indexOf('must never block/replay Club B') !== -1);
 });
 
-test('settle-player uses club-scoped settlementId and payment_id', function() {
-  const start = src.indexOf("app.post('/api/host/settle-player'");
-  const end = src.indexOf("app.get('/api/host/settlement-payments'");
+test('record-settlement uses club-scoped settlementId and record_id', function() {
+  const start = src.indexOf('async function _handleRecordSettlement');
+  const end = src.indexOf("app.get('/api/host/settlement-records'");
   const fn = src.slice(start, end);
   assert.ok(fn.indexOf("String(clubId) + '::' + String(idempotencyKey)") !== -1);
   assert.ok(fn.indexOf("'SETTLE_DIRECT_'+clubId+'_'+idempotencyKey") !== -1);
@@ -170,7 +173,7 @@ test('period payment rejects period_club_mismatch', function() {
 test('PROPOSED settle_player_tx club-scope stub removed', function() {
   var p = path.join(__dirname, '..', 'migrations', 'PROPOSED_settle_player_tx_club_scope.sql');
   assert.ok(!fs.existsSync(p), 'Option A must not ship settle_player_tx stub');
-  assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settlement_payments.sql')));
+  assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_settlement_records.sql')));
   assert.ok(fs.existsSync(path.join(__dirname, '..', 'migrations', 'PROPOSED_cancel_bet_tx_club_isolation.sql')));
 });
 

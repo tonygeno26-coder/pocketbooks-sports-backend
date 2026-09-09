@@ -13382,15 +13382,15 @@ function _ticketNetAfterCutoff(tickets, cutoffMs) {
   };
 }
 
-/** Confirmed settlement payments after epoch → playerPaidHost / hostPaidPlayer. */
-async function _loadSettlementPaymentsAfter(sb, clubId, playerIds, cutoffMap) {
+/** Confirmed settlement records after epoch → playerPaidHost / hostPaidPlayer (recorded amounts settled). */
+async function _loadSettlementRecordsAfter(sb, clubId, playerIds, cutoffMap) {
   var byPid = {};
   (playerIds||[]).forEach(function(pid){
     byPid[String(pid)] = { playerPaidHost: 0, hostPaidPlayer: 0 };
   });
   if (!sb || !(playerIds||[]).length) return byPid;
   try {
-    const { data: rows } = await sb.from('settlement_payments')
+    const { data: rows } = await sb.from('settlement_records')
       .select('player_id,direction,amount,confirmed_at,created_at,status')
       .eq('club_id', clubId)
       .eq('status', 'confirmed')
@@ -13399,14 +13399,14 @@ async function _loadSettlementPaymentsAfter(sb, clubId, playerIds, cutoffMap) {
       var pid = String(r.player_id||'');
       if (!byPid[pid]) byPid[pid] = { playerPaidHost: 0, hostPaidPlayer: 0 };
       var cut = (cutoffMap && cutoffMap[pid]) || 0;
-      var payMs = new Date(r.confirmed_at || r.created_at || 0).getTime();
-      if (cut && payMs && payMs <= cut) return;
+      var recMs = new Date(r.confirmed_at || r.created_at || 0).getTime();
+      if (cut && recMs && recMs <= cut) return;
       var a = parseFloat(r.amount)||0;
       if (r.direction === 'player_paid_host') byPid[pid].playerPaidHost += a;
       else if (r.direction === 'host_paid_player') byPid[pid].hostPaidPlayer += a;
     });
   } catch(_e) {
-    console.warn('[settlement-payments] read failed:', _e.message||_e);
+    console.warn('[settlement-records] read failed:', _e.message||_e);
   }
   Object.keys(byPid).forEach(function(pid){
     byPid[pid].playerPaidHost = settlementCarry.rnd(byPid[pid].playerPaidHost);
@@ -13414,6 +13414,8 @@ async function _loadSettlementPaymentsAfter(sb, clubId, playerIds, cutoffMap) {
   });
   return byPid;
 }
+/** @deprecated alias — use _loadSettlementRecordsAfter */
+const _loadSettlementPaymentsAfter = _loadSettlementRecordsAfter;
 
 /** Explicit bootstrap opening balances (signed player POV). Missing table → zeros. */
 async function _loadSettlementOpenings(sb, clubId, playerIds) {
@@ -13440,14 +13442,17 @@ async function _loadSettlementOpenings(sb, clubId, playerIds) {
   return byPid;
 }
 
-// Option A cash settle gate — default OFF. Explicit 'true' required after signed bootstrap.
-// Schema/RPC may exist while this remains false; hosts cannot submit cash settlement.
-const SETTLEMENT_OPTION_A_CASH_ENABLED = process.env.SETTLEMENT_OPTION_A_CASH_ENABLED === 'true';
+// Option A settlement RECORDING gate — default OFF. Explicit 'true' required after signed bootstrap.
+// Schema/RPC may exist while this remains false; hosts cannot submit settlement records.
+// PocketBooks records off-platform settlements only; it does not process funds.
+const SETTLEMENT_RECORDING_ENABLED = process.env.SETTLEMENT_RECORDING_ENABLED === 'true';
+/** @deprecated use SETTLEMENT_RECORDING_ENABLED */
+const SETTLEMENT_OPTION_A_CASH_ENABLED = SETTLEMENT_RECORDING_ENABLED;
 
-/** Authoritative carried settlement balance for one player. */
+/** Authoritative carried ledger position for one player. */
 async function _calcPlayerSettlementCarry(sb, clubId, playerId, ticketsForPlayer, cutoffMs) {
   var net = _ticketNetAfterCutoff(ticketsForPlayer || [], cutoffMs || 0);
-  var pays = await _loadSettlementPaymentsAfter(sb, clubId, [playerId], cutoffMs ? { [String(playerId)]: cutoffMs } : {});
+  var pays = await _loadSettlementRecordsAfter(sb, clubId, [playerId], cutoffMs ? { [String(playerId)]: cutoffMs } : {});
   var openings = await _loadSettlementOpenings(sb, clubId, [playerId]);
   var p = pays[String(playerId)] || { playerPaidHost: 0, hostPaidPlayer: 0 };
   var opening = openings[String(playerId)] || 0;
@@ -13583,7 +13588,7 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
       ticketsByPid[pid].push(t);
     });
 
-    var payMap = await _loadSettlementPaymentsAfter(sb, clubId, Object.keys(byPlayer), cutoffMap);
+    var payMap = await _loadSettlementRecordsAfter(sb, clubId, Object.keys(byPlayer), cutoffMap);
     var openMap = await _loadSettlementOpenings(sb, clubId, Object.keys(byPlayer));
 
     Object.keys(byPlayer).forEach(function(pid) {
@@ -13610,7 +13615,7 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     });
 
     // Ledger-derived betting bankroll — per-player (same as /api/player/dashboard).
-    // Distinct from settlementBalance (cash carry).
+    // Distinct from settlementBalance (recorded settlement / ledger position).
     var ledgerBalByPid = {};
     try {
       var allPids = Object.keys(byPlayer);
@@ -13654,8 +13659,9 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
 
     res.json({
       ok: true, source:'db', clubId: clubId||null,
-      settlementCashEnabled: SETTLEMENT_OPTION_A_CASH_ENABLED,
-      cashApplyEnabled: SETTLEMENT_OPTION_A_CASH_ENABLED,
+      settlementRecordingEnabled: SETTLEMENT_RECORDING_ENABLED,
+      settlementCashEnabled: SETTLEMENT_RECORDING_ENABLED, // deprecated alias
+      cashApplyEnabled: SETTLEMENT_RECORDING_ENABLED, // deprecated alias
       players,
       totals: {
         playersOwe: rnd(playersOweTot),
@@ -13758,17 +13764,19 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
   }
 });
 
-// POST /api/host/settle-player — partial/full settlement toward zero (never crosses zero)
-// Serialized via settle_payment_option_a_tx (pg_advisory_xact_lock per club_id+player_id).
-app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
+// POST /api/host/record-settlement — record off-platform settlement toward zero (never crosses zero)
+// Alias: POST /api/host/settle-player (same handler; prefer record-settlement in new clients)
+// Serialized via record_settlement_option_a_tx (pg_advisory_xact_lock per club_id+player_id).
+// PocketBooks does NOT move funds — host acknowledges an external settlement only.
+async function _handleRecordSettlement(req, res) {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
-  if (!SETTLEMENT_OPTION_A_CASH_ENABLED) {
+  if (!SETTLEMENT_RECORDING_ENABLED) {
     return res.status(503).json({
       ok: false,
-      error: 'settlement_cash_disabled',
-      message: 'SETTLEMENT_OPTION_A_CASH_ENABLED is not true. Cash settlement blocked until post-bootstrap enable.',
-      settlementCashEnabled: false,
+      error: 'settlement_recording_disabled',
+      message: 'SETTLEMENT_RECORDING_ENABLED is not true. Settlement recording blocked until post-bootstrap enable.',
+      settlementRecordingEnabled: false,
       bankrollMutated: false
     });
   }
@@ -13807,11 +13815,11 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
 
     const actorId = (req._actor&&req._actor.actorId)||'host';
 
-    // Authoritative serialized path: lock → recompute → validate → insert → before/after.
-    // Never trusts FE preview amount as SoT.
+    // Authoritative serialized path: lock → recompute → validate → insert record → before/after.
+    // Never trusts FE preview amount as SoT. Does not move funds.
     var rpcResult;
     try {
-      rpcResult = await _callMoneyRpc('settle_payment_option_a_tx', {
+      rpcResult = await _callMoneyRpc('record_settlement_option_a_tx', {
         p_club_id: clubId,
         p_player_id: playerId,
         p_amount: amt,
@@ -13824,27 +13832,27 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       });
     } catch (rpcErr) {
       var msg = String((rpcErr && rpcErr.message) || rpcErr || '');
-      if (/settle_payment_option_a_tx|Could not find the function|schema cache/i.test(msg)) {
+      if (/record_settlement_option_a_tx|settle_payment_option_a_tx|Could not find the function|schema cache/i.test(msg)) {
         return res.status(503).json({
           ok:false,
           error:'settlement_serialize_rpc_missing',
-          hint:'Apply migrations/PROPOSED_settle_payment_option_a_tx.sql (+ opening balances) after approval. Unlocked settle path disabled.',
+          hint:'Apply migrations/PROPOSED_record_settlement_option_a_tx.sql (+ opening balances) after approval. Unlocked record path disabled.',
           lockKey: { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
           lockTimeoutMs: lockTimeoutMs
         });
       }
-      if (/settlement_payments|does not exist|Could not find the table/i.test(msg)) {
+      if (/settlement_records|settlement_payments|does not exist|Could not find the table/i.test(msg)) {
         return res.status(503).json({
           ok:false,
-          error:'settlement_payments_missing',
-          hint:'Apply migrations/PROPOSED_settlement_payments.sql after approval. settle_player_tx is intentionally not used.'
+          error:'settlement_records_missing',
+          hint:'Apply migrations/PROPOSED_settlement_records.sql after approval. settle_player_tx is intentionally not used.'
         });
       }
       throw rpcErr;
     }
 
     if (!rpcResult || rpcResult.ok === false) {
-      var err = (rpcResult && rpcResult.error) || 'settle_failed';
+      var err = (rpcResult && rpcResult.error) || 'record_settlement_failed';
       if (err === 'lock_timeout') {
         return res.status(409).json({
           ok:false,
@@ -13853,19 +13861,19 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
           lockKey: (rpcResult && rpcResult.lockKey) || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
           retry: (rpcResult && rpcResult.retry) || {
             recommended: true, backoffMs: 250, maxAttempts: 3,
-            message: 'Settlement lock busy; retry with same Idempotency-Key. No payment was written.'
+            message: 'Settlement lock busy; retry with same Idempotency-Key. No settlement record was written.'
           },
           bankrollMutated: false,
-          message: 'Could not acquire settlement lock in time. No payment row written. Retry.'
+          message: 'Could not acquire settlement lock in time. No settlement record written. Retry.'
         });
       }
-      if (err === 'overpay_blocked') {
+      if (err === 'over_settlement_blocked' || err === 'overpay_blocked') {
         return res.status(400).json({
-          ok:false, error:'overpay_blocked',
+          ok:false, error:'over_settlement_blocked',
           amount: amt,
           maxAmount: rpcResult.maxAmount,
           balanceBefore: rpcResult.balanceBefore,
-          message: rpcResult.message || ('Settlement cannot cross zero. Max $'+Number(rpcResult.maxAmount||0).toFixed(2)),
+          message: rpcResult.message || ('Recorded settlement cannot cross zero. Max $'+Number(rpcResult.maxAmount||0).toFixed(2)),
           serialized: true
         });
       }
@@ -13893,11 +13901,11 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
     var finalDir = rpcResult.direction;
     var appliedAmt = rpcResult.amount;
     var idempotent = !!rpcResult.idempotent;
-    var paymentId = rpcResult.paymentId || ('SETTLE_DIRECT_'+clubId+'_'+idempotencyKey);
+    var recordId = rpcResult.recordId || rpcResult.paymentId || ('SETTLE_DIRECT_'+clubId+'_'+idempotencyKey);
     var settlementId = rpcResult.settlementId || (String(clubId) + '::' + String(idempotencyKey));
     var splitAfter = settlementCarry.splitOwes(balanceAfter);
 
-    // Open risk for previewAfter (read-only; not part of settle mutation)
+    // Open risk for previewAfter (read-only; not part of record mutation)
     var openRisk = 0;
     try {
       const { data: tickets } = await sb.from('tickets')
@@ -13912,7 +13920,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
 
     try {
       await sb.from('audit_events').insert({
-        event_type: 'settlement_executed',
+        event_type: 'settlement_recorded',
         club_id: clubId, player_id: playerId,
         payload: {
           option: 'A',
@@ -13922,7 +13930,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
           settlementWeek,
           idempotencyKey,
           settlementId,
-          paymentId,
+          recordId,
           note: note||null,
           balanceBefore: before,
           balanceAfter: balanceAfter,
@@ -13930,15 +13938,16 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
           period: settlementWeek || null,
           bankrollMutated: false,
           settlePlayerTxUsed: false,
+          fundsMoved: false,
           serialized: true,
           lockKey: rpcResult.lockKey || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
           lockTimeoutMs: lockTimeoutMs,
           idempotent: idempotent
         }
       });
-    } catch(_ae) { console.warn('[settle-player] audit error:', _ae.message); }
+    } catch(_ae) { console.warn('[record-settlement] audit error:', _ae.message); }
 
-    console.log('[settle-player] optionA serialized club='+clubId+' paymentId='+paymentId+
+    console.log('[record-settlement] optionA serialized club='+clubId+' recordId='+recordId+
       ' dir='+finalDir+' amt='+appliedAmt+' carry '+before+'→'+balanceAfter+
       ' idempotent='+idempotent+' lock='+lockMeta.key1+','+lockMeta.key2);
 
@@ -13947,7 +13956,8 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       executed: !idempotent,
       idempotent: idempotent,
       settlementId,
-      paymentId,
+      recordId,
+      paymentId: recordId, // deprecated alias
       direction: finalDir,
       amount: appliedAmt,
       settlementWeek,
@@ -13959,6 +13969,7 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       hostOwes: splitAfter.hostOwes,
       maxAmount: rpcResult.maxAmount != null ? rpcResult.maxAmount : Math.abs(before),
       bankrollMutated: false,
+      fundsMoved: false,
       settlePlayerTxUsed: false,
       serialized: true,
       lockKey: rpcResult.lockKey || { key1: lockMeta.key1, key2: lockMeta.key2, scope: lockMeta.scope },
@@ -13973,21 +13984,24 @@ app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionSco
       }
     });
   } catch(e) {
-    console.error('[settle-player] error:', e.message);
+    console.error('[record-settlement] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
-});
+}
+app.post('/api/host/record-settlement', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), _handleRecordSettlement);
+app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), _handleRecordSettlement);
 
-// GET /api/host/settlement-payments?clubId=&playerId= — payment history (Option A)
-app.get('/api/host/settlement-payments', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
+// GET /api/host/settlement-records?clubId=&playerId= — settlement history (Option A)
+// Alias: GET /api/host/settlement-payments
+async function _handleSettlementRecordsList(req, res) {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query || {};
   if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   try {
-    let q = sb.from('settlement_payments')
-      .select('payment_id,club_id,player_id,direction,amount,amount_cents,status,method,note,created_at,confirmed_at,created_by,confirmed_by,balance_before,balance_after,period_id')
+    let q = sb.from('settlement_records')
+      .select('record_id,club_id,player_id,direction,amount,amount_cents,status,method,note,created_at,confirmed_at,created_by,confirmed_by,balance_before,balance_after,period_id')
       .eq('club_id', clubId)
       .eq('status', 'confirmed')
       .order('confirmed_at', { ascending: false })
@@ -13995,17 +14009,19 @@ app.get('/api/host/settlement-payments', requireCanonicalClubId, requirePermissi
     if (playerId) q = q.eq('player_id', playerId);
     const { data, error } = await q;
     if (error) {
-      if (/relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(error.message||error))) {
-        return res.status(503).json({ ok:false, error:'settlement_payments_missing', payments: [] });
+      if (/relation .*settlement_records.* does not exist|Could not find the table/i.test(String(error.message||error))) {
+        return res.status(503).json({ ok:false, error:'settlement_records_missing', records: [], payments: [] });
       }
       throw error;
     }
-    res.json({ ok:true, clubId, playerId: playerId||null, payments: data||[] });
+    res.json({ ok:true, clubId, playerId: playerId||null, records: data||[], payments: data||[] });
   } catch(e) {
-    console.error('[settlement-payments] error:', e.message);
+    console.error('[settlement-records] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
-});
+}
+app.get('/api/host/settlement-records', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), _handleSettlementRecordsList);
+app.get('/api/host/settlement-payments', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), _handleSettlementRecordsList);
 
 // ── WEEKLY ROLLOVER ENGINE (Phase C Step 5) ────────────────────────────────────────────────────
 
@@ -15445,11 +15461,11 @@ app.get('/api/club/exposure', requirePermissionScoped('view_host_dashboard'), as
 
 // ══ SETTLEMENT PERIODS + CLOSEOUT (Phase N) ═══════════════════════════════════════════════════════════════════════
 
-// ── PAYMENT HELPERS ───────────────────────────────────────────────────────────────────────
+// ── SETTLEMENT RECORD HELPERS (Phase N; off-platform recording) ───────────────────────────────────────────────────────────────────────
 async function _calcTotalPaid(sb, periodId, playerId, direction, clubId) {
   // club_id required — period_id+player alone can mix clubs if period IDs collide.
   if (!clubId) return 0; // refuse unscoped aggregation
-  const { data } = await sb.from('settlement_payments').select('amount')
+  const { data } = await sb.from('settlement_records').select('amount')
     .eq('club_id', clubId)
     .eq('period_id',periodId).eq('player_id',playerId)
     .eq('direction',direction).eq('status','confirmed');
@@ -15515,7 +15531,7 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
       return res.status(409).json({ ok:false, code:'period_not_closed' });
     if (String(period.club_id) !== String(clubId))
       return res.status(403).json({ ok:false, error:'period_club_mismatch' });
-    // Snapshot for overpayment check — scoped to period (period already club-verified)
+    // Snapshot for over-settlement check — scoped to period (period already club-verified)
     const { data:snapData } = await sb.from('settlement_snapshots').select('amount_owed_by_player,amount_owed_to_player,club_id')
       .eq('period_id',periodId).eq('player_id',playerId).order('revision',{ascending:false}).limit(1);
     const snap = snapData&&snapData[0]||{ amount_owed_by_player:0, amount_owed_to_player:0 };
@@ -15536,9 +15552,10 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
     // Create payment row
     const paymentId = 'PAY_'+clubId+'_'+playerId+'_'+Date.now();
     const now = new Date().toISOString();
-    const { error:pErr } = await sb.from('settlement_payments').insert({
-      payment_id:paymentId, period_id:periodId, revision:period.revision||0,
+    const { error:pErr } = await sb.from('settlement_records').insert({
+      record_id:paymentId, period_id:periodId, revision:period.revision||0,
       club_id:clubId, player_id:playerId, direction, amount:amt,
+      amount_cents:Math.round(amt*100),
       method:method||'cash', status:'pending', note:note||null,
       created_at:now, created_by:actor.actorId||'host'
     });
@@ -15561,7 +15578,7 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
   const { paymentId } = req.body||{};
   if (!paymentId) return res.status(400).json({ ok:false, error:'missing_paymentId' });
   try {
-    const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
+    const { data:pData } = await sb.from('settlement_records').select('*').eq('record_id',paymentId).limit(1);
     const pay = pData&&pData[0];
     if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
     if (pay.status==='confirmed') return res.json({ ok:true, idempotent:true, paymentId });
@@ -15581,7 +15598,7 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
       // Also check if a DIRECT settlement row exists for same player+direction+amount
       // (settle-player path stores ledger_settlement_id for cross-reference)
       if (!_existingSettlement) {
-        var _directPay = await sb.from('settlement_payments').select('payment_id,ledger_settlement_id')
+        var _directPay = await sb.from('settlement_records').select('record_id,ledger_settlement_id')
           .eq('club_id',pay.club_id).eq('player_id',pay.player_id)
           .eq('direction',pay.direction).eq('status','confirmed').eq('method','direct')
           .eq('amount',pay.amount).limit(1);
@@ -15590,11 +15607,11 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
           console.log('[settlement/confirm] DOUBLE_SETTLEMENT_GUARD paymentId='+paymentId
             +' — direct settlement already exists ledger_id='+_directPay.data[0].ledger_settlement_id
             +' — skipping second SETTLEMENT_APPLIED write');
-          await sb.from('settlement_payments').update({
+          await sb.from('settlement_records').update({
             status:'confirmed', confirmed_at:new Date().toISOString(),
             confirmed_by:(actor&&actor.actorId)||'host', ledger_written:false,
             note:(pay.note?pay.note+' ':'')+'[no-ledger: covered by direct settlement]'
-          }).eq('payment_id',paymentId);
+          }).eq('record_id',paymentId);
           return res.json({ ok:true, paymentId, ledgerId:null, doubleSettlementPrevented:true });
         }
       }
@@ -15602,10 +15619,10 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
     if (_existingSettlement) {
       // Own prior write found — idempotent replay, update payment status if needed
       if (pay.status !== 'confirmed') {
-        await sb.from('settlement_payments').update({
+        await sb.from('settlement_records').update({
           status:'confirmed', confirmed_at:new Date().toISOString(),
           confirmed_by:(actor&&actor.actorId)||'host', ledger_written:true
-        }).eq('payment_id',paymentId);
+        }).eq('record_id',paymentId);
       }
       return res.json({ ok:true, paymentId, idempotent:true, ledgerId:_existingSettlement.ledger_id });
     }
@@ -15618,9 +15635,9 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
       reason:'payment_confirmed:'+pay.direction
     });
     const now = new Date().toISOString();
-    await sb.from('settlement_payments').update({
+    await sb.from('settlement_records').update({
       status:'confirmed', confirmed_at:now, confirmed_by:actor.actorId||'host', ledger_written:true
-    }).eq('payment_id',paymentId);
+    }).eq('record_id',paymentId);
     _writeAuthAudit('payment_confirmed', actor.actorId, pay.club_id, '/settlements/payment-confirm',
       { paymentId, amount:pay.amount, direction:pay.direction });
     console.log('[settlement/confirm] '+paymentId+' confirmed $'+pay.amount+' '+dir);
@@ -15641,7 +15658,7 @@ app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_p
   const { paymentId, voidReason } = req.body||{};
   if (!paymentId) return res.status(400).json({ ok:false, error:'missing_paymentId' });
   try {
-    const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
+    const { data:pData } = await sb.from('settlement_records').select('*').eq('record_id',paymentId).limit(1);
     const pay = pData&&pData[0];
     if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
     if (pay.status==='voided') return res.json({ ok:true, idempotent:true, paymentId });
@@ -15659,10 +15676,10 @@ app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_p
       reversalLedgerId = 'LE_REV_'+paymentId;
     }
     const now = new Date().toISOString();
-    await sb.from('settlement_payments').update({
+    await sb.from('settlement_records').update({
       status:'voided', voided_at:now, voided_by:actor.actorId||'host',
       void_reason:voidReason||null
-    }).eq('payment_id',paymentId);
+    }).eq('record_id',paymentId);
     _writeAuthAudit('payment_voided', actor.actorId, pay.club_id, '/settlements/payment-void',
       { paymentId, amount:pay.amount, reversalLedgerId, voidReason });
     console.log('[settlement/void] '+paymentId+(reversalLedgerId?' reversal='+reversalLedgerId:''));
@@ -15685,7 +15702,7 @@ app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('vie
     const latestRev = revData&&revData[0]?revData[0].revision:0;
     const { data:snaps } = await sb.from('settlement_snapshots').select('*')
       .eq('period_id',periodId).eq('revision',latestRev);
-    const { data:payments } = await sb.from('settlement_payments').select('*')
+    const { data:payments } = await sb.from('settlement_records').select('*')
       .eq('period_id',periodId).order('created_at');
     // Build per-player balance view
     const byPlayer = {};

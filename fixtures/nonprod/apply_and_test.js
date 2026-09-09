@@ -51,9 +51,9 @@ async function main() {
   var root = path.join(__dirname, '..', '..');
   var files = [
     path.join(__dirname, 'schema_minimal.sql'),
-    path.join(root, 'migrations', 'PROPOSED_settlement_payments.sql'),
+    path.join(root, 'migrations', 'PROPOSED_settlement_records.sql'),
     path.join(root, 'migrations', 'PROPOSED_settlement_opening_balances.sql'),
-    path.join(root, 'migrations', 'PROPOSED_settle_payment_option_a_tx.sql'),
+    path.join(root, 'migrations', 'PROPOSED_record_settlement_option_a_tx.sql'),
     path.join(root, 'migrations', 'PROPOSED_bootstrap_settlement_opening_epoch.sql'),
     path.join(root, 'migrations', 'PROPOSED_cancel_bet_tx_club_isolation.sql')
   ];
@@ -76,7 +76,7 @@ async function main() {
 
   // Seed + cancel matrix against real function
   await client.query('TRUNCATE club_members, tickets, ledger_entries RESTART IDENTITY CASCADE');
-  try { await client.query('TRUNCATE settlement_payments'); } catch (_e) {}
+  try { await client.query('TRUNCATE settlement_records'); } catch (_e) {}
 
   await client.query(`
     INSERT INTO club_members (club_id, player_id, balance_start) VALUES
@@ -109,9 +109,9 @@ async function main() {
   results.push(['already_canceled', await callCancel('tA1', 'clubA', 'p1', 'CAN_A1b')]);
   results.push(['already_graded', await callCancel('tA_won', 'clubA', 'p1', 'CAN_WON')]);
 
-  // settlement_payments insert smoke
+  // settlement_records insert smoke
   await client.query(`
-    INSERT INTO settlement_payments (
+    INSERT INTO settlement_records (
       payment_id, club_id, player_id, direction, amount, amount_cents,
       status, confirmed_at, balance_before, balance_after
     ) VALUES (
@@ -119,7 +119,7 @@ async function main() {
       'confirmed', now(), -500, -300
     )
   `);
-  var payCount = await client.query(`SELECT count(*)::int AS c FROM settlement_payments WHERE club_id='clubA'`);
+  var payCount = await client.query(`SELECT count(*)::int AS c FROM settlement_records WHERE club_id='clubA'`);
 
   var fail = 0;
   function expect(name, cond, detail) {
@@ -138,7 +138,7 @@ async function main() {
   expect('idempotent dup', by.dup && by.dup.ok === true && by.dup.idempotent === true, JSON.stringify(by.dup));
   expect('already canceled', by.already_canceled && by.already_canceled.error === 'invalid_transition', JSON.stringify(by.already_canceled));
   expect('already graded', by.already_graded && by.already_graded.error === 'invalid_transition', JSON.stringify(by.already_graded));
-  expect('settlement_payments row', payCount.rows[0].c === 1);
+  expect('settlement_records row', payCount.rows[0].c === 1);
 
   // Serialized settle smoke (advisory lock path) — isolated player
   await client.query(`
@@ -149,7 +149,7 @@ async function main() {
     ON CONFLICT (id) DO UPDATE SET status='lost', risk_amount=500, player_id='pSettle', graded_at=now()
   `);
   var settleJ = await client.query(
-    `SELECT public.settle_payment_option_a_tx('clubA','pSettle',200,'APPLY_SMOKE',NULL,NULL,'test','DIRECT',3000) AS j`
+    `SELECT public.record_settlement_option_a_tx('clubA','pSettle',200,'APPLY_SMOKE',NULL,NULL,'test','DIRECT',3000) AS j`
   );
   expect('serialized settle 200 on −500 → −300',
     settleJ.rows[0].j && settleJ.rows[0].j.ok === true && Number(settleJ.rows[0].j.balanceAfter) === -300,

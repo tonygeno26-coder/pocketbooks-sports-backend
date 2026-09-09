@@ -4,9 +4,9 @@
   "productionTouched": false,
   "files": [
     "fixtures/nonprod/schema_minimal.sql",
-    "migrations/PROPOSED_settlement_payments.sql",
+    "migrations/PROPOSED_settlement_records.sql",
     "migrations/PROPOSED_settlement_opening_balances.sql",
-    "migrations/PROPOSED_settle_payment_option_a_tx.sql",
+    "migrations/PROPOSED_record_settlement_option_a_tx.sql",
     "migrations/PROPOSED_bootstrap_settlement_opening_epoch.sql",
     "migrations/PROPOSED_cancel_bet_tx_club_isolation.sql"
   ],

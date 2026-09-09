@@ -22,7 +22,7 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Lifetime ticket net (context ONLY) | **+1037.85** (5 won / 0 lost / 12 canceled; last grade 2026-05-28) |
 | Null-club involvement | **Yes — 2** `bet_canceled` smoke rows (2026-09-01); excluded by club-eq settlement math; evidence noise only |
 | Last activity | Club tickets last grade **2026-05-28**; null-club smoke **2026-09-01** |
-| Why Ambiguous | Non-trivial lifetime (+1037.85); **no** payments / opening / epoch / legacy settlement rows; bankroll ≠ cash carry; null-club smoke does not prove square or a signed residue |
+| Why Ambiguous | Non-trivial lifetime (+1037.85); **no** settlement records / opening / epoch / legacy settlement rows; bankroll ≠ cash carry; null-club smoke does not prove square or a signed residue |
 | Evidence square vs owed | **Neither proven.** No cash ledger proves $0 square; lifetime must **not** be treated as host-owes +1037.85 |
 | Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT only if owner has an external signed cash residue). Do **not** OPEN AT $0 without written rationale |
 
@@ -41,7 +41,7 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Lifetime ticket net (context ONLY) | **+176.43** (2 won / 4 lost; last grade 2026-09-06) |
 | Null-club involvement | **None** (0 rows) |
 | Last activity | Last grade **2026-09-06T00:30:20Z**; last place 2026-09-05 |
-| Why Ambiguous | \|lifetime\| ≥ 100 bootstrap heuristic; 0 epoch / 0 payments / 0 legacy settlements; no signed cash residue |
+| Why Ambiguous | \|lifetime\| ≥ 100 bootstrap heuristic; 0 epoch / 0 settlement records / 0 legacy settlements; no signed cash residue |
 | Evidence square vs owed | **Neither proven.** Not square by record; not an explicit owed amount |
 | Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT with signed external amount). Do **not** OPEN AT $0 without written rationale |
 
@@ -60,7 +60,7 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 | Lifetime ticket net (context ONLY) | **−163.94** (4 won / 12 lost / 2 canceled; last grade 2026-09-09 01:40Z) |
 | Null-club involvement | **None** (0 rows) |
 | Last activity | Last grade **2026-09-09T01:40:02Z**; last place 2026-09-08 22:15Z |
-| Why Ambiguous | \|lifetime\| ≥ 100; recent graded play; 0 epoch / 0 payments / 0 legacy settlements; must not infer player-owes from P&L |
+| Why Ambiguous | \|lifetime\| ≥ 100; recent graded play; 0 epoch / 0 settlement records / 0 legacy settlements; must not infer player-owes from P&L |
 | Evidence square vs owed | **Neither proven.** Do **not** treat −163.94 as opening debt |
 | Recommended Owner Decision | **DEFER** (or ENTER EXPLICIT AMOUNT with signed external amount). Do **not** OPEN AT $0 without written rationale |
 
@@ -70,7 +70,7 @@ Hard rules honored: no invented financial amounts; lifetime / bankroll are **con
 
 ## CATEGORY A — Still qualify for tentative $0 (2)
 
-Reconfirmed on live SELECT (active/open **0** globally; epoch markers **0**; legacy `settlements` rows **0**; settlement_payments / opening tables **absent**).
+Reconfirmed on live SELECT (active/open **0** globally; epoch markers **0**; legacy `settlements` rows **0**; settlement_records / opening tables **absent**).
 
 ### A1) Host `16`
 
@@ -79,7 +79,7 @@ Reconfirmed on live SELECT (active/open **0** globally; epoch markers **0**; leg
 | Club / Player | Test Club `d616…8479` / player_id **`16`** (host in `club_memberships`) |
 | Known carry | **None** — no tickets, lifetime net **0**, bankroll **0** |
 | Null-club relationship | **None** |
-| Unresolved carry / payments | **None** (0 epoch, 0 payments, 0 legacy settlements) |
+| Unresolved carry  / settlement records | **None** (0 epoch, 0 settlement records, 0 legacy settlements) |
 | Active-ticket cutover | **0** active/open |
 | Why still $0-eligible | Host membership; empty betting history; no settlement primitives/rows to contradict clean open |
 
@@ -92,7 +92,7 @@ Tentative owner stance (prior): approved at **$0** **if** evidence still confirm
 | Club / Player | Test Club `d616…8479` / **Test Player 3** (`testplayer3`) / `bc767309-6fc7-4585-9077-3de7b898df13` |
 | Known carry | **None on record** — diagnostic lifetime **−44.70** only (\|net\| &lt; 100); not a signed cash residue |
 | Null-club relationship | **None** (0 rows) |
-| Unresolved carry / payments | **None** (0 epoch, 0 payments, 0 legacy settlements) |
+| Unresolved carry  / settlement records | **None** (0 epoch, 0 settlement records, 0 legacy settlements) |
 | Active-ticket cutover | **0** active/open (last grade 2026-09-09 01:46Z) |
 | Why still $0-eligible | Immaterial diagnostic history under bootstrap heuristic; no ambiguous null-club; no active cutover; opening $0 means clean T0 start — **not** converting bankroll/P&L to debt |
 
@@ -106,21 +106,21 @@ Tentative owner stance (prior): approved at **$0** **if** evidence still confirm
 
 | Primitive | Present? |
 |---|---|
-| `settlement_payments` / `settlement_opening_balances` | **No** |
-| `settle_payment_option_a_tx` / bootstrap RPC | **No** |
+| `settlement_records` / `settlement_opening_balances` | **No** |
+| `record_settlement_option_a_tx` / bootstrap RPC | **No** |
 | Legacy `settlements` rows | **0** |
 | BE cash flag | Scaffolded on feature branch; **default OFF** (`!== 'true'`) |
 
-### Proposed deploy with `SETTLEMENT_OPTION_A_CASH_ENABLED=false`
+### Proposed deploy with `SETTLEMENT_RECORDING_ENABLED=false`
 
 | Concern | Verdict |
 |---|---|
 | Existing balance changes (`balance_start`, tickets, bankroll) | **Safe** — additive empty tables; settle RPC append-only payments + optional audit ledger type; bootstrap inserts only when **explicitly invoked** (prod blocked without `force`) |
-| Settlement calcs suddenly appear as cash **actions** | **Blocked** — `POST /api/host/settle-player` returns **503 `settlement_cash_disabled`** when flag ≠ `true` |
-| Host can submit cash settlement | **No** while flag off (even if schema+RPC applied) |
+| Settlement calcs suddenly appear as cash **actions** | **Blocked** — `POST /api/host/settle-player` returns **503 `settlement_recording_disabled`** when flag ≠ `true` |
+| Host can submit settlement recordingment | **No** while flag off (even if schema+RPC applied) |
 | Ticket place / grade | **Unchanged** by settlement migrations |
 | Cancel path | Unchanged until `PROPOSED_cancel_bet_tx_club_isolation.sql` applied; then cancel still only via approved `cancel_bet_tx` (harder club lock; no phantom $1000) — **not** a cash-settle path |
-| App operates normally | **Yes** — betting SoT unchanged; preview may still show diagnostic carry fields with `settlementCashEnabled:false` / `cashApplyEnabled:false` (read-only UX signal; no write) |
+| App operates normally | **Yes** — betting SoT unchanged; preview may still show diagnostic carry fields with `settlementRecordingEnabled:false` / `settlementRecordingEnabled:false` (read-only UX signal; no write) |
 
 ### Required order (unchanged intent)
 

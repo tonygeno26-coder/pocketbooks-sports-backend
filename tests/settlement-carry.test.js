@@ -30,7 +30,7 @@ test('-500 + 500 → 0', function() {
 test('-500 + 600 never +100 (reject)', function() {
   var r = sc.applyPartialSettlement(-500, 600);
   assert.strictEqual(r.ok, false);
-  assert.strictEqual(r.error, 'overpay_blocked');
+  assert.strictEqual(r.error, 'over_settlement_blocked');
   assert.strictEqual(r.maxAmount, 500);
   assert.strictEqual(r.before, -500);
 });
@@ -51,7 +51,7 @@ test('+500 + 500 → 0', function() {
 test('+500 + 600 never -100 (reject)', function() {
   var r = sc.applyPartialSettlement(500, 600);
   assert.strictEqual(r.ok, false);
-  assert.strictEqual(r.error, 'overpay_blocked');
+  assert.strictEqual(r.error, 'over_settlement_blocked');
   assert.strictEqual(r.maxAmount, 500);
 });
 
@@ -136,17 +136,17 @@ test('index.js stops writing SETTLEMENT_APPLIED on weekly-rollover', function() 
   assert.ok(rolloverFn.indexOf("type: 'SETTLEMENT_APPLIED'") === -1);
 });
 
-test('settle-player uses serialized RPC + overpay_blocked', function() {
+test('record-settlement uses serialized RPC + over_settlement_blocked', function() {
   const fs = require('fs');
   const path = require('path');
   const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
-  const start = src.indexOf("app.post('/api/host/settle-player'");
+  const start = src.indexOf('async function _handleRecordSettlement');
   const end = src.indexOf("app.post('/api/host/weekly-rollover'");
   assert.ok(start !== -1 && end !== -1 && end > start);
   const settleFn = src.slice(start, end);
-  assert.ok(settleFn.indexOf("settle_payment_option_a_tx") !== -1);
+  assert.ok(settleFn.indexOf("record_settlement_option_a_tx") !== -1);
   assert.ok(settleFn.indexOf('balanceBefore') !== -1);
-  assert.ok(settleFn.indexOf('overpay_blocked') !== -1);
+  assert.ok(settleFn.indexOf('over_settlement_blocked') !== -1);
   assert.ok(settleFn.indexOf('serialized: true') !== -1);
   assert.ok(settleFn.indexOf('lock_timeout') !== -1);
   const lib = fs.readFileSync(path.join(__dirname, '..', 'lib', 'settlement-carry.js'), 'utf8');

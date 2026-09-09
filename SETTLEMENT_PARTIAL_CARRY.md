@@ -18,7 +18,7 @@ Host Settlements UI → openSettlePlayerModal
     ↓
 POST /api/host/settle-player
     → settle_player_tx (canonical ledger SETTLEMENT_APPLIED debit/credit)
-    → settlement_payments (confirmed)
+    → settlement_records (confirmed)
     → ledger_entries type=settlement (mirror)
     → audit_events settlement_executed
     ↓
@@ -34,7 +34,7 @@ POST /api/host/weekly-rollover
 | Betting bankroll | `club_members.balance_start` + `ledger` / `ledger_entries` | Players tab / bet gate |
 | Credit limit | `club_members.balance_start` via player-credit | Distinct from settlement cash |
 | Settlement owed (old) | Derived: ticket nets after cutoff | Cutoff treated rollover ≈ settled |
-| Prior payments | `settlement_payments` status=confirmed | Used in settle-player max, not always in preview |
+| Prior payments | `settlement_records` status=confirmed | Used in settle-player max, not always in preview |
 
 ### Old formulas
 ```
@@ -61,7 +61,7 @@ Switching cutoffs off entirely would **resurrect** unpaid weeks previously clear
 **Resolution (forward-safe, no rewrite history):**
 - Keep historical rollover `SETTLEMENT_APPLIED_*` / `weekly_rollover` ledger markers as epoch floor
 - Stop writing new epoch markers on weekly rollover
-- Cash settle adjusts via `settlement_payments` only (does not advance ticket epoch)
+- Settlement recording adjusts via `settlement_records` only (does not advance ticket epoch)
 - Carry = `ticketNet(after epoch) + playerPaidHost − hostPaidPlayer`
 
 ---
@@ -78,7 +78,7 @@ settlementBalance = ticketSettledNet(after historical epoch)
 apply(amount):
   if amount ≤ 0 → no-op
   if balance = 0 → reject
-  if amount > |balance| → REJECT overpay_blocked (prefer reject over silent cap)
+  if amount > |balance| → REJECT over_settlement_blocked (prefer reject over silent cap)
   newBalance = sign(balance) * max(|balance| − amount, 0)
 
 week carry (betting may cross zero):
@@ -91,13 +91,13 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 ---
 
 ## 3. UX choice: overpayment
-**Reject** with `overpay_blocked` + max message (“Settlement cannot cross zero…”). Matches existing API pattern; FE mirrors the message.
+**Reject** with `over_settlement_blocked` + max message (“Settlement cannot cross zero…”). Matches existing API pattern; FE mirrors the message.
 
 ---
 
 ## 4. Tables / routes / files
 
-**DB tables:** `tickets`, `settlement_payments` (proposed), `ledger_entries` (audit mirror only), `weekly_rollovers`, `weekly_player_snapshots`, `audit_events`, `club_members`
+**DB tables:** `tickets`, `settlement_records` (proposed), `ledger_entries` (audit mirror only), `weekly_rollovers`, `weekly_player_snapshots`, `audit_events`, `club_members`
 
 **API:**  
 `GET /api/host/settlements-preview` · `POST /api/host/settle-player` · `GET /api/host/settlement-payments` · `POST /api/host/weekly-rollover`
@@ -106,7 +106,7 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 **FE:** `index.html`, `tests/settlement-partial-carry-ui.test.js`
 
 **Migrations:** none applied. Proposed (not applied):
-- `migrations/PROPOSED_settlement_payments.sql` — Option A payment primitive
+- `migrations/PROPOSED_settlement_records.sql` — Option A payment primitive
 - `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` — hard club lock + remove phantom `$1000`
 - ~~`PROPOSED_settle_player_tx_club_scope.sql`~~ — removed; Option A does not use `settle_player_tx`
 
@@ -133,7 +133,7 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 - `club_members` / memberships: `UNIQUE(club_id, player_id)`
 - canonical `ledger`: `UNIQUE(club_id, idempotency_key, event_type)`
 - `idempotency_keys`: still PK on key alone — mitigated by club-prefixed storage key
-- `settlement_payments.payment_id` PK — mitigated by club-prefixed payment_id
+- `settlement_records.payment_id` PK — mitigated by club-prefixed payment_id
 
 ### Rollover proven (post-change)
 - Does **NOT** write `SETTLEMENT_APPLIED` epoch markers
@@ -153,7 +153,7 @@ Starting credit (`balance_start`) remains **bankroll/credit**, not settlement ca
 
 ## Option A redesign (cursor/settlement-option-a)
 
-See `docs/SETTLEMENT_OPTION_A.md`. Hard dependency on `settle_player_tx` **removed**. Authoritative apply path writes `settlement_payments` only.
+See `docs/SETTLEMENT_OPTION_A.md`. Hard dependency on `settle_player_tx` **removed**. Authoritative apply path writes `settlement_records` only.
 
 **Non-prod validation:** `docs/SETTLEMENT_NONPROD_VALIDATION.md`  
 **Local fixture apply (never prod):** `fixtures/nonprod/apply_and_test.js` → DB `pb_settlement_nonprod`  

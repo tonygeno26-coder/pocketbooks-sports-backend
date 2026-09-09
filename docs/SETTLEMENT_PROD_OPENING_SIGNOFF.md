@@ -33,7 +33,7 @@ Quiet-window ops tip: freeze new placements for ~5–10 minutes around bootstrap
 ## Production account inventory (active = `club_members`)
 
 Club: **Test Club** `d616dc2a-95a6-473a-97b1-7da330878479` (only UUID club with members).  
-`settlement_payments` / `settlement_opening_balances` / settle+bootstrap RPCs: **absent** in prod.  
+`settlement_records` / `settlement_opening_balances` / settle+bootstrap RPCs: **absent** in prod.  
 Epoch markers: **0**. Legacy `settlements` rows: **0**. Multi-club members: **none**.
 
 | Club | Player | balance_start | Approx available bankroll¹ | Active exposure | Lifetime ticket net² (diagnostic) | Current-period settled net³ | Epoch markers | Recent activity | Role note |
@@ -68,7 +68,7 @@ Epoch markers: **0**. Legacy `settlements` rows: **0**. Multi-club members: **no
 
 | Club | Player | Proposed Opening | Classification | Evidence | Active Risk | Human Approval |
 |---|---|---|---|---|---|---|
-| Test Club `d616…8479` | `0a1885b8-…7d49` | **PENDING** — candidate `$0` + T0 (NOT +1037.85) | **C AMBIGUOUS** | Lifetime ticket net +1037.85; 0 epoch; 0 payments; 2 null-club smoke void ledger rows (excluded by club eq). Bankroll ≠ settlement. | 0 active tickets | ☐ Approve `$0` + rationale  ☐ Set B amount $____  ☐ Defer |
+| Test Club `d616…8479` | `0a1885b8-…7d49` | **PENDING** — candidate `$0` + T0 (NOT +1037.85) | **C AMBIGUOUS** | Lifetime ticket net +1037.85; 0 epoch; 0 settlement records; 2 null-club smoke void ledger rows (excluded by club eq). Bankroll ≠ settlement. | 0 active tickets | ☐ Approve `$0` + rationale  ☐ Set B amount $____  ☐ Defer |
 | Test Club `d616…8479` | `12bb68f1-…9172` | **PENDING** — candidate `$0` + T0 (NOT +176.43) | **C AMBIGUOUS** | Lifetime +176.43; \|net\|≥100 bootstrap heuristic; no markers/payments. | 0 | ☐ `$0` + rationale  ☐ B $____  ☐ Defer |
 | Test Club `d616…8479` | `16` | **$0** | **A OPEN AT ZERO** | Host membership; balance_start 0; no tickets/ledger. | 0 | ☐ Confirm (or exclude host from bootstrap) |
 | Test Club `d616…8479` | `2a3e6819-…929e` | **PENDING** — candidate `$0` + T0 (NOT −163.94) | **C AMBIGUOUS** | Lifetime −163.94; recent grades through 2026-09-09; no markers/payments. | 0 | ☐ `$0` + rationale  ☐ B $____  ☐ Defer |
@@ -81,9 +81,9 @@ Epoch markers: **0**. Legacy `settlements` rows: **0**. Multi-club members: **no
 ## Multi-club proof
 
 - `club_members`: single club UUID; **0** players with `count(DISTINCT club_id) > 1`.  
-- Settlement APIs require `clubId` (`missing_clubId` on preview / settle / payments / rollover).  
+- Settlement APIs require `clubId` (`missing_clubId` on preview / settle  / settlement records / rollover).  
 - Ticket/payment loads use `.eq('club_id', clubId)` then group by `player_id` **within that club** — not global player aggregation.  
-- SQL helpers `_settlement_cutoff_ms` / `_settlement_recompute_carry` / `settle_payment_option_a_tx` all take `(club_id, player_id)`.
+- SQL helpers `_settlement_cutoff_ms` / `_settlement_recompute_carry` / `record_settlement_option_a_tx` all take `(club_id, player_id)`.
 
 ## Null-club ledger (36 rows)
 
@@ -107,13 +107,13 @@ Epoch markers: **0**. Legacy `settlements` rows: **0**. Multi-club members: **no
 
 ## Feature flag (scaffolded — **DO NOT ENABLE**)
 
-BE scaffolding on `cursor/settlement-option-a`: `SETTLEMENT_OPTION_A_CASH_ENABLED` must equal exact string `true` to allow cash settle. Default / unset / any other value = **OFF**.
+BE scaffolding on `cursor/settlement-option-a`: `SETTLEMENT_RECORDING_ENABLED` must equal exact string `true` to allow settlement recording. Default / unset / any other value = **OFF**.
 
 | Layer | Flag | Default | Effect when false |
 |---|---|---|---|
-| BE | `SETTLEMENT_OPTION_A_CASH_ENABLED` | **false** (unset) | `/api/host/settle-player` → `503 settlement_cash_disabled` **before** RPC |
-| BE | (same flag) | | `settlements-preview` returns `settlementCashEnabled:false` + `cashApplyEnabled:false` |
-| FE | `window.__PB_SETTLEMENT_OPTION_A_CASH__ !== true` (or env off) | **off** | Hide Settle / payment controls in host UI (FE still recommended) |
+| BE | `SETTLEMENT_RECORDING_ENABLED` | **false** (unset) | `/api/host/settle-player` → `503 settlement_recording_disabled` **before** RPC |
+| BE | (same flag) | | `settlements-preview` returns `settlementRecordingEnabled:false` + `settlementRecordingEnabled:false` |
+| FE | `window.__PB_SETTLEMENT_OPTION_A_CASH__ !== true` (or env off) | **off** | Hide Settle / recording controls in host UI (FE still recommended) |
 
 Enable **only after** schema + signed bootstrap. Schema-first + flag-off is safe: empty tables / unused RPCs do not mutate balances; hosts cannot submit cash.
 
@@ -121,13 +121,13 @@ Enable **only after** schema + signed bootstrap. Schema-first + flag-off is safe
 
 ## Revised deployment order (corrects prior “BE first” gate)
 
-1. **Schema first (prod, separate approval):** `PROPOSED_cancel_bet_tx_club_isolation.sql` → `PROPOSED_settlement_payments.sql` → `PROPOSED_settlement_opening_balances.sql` → `PROPOSED_settle_payment_option_a_tx.sql` → `PROPOSED_bootstrap_settlement_opening_epoch.sql`  
+1. **Schema first (prod, separate approval):** `PROPOSED_cancel_bet_tx_club_isolation.sql` → `PROPOSED_settlement_records.sql` → `PROPOSED_settlement_opening_balances.sql` → `PROPOSED_record_settlement_option_a_tx.sql` → `PROPOSED_bootstrap_settlement_opening_epoch.sql`  
 2. **Compatible BE/FE** (`d839449` / `46da895`) with **cash flag OFF**  
 3. **Owner financial sign-off** on this doc’s C rows  
 4. **Bootstrap** signed `(club,player)` at T0 (force+rationale only where required)  
 5. **Enable UI/API flag**  
 
-**Can `d839449` deploy before tables?** Technically settle returns `503 settlement_serialize_rpc_missing` / `settlement_payments_missing`, but preview without T0 would surface **lifetime** as carry — **unsafe**. Prefer schema → flagged BE → bootstrap → UI. No window that invites settle against missing primitives or lifetime-as-debt UX.
+**Can `d839449` deploy before tables?** Technically settle returns `503 settlement_serialize_rpc_missing` / `settlement_records_missing`, but preview without T0 would surface **lifetime** as carry — **unsafe**. Prefer schema → flagged BE → bootstrap → UI. No window that invites settle against missing primitives or lifetime-as-debt UX.
 
 ---
 
@@ -138,14 +138,14 @@ Exact apply order:
 | # | File | Deps | Additive? | Changes existing financial rows? | Txn / rollback |
 |---|---|---|---|---|---|
 | 1 | `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` | existing `cancel_bet_tx` | **No** (CREATE OR REPLACE function) | Function body only at apply-time; **runtime** cancel UPDATEs tickets + INSERTs ledger (same refund math; harder club lock; removes phantom $1000) | Backup `pg_get_functiondef` → restore body |
-| 2 | `migrations/PROPOSED_settlement_payments.sql` | none | **Yes** CREATE TABLE | No | DROP TABLE/indexes |
+| 2 | `migrations/PROPOSED_settlement_records.sql` | none | **Yes** CREATE TABLE | No | DROP TABLE/indexes |
 | 3 | `migrations/PROPOSED_settlement_opening_balances.sql` | none | **Yes** CREATE TABLE | No | DROP TABLE/index |
-| 4 | `migrations/PROPOSED_settle_payment_option_a_tx.sql` | needs `settlement_payments`; optional opening table | New functions | **Runtime** INSERT `settlement_payments` + audit `ledger_entries` (`settlement_payment`). **Does not** mutate `balance_start` / tickets | DROP functions |
+| 4 | `migrations/PROPOSED_record_settlement_option_a_tx.sql` | needs `settlement_records`; optional opening table | New functions | **Runtime** INSERT `settlement_records` + audit `ledger_entries` (`settlement_payment`). **Does not** mutate `balance_start` / tickets | DROP functions |
 | 5 | `migrations/PROPOSED_bootstrap_settlement_opening_epoch.sql` | needs `settlement_opening_balances` | New function | **Runtime** INSERT epoch marker + opening row (blocked for `bootstrap_prod` without `force`) | DROP function; delete bootstrap ids by prefix |
 
 **Highlights — statements that modify existing financial values**
 - **cancel_bet_tx (replace):** future cancels rewrite ticket status / bankroll presentation paths; no bulk UPDATE at migrate time.  
-- **settle_payment_option_a_tx:** append-only cash; never rewrites ticket nets or `balance_start`.  
+- **record_settlement_option_a_tx:** append-only recorded settlement; never rewrites ticket nets or `balance_start`.  
 - **bootstrap:** inserts only; lifetime P&L not written as debt unless caller passes that opening explicitly (forbidden without human rationale).
 
 ---
@@ -166,7 +166,7 @@ Exact apply order:
 2. For each **C** account: fill `OWNER CHOICE` in `docs/SETTLEMENT_OWNER_DECISION_TABLE.md` (`$0` + rationale **or** explicit signed amount **or** DEFER). Do not auto-zero.  
 3. Confirm **A** rows (`16`, `bc767309-…`) at `$0` (reconfirmed eligible).  
 4. Approve schema apply order + later bootstrap (separate from this doc).  
-5. Keep `SETTLEMENT_OPTION_A_CASH_ENABLED` false until bootstrap verified.
+5. Keep `SETTLEMENT_RECORDING_ENABLED` false until bootstrap verified.
 
 Companion dry-run: `docs/settlement_prod_opening_dry_run.json`  
 Owner table: `docs/SETTLEMENT_OWNER_DECISION_TABLE.md`

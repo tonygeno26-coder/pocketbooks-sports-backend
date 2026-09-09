@@ -34,7 +34,7 @@ function expect(name, cond, detail, bag) {
 
 async function settle(client, clubId, playerId, amount, key, lockMs) {
   var r = await client.query(
-    `SELECT public.settle_payment_option_a_tx($1,$2,$3,$4,$5,$6,$7,$8,$9) AS j`,
+    `SELECT public.record_settlement_option_a_tx($1,$2,$3,$4,$5,$6,$7,$8,$9) AS j`,
     [clubId, playerId, amount, key, null, null, 'test', 'DIRECT', lockMs || 3000]
   );
   return r.rows[0].j;
@@ -96,7 +96,7 @@ async function main() {
   expect('cross-club different lock', keys.key1 !== keysB.key1 || keys.key2 !== keysB.key2, null, bag);
   var keysP2 = settlementLock.settlementLockKeys('clubA', 'p2');
   expect('cross-player different lock', keys.key1 !== keysP2.key1 || keys.key2 !== keysP2.key2, null, bag);
-  report.advisoryLock = 'pg_advisory_xact_lock(key1,key2) via settle_payment_option_a_tx';
+  report.advisoryLock = 'pg_advisory_xact_lock(key1,key2) via record_settlement_option_a_tx';
   report.lockKey = {
     algorithm: 'md5(settle_v1|club_id|player_id) → int4 pair',
     namespace: settlementLock.SETTLEMENT_LOCK_NAMESPACE,
@@ -105,8 +105,8 @@ async function main() {
   };
 
   // Reset settlement tables for concurrency matrix
-  await client.query('TRUNCATE settlement_payments, settlement_opening_balances RESTART IDENTITY CASCADE');
-  await client.query(`DELETE FROM ledger_entries WHERE id LIKE 'SETTLEMENT_APPLIED_BOOTSTRAP_%' OR type='settlement_payment'`);
+  await client.query('TRUNCATE settlement_records, settlement_opening_balances RESTART IDENTITY CASCADE');
+  await client.query(`DELETE FROM ledger_entries WHERE id LIKE 'SETTLEMENT_APPLIED_BOOTSTRAP_%' OR type='settlement_record'`);
   await client.query(`DELETE FROM tickets WHERE id LIKE 'conc_%' OR id LIKE 'boot_%'`);
   await client.query(`
     INSERT INTO club_members (club_id, player_id, balance_start) VALUES
@@ -123,7 +123,7 @@ async function main() {
   `);
 
   console.log('\n── Concurrent overpay matrix (−500) ──');
-  // Two concurrent $400 on −500 → one ok (−100), one overpay_blocked; never +300 / $600
+  // Two concurrent $400 on −500 → one ok (−100), one over_settlement_blocked; never +300 / $600
   var c1 = new pg.Client({ connectionString: DEFAULT_URL });
   var c2 = new pg.Client({ connectionString: DEFAULT_URL });
   await c1.connect();
@@ -136,13 +136,13 @@ async function main() {
   await c2.end();
 
   var okPays = parallel.filter(function(j){ return j && j.ok === true && !j.idempotent; });
-  var blocked = parallel.filter(function(j){ return j && j.ok === false && j.error === 'overpay_blocked'; });
+  var blocked = parallel.filter(function(j){ return j && j.ok === false && j.error === 'over_settlement_blocked'; });
   expect('exactly one of two $400 succeeds', okPays.length === 1, JSON.stringify(parallel), bag);
-  expect('other is overpay_blocked', blocked.length === 1, JSON.stringify(parallel), bag);
+  expect('other is over_settlement_blocked', blocked.length === 1, JSON.stringify(parallel), bag);
   var afterCarry = await recompute(client, 'clubA', 'pConc');
   expect('after concurrent → −100 (not +300)', Number(afterCarry.settlementBalance) === -100, afterCarry, bag);
   var paySum = await client.query(
-    `SELECT coalesce(sum(amount),0)::float AS s FROM settlement_payments
+    `SELECT coalesce(sum(amount),0)::float AS s FROM settlement_records
      WHERE club_id='clubA' AND player_id='pConc' AND status='confirmed'`
   );
   expect('payments total $400 not $600/$800', Number(paySum.rows[0].s) === 400, paySum.rows[0], bag);
@@ -156,20 +156,20 @@ async function main() {
 
   // Sequential 200+200 from −100? First reset: currently −100. Pay 200 should overpay; pay 100 → 0
   var overFromNeg100 = await settle(client, 'clubA', 'pConc', 200, 'OVER_200', 3000);
-  expect('−100 + 200 → overpay_blocked', overFromNeg100.ok === false && overFromNeg100.error === 'overpay_blocked', overFromNeg100, bag);
+  expect('−100 + 200 → over_settlement_blocked', overFromNeg100.ok === false && overFromNeg100.error === 'over_settlement_blocked', overFromNeg100, bag);
   var pay100 = await settle(client, 'clubA', 'pConc', 100, 'PAY_100', 3000);
   expect('−100 + 100 → 0', pay100.ok === true && Number(pay100.balanceAfter) === 0, pay100, bag);
 
   // Fresh −500 for 200+200 → −100
-  await client.query(`DELETE FROM settlement_payments WHERE club_id='clubA' AND player_id='pConc'`);
-  await client.query(`DELETE FROM ledger_entries WHERE club_id='clubA' AND player_id='pConc' AND type='settlement_payment'`);
+  await client.query(`DELETE FROM settlement_records WHERE club_id='clubA' AND player_id='pConc'`);
+  await client.query(`DELETE FROM ledger_entries WHERE club_id='clubA' AND player_id='pConc' AND type='settlement_record'`);
   var s1 = await settle(client, 'clubA', 'pConc', 200, 'SEQ_200a', 3000);
   var s2 = await settle(client, 'clubA', 'pConc', 200, 'SEQ_200b', 3000);
   expect('200+200 on −500 → −100', s1.ok && s2.ok && Number(s2.balanceAfter) === -100, { s1: s1, s2: s2 }, bag);
 
   console.log('\n── Idempotency under concurrent same key ──');
-  await client.query(`DELETE FROM settlement_payments WHERE club_id='clubA' AND player_id='pConc'`);
-  await client.query(`DELETE FROM ledger_entries WHERE club_id='clubA' AND player_id='pConc' AND type='settlement_payment'`);
+  await client.query(`DELETE FROM settlement_records WHERE club_id='clubA' AND player_id='pConc'`);
+  await client.query(`DELETE FROM ledger_entries WHERE club_id='clubA' AND player_id='pConc' AND type='settlement_record'`);
   // Reset position to −500 via ticket only
   var i1 = new pg.Client({ connectionString: DEFAULT_URL });
   var i2 = new pg.Client({ connectionString: DEFAULT_URL });
@@ -186,7 +186,7 @@ async function main() {
   expect('same key → one executed', executed.length === 1, JSON.stringify(sameKey), bag);
   expect('same key → one idempotent replay', idem.length === 1, JSON.stringify(sameKey), bag);
   var sameCount = await client.query(
-    `SELECT count(*)::int AS c FROM settlement_payments WHERE payment_id='SETTLE_DIRECT_clubA_SAME_KEY'`
+    `SELECT count(*)::int AS c FROM settlement_records WHERE payment_id='SETTLE_DIRECT_clubA_SAME_KEY'`
   );
   expect('one payment row for same key', sameCount.rows[0].c === 1, sameCount.rows[0], bag);
 
@@ -213,11 +213,11 @@ async function main() {
   await lockHolder.query('BEGIN');
   await lockHolder.query('SELECT pg_advisory_xact_lock($1,$2)', [lk.key1, lk.key2]);
   var beforeCount = await lockWaiter.query(
-    `SELECT count(*)::int AS c FROM settlement_payments WHERE club_id='clubA' AND player_id='pConc'`
+    `SELECT count(*)::int AS c FROM settlement_records WHERE club_id='clubA' AND player_id='pConc'`
   );
   var timed = await settle(lockWaiter, 'clubA', 'pConc', 10, 'LOCK_TO', 500);
   var afterCount = await lockWaiter.query(
-    `SELECT count(*)::int AS c FROM settlement_payments WHERE club_id='clubA' AND player_id='pConc'`
+    `SELECT count(*)::int AS c FROM settlement_records WHERE club_id='clubA' AND player_id='pConc'`
   );
   await lockHolder.query('ROLLBACK');
   await lockHolder.end();
@@ -331,7 +331,7 @@ async function main() {
   expect('tickets not voided by bootstrap/settle', ticketStates.rows.every(function(r){
     return r.status === 'lost' || r.status === 'won';
   }), ticketStates.rows, bag);
-  expect('pure −500+600 still overpay', sc.applyPartialSettlement(-500, 600).error === 'overpay_blocked', null, bag);
+  expect('pure −500+600 still overpay', sc.applyPartialSettlement(-500, 600).error === 'over_settlement_blocked', null, bag);
   expect('pure 200+200 math → −100', sc.applyPartialSettlement(sc.applyPartialSettlement(-500, 200).after, 200).after === -100, null, bag);
   report.regression = {
     ticketsUnmutatedBySettlement: true,

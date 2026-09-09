@@ -10,7 +10,7 @@ Formula (authoritative):
 settlementBalance = openingBalance + ticketSettledNet(after epoch) + playerPaid − hostPaid
 ```
 
-Toward zero only; reject overpay; tickets may cross zero; settlement does **not** rewrite bankroll; `settlement_payments` is SoT for cash; bankroll = `balance_start` + tickets.
+Toward zero only; reject over-settlement; tickets may cross zero; settlement does **not** rewrite bankroll; `settlement_records` is SoT for cash; bankroll = `balance_start` + tickets.
 `openingBalance` comes only from explicit `settlement_opening_balances` bootstrap (default 0).
 
 ---
@@ -24,12 +24,12 @@ Toward zero only; reject overpay; tickets may cross zero; settlement does **not*
 | **DB value** | Per-player cutoff timestamp (ms) = `max(created_at)` among **historical epoch markers** in `ledger_entries` for that `(club_id, player_id)`. Loaded by `_loadSettlementCutoffs`. |
 | **Scope** | **Per club + player** (not account-wide, not club-global week alone). Same human in two clubs → two independent epochs. |
 | **Week** | Not a calendar week by itself. Past **weekly rollover** wrote markers that act as the floor; **new** rollovers must **not** write markers (`carryPreserved: true`). |
-| **Immutable?** | Historical markers are retained and never rewritten by Option A cash settle. New cash settle writes `settlement_payments` (+ optional audit `ledger_entries.type='settlement_payment'`) and must **not** create `SETTLEMENT_APPLIED_*` / `weekly_rollover` epoch markers. |
+| **Immutable?** | Historical markers are retained and never rewritten by Option A settlement recording. New settlement recording writes `settlement_records` (+ optional audit `ledger_entries.type='settlement_record'`) and must **not** create `SETTLEMENT_APPLIED_*` / `weekly_rollover` epoch markers. |
 | **First launch / no markers** | `cutoffMs = 0` → **every** graded ticket for that club+player counts (lifetime net). **Never** treat “lifetime” as intentional without an explicit epoch (bootstrap or historical marker). |
 | **Ticket inclusion** | Graded ticket enters net iff `gradeMs = Date(graded_at \|\| placed_at) > cutoffMs`. Boundary `gradeMs <= cutoffMs` is **excluded** (at-boundary = before epoch). |
 | **Cancelled / void / push** | Statuses `canceled`, `voided`, `deleted`, `push`, `pushed` are **excluded** from ticketSettledNet and openRisk (cancel refund is bankroll, not settlement). |
 | **Active / open** | Contribute to `openRisk` only; not to ticketSettledNet. |
-| **Payments after epoch** | Confirmed `settlement_payments` with `confirmed_at \|\| created_at > cutoff` count toward `playerPaid` / `hostPaid`. |
+| **Payments after epoch** | Confirmed `settlement_records` with `confirmed_at \|\| created_at > cutoff` count toward `playerPaid` / `hostPaid`. |
 
 ### Marker recognition (`isHistoricalEpochMarker`)
 
@@ -38,7 +38,7 @@ Counts as epoch floor when:
 - `type ∈ {weekly_rollover, WEEKLY_ROLLOVER}`, **or**
 - `type ∈ {SETTLEMENT_APPLIED, settlement_applied}` **and** (`id` starts with `SETTLEMENT_APPLIED_` **or** `reason` starts with `weekly_rollover:`)
 
-Cash settlement ledger rows (`settlement` / `settlement_payment` / non-rollover `SETTLEMENT_APPLIED`) do **not** advance epoch.
+Settlement recordingment ledger rows (`settlement` / `settlement_payment` / non-rollover `SETTLEMENT_APPLIED`) do **not** advance epoch.
 
 ### Hard rule
 
@@ -55,14 +55,14 @@ Goal: existing players must not silently inherit unintended lifetime nets.
 | Lifetime ticket net ≈ −$12k, host does **not** want that as opening | Opening ≈ `$0` (or agreed amount) | At go-live `T0`, write one **historical epoch marker** per `(club_id, player_id)` with `created_at = T0` (same shape as legacy rollover `SETTLEMENT_APPLIED_*`). Pre-`T0` tickets drop out. Do **not** set opening = lifetime unless product explicitly chooses that. |
 | +$300 unresolved graded after intended epoch | Enters as `ticketSettledNet = +300` | Ensure those tickets have `graded_at > T0` (or no marker and they are the only graded tickets you intend to count). |
 | Already `$0` / fully settled historically | Stays `$0`; old tickets do not reappear | Epoch marker at/after last clear; no post-epoch graded tickets; no post-epoch payments. |
-| Intentional carry-in of prior debt (e.g. −$500) | Opening = that amount | Prefer: epoch at `T0` **plus** one confirmed `settlement_payments` opening row **or** leave matching post-epoch tickets. Avoid mutating `balance_start` for settlement. |
+| Intentional carry-in of prior debt (e.g. −$500) | Opening = that amount | Prefer: epoch at `T0` **plus** one confirmed `settlement_records` opening row **or** leave matching post-epoch tickets. Avoid mutating `balance_start` for settlement. |
 
 ### Safest bootstrap order (non-prod rehearsal → later prod)
 
 1. Snapshot read-only: per club/player lifetime net, last epoch marker, open tickets.  
 2. Product sign-off: opening = `$0` vs intentional carry.  
 3. In a **transaction on non-prod first**: insert epoch markers at `T0` for all active members (or only clubs flipping on).  
-4. Optionally insert opening `settlement_payments` if carry-in ≠ ticket residual after epoch.  
+4. Optionally insert opening `settlement_records` if carry-in ≠ ticket residual after epoch.  
 5. Verify preview: `$0` players stay `$0`; intentional residues match; bankroll unchanged.  
 6. **Rollback plan:** delete go-live markers / opening payments by known id prefix; never delete historical pre-`T0` markers.
 
@@ -87,10 +87,10 @@ hostPaid         = Σ confirmed host_paid_player             // after epoch
 settlementBalance = ticketSettledNet + playerPaid − hostPaid
 ```
 
-Apply payment (toward zero only):
+Record settlement (toward zero only):
 
 - Direction derived from sign: `−` → `player_paid_host`; `+` → `host_paid_player`
-- Reject `amount ≤ 0`, balance already `0`, or `amount > |balance|` (`overpay_blocked`)
+- Reject `amount ≤ 0`, balance already `0`, or `amount > |balance|` (`over_settlement_blocked`)
 
 **Matrix:**
 
@@ -127,7 +127,7 @@ Apply **only** to isolated fixture DB (`fixtures/nonprod/`), never to `padgicwrr
 
 SQL applied (exact files):
 
-1. `migrations/PROPOSED_settlement_payments.sql`
+1. `migrations/PROPOSED_settlement_records.sql`
 2. `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql`
 3. Fixture schema bootstrap: `fixtures/nonprod/schema_minimal.sql`
 
@@ -139,7 +139,7 @@ Harness: `fixtures/nonprod/apply_and_test.js` (local Postgres) + JS sim fallback
 
 | Constraint | Status |
 |---|---|
-| `settlement_payments.direction` check | `player_paid_host` \| `host_paid_player` |
+| `settlement_records.direction` check | `player_paid_host` \| `host_paid_player` |
 | `amount > 0`, `amount_cents > 0`, cents match amount | Yes |
 | Unique `(club_id, ledger_settlement_id)` when set | Yes |
 | Payment PK `payment_id` | Club-prefixed by API (`SETTLE_DIRECT_{club}_{key}`) |
@@ -151,9 +151,9 @@ Harness: `fixtures/nonprod/apply_and_test.js` (local Postgres) + JS sim fallback
 ## 7. STALE PREVIEW / CONCURRENCY
 
 - Backend **recomputes** authoritative `settlementBalance` inside `settle-player`; FE preview amount is not trusted as SoT.
-- Stale FE preview −500 with actual −200 and pay 500 → `overpay_blocked` with `maxAmount: 200` (cap/reject against **−200**).
+- Stale FE preview −500 with actual −200 and pay 500 → `over_settlement_blocked` with `maxAmount: 200` (cap/reject against **−200**).
 - FE does not send `balance_before` as authority; server returns `balanceBefore` / `balanceAfter`.
-- **Remaining race (resolved on this branch):** serialize settle via `settle_payment_option_a_tx` + `pg_advisory_xact_lock(club,player)` with lock_timeout. See `docs/SETTLEMENT_FINAL_NONPROD_GATE.md`.
+- **Remaining race (resolved on this branch):** serialize settle via `record_settlement_option_a_tx` + `pg_advisory_xact_lock(club,player)` with lock_timeout. See `docs/SETTLEMENT_FINAL_NONPROD_GATE.md`.
 
 ---
 
@@ -190,11 +190,11 @@ Asserted in tests + `bankrollMutated: false` on settle response.
 |---|---|---|
 | **0** | Freeze product sign-off on epoch + openings | N/A |
 | **1** | Deploy BE/FE code (feature branch → release) **without** DB migrate | Revert deploy |
-| **2** | Apply `settlement_payments` on prod (additive) | `DROP TABLE settlement_payments` (if unused) |
+| **2** | Apply `settlement_records` on prod (additive) | `DROP TABLE settlement_records` (if unused) |
 | **3** | Apply `cancel_bet_tx` isolation (replace function; keep backup `pg_get_functiondef`) | Restore prior function body |
 | **4** | Bootstrap epoch markers / opening payments per §2 | Delete bootstrap ids by prefix |
 | **5** | Enable host settle UI; smoke one club | Disable UI; void mistaken payments |
-| **6** | Monitor overpay / missing-table / cancel errors | Hotfix / function restore |
+| **6** | Monitor over-settlement / missing-table / cancel errors | Hotfix / function restore |
 
 **Never:** merge-main casually; migrate without backup; use lifetime net as opening without sign-off; rewrite bankroll via settlement.
 
