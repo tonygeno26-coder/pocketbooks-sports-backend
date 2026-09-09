@@ -9,6 +9,7 @@ const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
 const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const owlsLiveScores = require('./lib/owls-live-scores');
+const settlementCarry = require('./lib/settlement-carry');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5437,13 +5438,14 @@ function _deriveBalanceFromLedgerEntries(startingBalance, entries) {
 async function _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance) {
   var ledgerAvailable = null;
   var ledgerEntryCount = 0;
-  if (!sb || !playerId) return { ledgerAvailable: null, ledgerEntryCount: 0 };
+  // MERGE BLOCKER invariant: never aggregate ledger by player_id alone.
+  if (!sb || !playerId || !clubId) return { ledgerAvailable: null, ledgerEntryCount: 0 };
   try {
     var lq = sb.from('ledger_entries')
       .select('id,type,amount,balance_before,balance_after,created_at,ticket_id')
+      .eq('club_id', clubId)
       .eq('player_id', playerId)
       .order('created_at', { ascending: true });
-    if (clubId) lq = lq.eq('club_id', clubId);
     var { data: ledgerRows, error: lErr } = await lq;
     if (lErr) throw lErr;
     ledgerEntryCount = (ledgerRows || []).length;
@@ -5451,7 +5453,7 @@ async function _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance) 
       ledgerAvailable = _deriveBalanceFromLedgerEntries(startingBalance, ledgerRows);
     }
   } catch (_le) {
-    console.warn('[ledger-available] player=' + playerId + ':', (_le && _le.message) || _le);
+    console.warn('[ledger-available] club=' + clubId + ' player=' + playerId + ':', (_le && _le.message) || _le);
   }
   return { ledgerAvailable: ledgerAvailable, ledgerEntryCount: ledgerEntryCount };
 }
@@ -5503,6 +5505,7 @@ async function _creditPlayerAccount(opts) {
   if (!(amt > 0)) return { ok:false, error:'invalid_amount' };
   const clubId = opts.clubId || '';
   const playerId = opts.playerId || '';
+  if (!clubId || !playerId) return { ok:false, error:'missing_club_or_player' };
   const eventType = opts.eventType;
   const leType = opts.ledgerEntriesType || eventType;
   const iKey = opts.idempotencyKey || ('CR_'+eventType+'_'+Date.now());
@@ -5514,9 +5517,10 @@ async function _creditPlayerAccount(opts) {
   } catch(_e) {}
   let before = startBal;
   try {
+    // Always scope ledger by club_id + player_id (never player alone).
     var lq = sb.from('ledger_entries').select('amount,balance_after,created_at')
-      .eq('player_id', playerId).order('created_at', { ascending:true });
-    if (clubId) lq = lq.eq('club_id', clubId);
+      .eq('club_id', clubId).eq('player_id', playerId)
+      .order('created_at', { ascending:true });
     const { data: ledRows } = await lq;
     if (ledRows && ledRows.length)
       before = _deriveBalanceFromLedgerEntries(startBal, ledRows);
@@ -5564,13 +5568,15 @@ async function _fetchPlayerLedger(clubId, playerId) {
 
 // Derive available balance from ledger + active tickets
 async function _deriveAvailableBalance(clubId, playerId, startingLimit) {
+  if (!clubId || !playerId) return { ledgerBal: null, openRisk: 0, available: null, rows: [], error: 'missing_club_or_player' };
   const rows = await _fetchPlayerLedger(clubId, playerId);
   let activeTix = [];
   try {
     const sb = getSupabase();
     if (sb) {
+      // MUST filter club_id — open risk in Club B must not reduce Club A balance.
       const { data } = await sb.from('tickets').select('risk_amount')
-        .eq('player_id',playerId).in('status',['active','open']);
+        .eq('club_id', clubId).eq('player_id', playerId).in('status',['active','open']);
       activeTix = data||[];
     }
   } catch(_e){}
@@ -7597,16 +7603,19 @@ async function _idemComplete(key, responseStatus, responseBody) {
 // Express middleware factory: enforce idempotency for money endpoints
 function requireIdempotency(opts) {
   return async function(req, res, next) {
-    const key = (req.headers['idempotency-key'] || '').trim() ||
+    const clientKey = (req.headers['idempotency-key'] || '').trim() ||
                 (req.body && req.body.idempotencyKey) || null;
-    if (!key && opts && opts.required) {
+    if (!clientKey && opts && opts.required) {
       return res.status(400).json({ ok:false, error:'missing_idempotency_key',
         hint:'Include Idempotency-Key header or idempotencyKey in body' });
     }
-    if (!key) return next(); // optional endpoints skip
+    if (!clientKey) return next(); // optional endpoints skip
 
     const actor  = req._actor || {};
-    const clubId = req._clubId || '';
+    // Prefer canonical club from middleware; fall back to body/query.
+    const clubId = req._clubId || (req.body && req.body.clubId) || (req.query && req.query.clubId) || '';
+    // Club-scoped storage key: same client key in Club A must never block/replay Club B.
+    const key = clubId ? (String(clubId) + '::' + clientKey) : clientKey;
     const result = await _idemCheck(key, req.path, actor.actorId||'anon', clubId, req.body);
 
     if (result.action === 'replay') {
@@ -7625,6 +7634,7 @@ function requireIdempotency(opts) {
 
     // Store key for completion after handler
     req._idemKey = key;
+    req._idemClientKey = clientKey;
     // Monkey-patch res.json to auto-complete idempotency after response
     const _origJson = res.json.bind(res);
     res.json = function(body) {
@@ -12937,22 +12947,23 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId', stats:null });
   try {
     // Load tickets (club-scoped). Extra columns are additive for the host Bets tab.
     let tq = sb.from('tickets')
       .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at,insurance_enabled,cashout_offer_amount,cashout_offer_status')
+      .eq('club_id', clubId)
       .order('placed_at', { ascending:false })
       .limit(1000);
-    if (clubId)   tq = tq.eq('club_id',   clubId);
     if (playerId) tq = tq.eq('player_id', playerId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    // Load recent ledger entries
+    // Load recent ledger entries — club-scoped only (null-club legacy rows excluded by design)
     let lq = sb.from('ledger_entries')
       .select('id,ticket_id,player_id,type,amount,balance_before,balance_after,reason,created_at')
+      .eq('club_id', clubId)
       .order('created_at', { ascending:false }).limit(200);
-    if (clubId)   lq = lq.eq('club_id',   clubId);
     if (playerId) lq = lq.eq('player_id', playerId);
     const { data: ledger, error: lErr } = await lq;
     if (lErr) throw lErr;
@@ -12985,8 +12996,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     var playerMemberCount = 0;
     var skippedHostIds = {};
     try {
-      var memQ = sb.from('club_memberships').select('actor_id,role,status');
-      if (clubId) memQ = memQ.eq('club_id', clubId);
+      var memQ = sb.from('club_memberships').select('actor_id,role,status')
+        .eq('club_id', clubId);
       const { data: memRows, error: memErr } = await memQ;
       if (memErr) throw memErr;
       membershipCount = (memRows||[]).length;
@@ -13012,8 +13023,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
 
     // Starting balances from club_members (canonical balance table).
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start,status');
-      if (clubId) plq = plq.eq('club_id', clubId);
+      let plq = sb.from('club_members').select('player_id,balance_start,status')
+        .eq('club_id', clubId);
       const { data: plRows, error: mErr } = await plq;
       if (mErr) throw mErr;
       (plRows||[]).forEach(function(r) {
@@ -13320,17 +13331,20 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
 // ────────────────────────────────────────────────────────────────────────────
 
 
-// Last SETTLEMENT_APPLIED / settlement / weekly rollover marker per player (cutoff for weekly nets)
+// Historical epoch cutoffs only — unpaid weeks cleared by PAST rollover markers
+// must not resurrect. Cash settlement and NEW weekly rollovers must NOT advance
+// this epoch (carry persists until betting nets or host payment).
 async function _loadSettlementCutoffs(sb, clubId, playerIds) {
   const map = {}; // playerId -> ISO timestamp ms
   if (!sb || !(playerIds||[]).length) return map;
   try {
     const { data: rows } = await sb.from('ledger_entries')
-      .select('player_id,type,created_at')
+      .select('id,player_id,type,reason,created_at')
       .eq('club_id', clubId)
       .in('player_id', playerIds)
-      .in('type', ['settlement','SETTLEMENT_APPLIED','weekly_rollover','WEEKLY_ROLLOVER']);
+      .in('type', ['SETTLEMENT_APPLIED','weekly_rollover','WEEKLY_ROLLOVER']);
     (rows||[]).forEach(function(r){
+      if (!settlementCarry.isHistoricalEpochMarker(r)) return;
       const pid = String(r.player_id||'');
       const ms = new Date(r.created_at||0).getTime();
       if (!pid || !ms) return;
@@ -13339,19 +13353,78 @@ async function _loadSettlementCutoffs(sb, clubId, playerIds) {
   } catch(_e) {
     console.warn('[settlement-cutoff] ledger_entries read failed:', _e.message||_e);
   }
-  try {
-    const { data: rolls } = await sb.from('weekly_rollovers')
-      .select('performed_at').eq('club_id', clubId)
-      .order('performed_at', { ascending:false }).limit(1);
-    if (rolls && rolls[0] && rolls[0].performed_at) {
-      const rms = new Date(rolls[0].performed_at).getTime();
-      playerIds.forEach(function(pid){
-        const k = String(pid);
-        if (!map[k] || rms > map[k]) map[k] = rms;
-      });
-    }
-  } catch(_e2) {}
+  // Intentionally do NOT advance epoch from weekly_rollovers.performed_at —
+  // new rollovers must preserve outstanding settlement carry.
   return map;
+}
+
+/** Ticket settled net (player POV) after epoch cutoff + open risk. */
+function _ticketNetAfterCutoff(tickets, cutoffMs) {
+  var settledNet = 0, openRisk = 0, weekWagered = 0, weekWon = 0, weekLost = 0;
+  (tickets||[]).forEach(function(t){
+    var s = String(t.status||'').toLowerCase();
+    var r = parseFloat(t.risk_amount)||0;
+    var p = parseFloat(t.potential_profit)||0;
+    if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
+    if (s==='active'||s==='open') { openRisk += r; weekWagered += r; return; }
+    var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
+    if (cutoffMs && gradeMs && gradeMs <= cutoffMs) return;
+    if (s==='won') { settledNet += p; weekWon += p; weekWagered += r; }
+    else if (s==='lost') { settledNet -= r; weekLost += r; weekWagered += r; }
+  });
+  return {
+    settledNet: settlementCarry.rnd(settledNet),
+    openRisk: settlementCarry.rnd(openRisk),
+    weekWagered: settlementCarry.rnd(weekWagered),
+    weekWon: settlementCarry.rnd(weekWon),
+    weekLost: settlementCarry.rnd(weekLost)
+  };
+}
+
+/** Confirmed settlement payments after epoch → playerPaidHost / hostPaidPlayer. */
+async function _loadSettlementPaymentsAfter(sb, clubId, playerIds, cutoffMap) {
+  var byPid = {};
+  (playerIds||[]).forEach(function(pid){
+    byPid[String(pid)] = { playerPaidHost: 0, hostPaidPlayer: 0 };
+  });
+  if (!sb || !(playerIds||[]).length) return byPid;
+  try {
+    const { data: rows } = await sb.from('settlement_payments')
+      .select('player_id,direction,amount,confirmed_at,created_at,status')
+      .eq('club_id', clubId)
+      .eq('status', 'confirmed')
+      .in('player_id', playerIds);
+    (rows||[]).forEach(function(r){
+      var pid = String(r.player_id||'');
+      if (!byPid[pid]) byPid[pid] = { playerPaidHost: 0, hostPaidPlayer: 0 };
+      var cut = (cutoffMap && cutoffMap[pid]) || 0;
+      var payMs = new Date(r.confirmed_at || r.created_at || 0).getTime();
+      if (cut && payMs && payMs <= cut) return;
+      var a = parseFloat(r.amount)||0;
+      if (r.direction === 'player_paid_host') byPid[pid].playerPaidHost += a;
+      else if (r.direction === 'host_paid_player') byPid[pid].hostPaidPlayer += a;
+    });
+  } catch(_e) {
+    console.warn('[settlement-payments] read failed:', _e.message||_e);
+  }
+  Object.keys(byPid).forEach(function(pid){
+    byPid[pid].playerPaidHost = settlementCarry.rnd(byPid[pid].playerPaidHost);
+    byPid[pid].hostPaidPlayer = settlementCarry.rnd(byPid[pid].hostPaidPlayer);
+  });
+  return byPid;
+}
+
+/** Authoritative carried settlement balance for one player. */
+async function _calcPlayerSettlementCarry(sb, clubId, playerId, ticketsForPlayer, cutoffMs) {
+  var net = _ticketNetAfterCutoff(ticketsForPlayer || [], cutoffMs || 0);
+  var pays = await _loadSettlementPaymentsAfter(sb, clubId, [playerId], cutoffMs ? { [String(playerId)]: cutoffMs } : {});
+  var p = pays[String(playerId)] || { playerPaidHost: 0, hostPaidPlayer: 0 };
+  var carry = settlementCarry.deriveSettlementCarry(net.settledNet, p.playerPaidHost, p.hostPaidPlayer);
+  var split = settlementCarry.splitOwes(carry);
+  return Object.assign({ ticketSettledNet: net.settledNet, openRisk: net.openRisk,
+    weekWagered: net.weekWagered, weekWon: net.weekWon, weekLost: net.weekLost,
+    playerPaidHost: p.playerPaidHost, hostPaidPlayer: p.hostPaidPlayer,
+    settlementBalance: carry }, split);
 }
 
 // GET /api/host/settlements-preview?clubId= — read-only settlement preview from DB
@@ -13360,11 +13433,12 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   try {
-    // Load all tickets for this club
+    // Load all tickets for this club only
     let tq = sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at,type');
-    if (clubId) tq = tq.eq('club_id', clubId);
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at,type')
+      .eq('club_id', clubId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
@@ -13373,8 +13447,8 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     var memberMap = {};
     var skippedHostIds = {};
     try {
-      var memQ = sb.from('club_memberships').select('actor_id,role,status');
-      if (clubId) memQ = memQ.eq('club_id', clubId);
+      var memQ = sb.from('club_memberships').select('actor_id,role,status')
+        .eq('club_id', clubId);
       const { data: memRows, error: memErr } = await memQ;
       if (memErr) throw memErr;
       (memRows||[]).forEach(function(r) {
@@ -13391,8 +13465,8 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     } catch(_e) { console.warn('[settlements-preview] club_memberships fetch error:', _e.message); }
 
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start,status');
-      if (clubId) plq = plq.eq('club_id', clubId);
+      let plq = sb.from('club_members').select('player_id,balance_start,status')
+        .eq('club_id', clubId);
       const { data: plRows } = await plq;
       (plRows||[]).forEach(function(r) {
         if (r.player_id == null) return;
@@ -13464,26 +13538,43 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
 
     var cutoffMap = await _loadSettlementCutoffs(sb, clubId, Object.keys(byPlayer).concat(Object.keys(memberMap)));
 
+    // Group tickets by player for carry derivation
+    var ticketsByPid = {};
     (tickets||[]).forEach(function(t) {
       var pid  = String(t.player_id || 'unknown');
       if (skippedHostIds[pid]) return;
-      var s    = (t.status||'').toLowerCase();
-      var risk = parseFloat(t.risk_amount)||0;
-      var prof = parseFloat(t.potential_profit)||0;
-      var p    = getOrCreate(pid, nameById[pid] || t.player_username);
+      var p = getOrCreate(pid, nameById[pid] || t.player_username);
       var pMs  = t.placed_at ? new Date(t.placed_at).getTime() : 0;
       if (pMs && (!p.lastTicketAt || pMs > new Date(p.lastTicketAt).getTime())) p.lastTicketAt = t.placed_at;
-      if (s==='canceled'||s==='voided'||s==='deleted'||s==='push'||s==='pushed') return;
-      if (s==='active'||s==='open')  { p.openRisk += risk; p.weekWagered += risk; return; }
-      // Settled nets / week stats only count AFTER last SETTLEMENT_APPLIED cutoff (no double-count)
-      var cut = cutoffMap[pid] || 0;
-      var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
-      if (cut && gradeMs && gradeMs <= cut) return;
-      if (s==='won')             { p.settledNet += prof; p.weekWon += prof; p.weekWagered += risk; }
-      else if (s==='lost')       { p.settledNet -= risk; p.weekLost += risk; p.weekWagered += risk; }
+      if (!ticketsByPid[pid]) ticketsByPid[pid] = [];
+      ticketsByPid[pid].push(t);
     });
 
-    // Ledger-derived current balances — per-player (same as /api/player/dashboard).
+    var payMap = await _loadSettlementPaymentsAfter(sb, clubId, Object.keys(byPlayer), cutoffMap);
+
+    Object.keys(byPlayer).forEach(function(pid) {
+      var cut = cutoffMap[pid] || 0;
+      var net = _ticketNetAfterCutoff(ticketsByPid[pid] || [], cut);
+      var pays = payMap[pid] || { playerPaidHost: 0, hostPaidPlayer: 0 };
+      var carry = settlementCarry.deriveSettlementCarry(net.settledNet, pays.playerPaidHost, pays.hostPaidPlayer);
+      var split = settlementCarry.splitOwes(carry);
+      var p = byPlayer[pid];
+      p.settledNet = net.settledNet;
+      p.openRisk = net.openRisk;
+      p.weekWagered = net.weekWagered;
+      p.weekWon = net.weekWon;
+      p.weekLost = net.weekLost;
+      p.weekNet = carry; // carried settlement position (player POV)
+      p.ticketSettledNet = net.settledNet;
+      p.playerPaidHost = pays.playerPaidHost;
+      p.hostPaidPlayer = pays.hostPaidPlayer;
+      p.settlementBalance = split.settlementBalance;
+      p.owesHost = split.owesHost;
+      p.hostOwes = split.hostOwes;
+    });
+
+    // Ledger-derived betting bankroll — per-player (same as /api/player/dashboard).
+    // Distinct from settlementBalance (cash carry).
     var ledgerBalByPid = {};
     try {
       var allPids = Object.keys(byPlayer);
@@ -13502,24 +13593,20 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     } catch(_lb) { console.warn('[settlements-preview] ledger balance error:', _lb.message); }
 
     Object.values(byPlayer).forEach(function(p) {
-      p.settledNet  = rnd(p.settledNet);
-      p.openRisk    = rnd(p.openRisk);
-      p.weekWagered = rnd(p.weekWagered);
-      p.weekWon     = rnd(p.weekWon);
-      p.weekLost    = rnd(p.weekLost);
-      p.weekNet     = rnd(p.settledNet); // player POV: + = player won / host owes
-      if (p.settledNet < 0) { p.owesHost = rnd(Math.abs(p.settledNet)); p.hostOwes = 0; }
-      else                  { p.hostOwes = rnd(p.settledNet); p.owesHost = 0; }
       var start = (memberMap[p.playerId]&&memberMap[p.playerId].balance_start!=null)
         ? rnd(memberMap[p.playerId].balance_start) : null;
       p.startingBalance = start;
       p.balance_start   = start; // alias for clients expecting snake_case
-      p.currentBalance = ledgerBalByPid[p.playerId] != null ? rnd(ledgerBalByPid[p.playerId]) : start;
-      p.availableBalance = p.currentBalance;
-      p.balance = p.currentBalance;
-      p.balanceSource = ledgerBalByPid[p.playerId] != null ? 'ledger' : (start != null ? 'balance_start' : null);
-      // Next week starts from current available balance (open risk already held in ledger)
-      p.startingBalanceNextWeek = p.currentBalance;
+      // Settlements "Current Balance" = carried settlement position (signed).
+      // Betting bankroll kept as availableBalance / bankrollBalance for Players tab parity.
+      p.bankrollBalance = ledgerBalByPid[p.playerId] != null ? rnd(ledgerBalByPid[p.playerId]) : start;
+      p.availableBalance = p.bankrollBalance;
+      p.currentBalance = p.settlementBalance; // signed carry for Host Settlements UI
+      p.balance = p.settlementBalance;
+      p.balanceSource = 'settlement_carry';
+      p.bankrollSource = ledgerBalByPid[p.playerId] != null ? 'ledger' : (start != null ? 'balance_start' : null);
+      // Next week betting start remains bankroll; settlement carry persists separately
+      p.startingBalanceNextWeek = p.bankrollBalance;
       p.settlementCutoffAt = cutoffMap[p.playerId] ? new Date(cutoffMap[p.playerId]).toISOString() : null;
     });
 
@@ -13633,140 +13720,256 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
   }
 });
 
-// POST /api/host/settle-player — execute settlement, write ledger + audit
+// POST /api/host/settle-player — partial/full settlement toward zero (never crosses zero)
 app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
 
-  // Validate inputs
   const VALID_DIR = new Set(['player_paid_host','host_paid_player']);
   const errors = [];
   if (!clubId)         errors.push('missing_clubId');
   if (!playerId)       errors.push('missing_playerId');
   if (!idempotencyKey) errors.push('missing_idempotencyKey');
-  if (!VALID_DIR.has(direction)) errors.push('invalid_direction:'+direction);
   const amt = parseFloat(amount);
-  if (isNaN(amt) || amt <= 0) errors.push('invalid_amount');
+  if (isNaN(amt) || amt <= 0) errors.push('invalid_amount'); // blank/$0 = no-op
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
   try {
-    // 1. Recalculate preview server-side
-    let tq = sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id')
+    // Authorize: player must belong to this club (club_members or club_memberships).
+    var memberOk = false;
+    try {
+      const { data: cm } = await sb.from('club_members').select('player_id')
+        .eq('club_id', clubId).eq('player_id', playerId).limit(1);
+      if (cm && cm.length) memberOk = true;
+    } catch(_e) {}
+    if (!memberOk) {
+      try {
+        const { data: ms } = await sb.from('club_memberships').select('actor_id,status')
+          .eq('club_id', clubId).eq('actor_id', playerId).limit(1);
+        var st = ms && ms[0] && String(ms[0].status||'').toLowerCase();
+        if (st === 'active' || st === 'approved') memberOk = true;
+      } catch(_e2) {}
+    }
+    if (!memberOk)
+      return res.status(403).json({ ok:false, error:'player_not_in_club', clubId, playerId });
+
+    const cutoffMap = await _loadSettlementCutoffs(sb, clubId, [playerId]);
+    const cutoffMs = cutoffMap[String(playerId)] || 0;
+
+    const { data: tickets, error: tErr } = await sb.from('tickets')
+      .select('id,status,risk_amount,potential_profit,player_id,graded_at,placed_at')
       .eq('club_id', clubId).eq('player_id', playerId);
-    const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
-    var owesHost=0, hostOwes=0;
-    (tickets||[]).forEach(function(t){
-      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
-      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed'||s==='active'||s==='open') return;
-      if (s==='lost') owesHost += r;
-      if (s==='won')  hostOwes += p;
-    });
-    // Net
-    var net = hostOwes - owesHost; // positive = host owes player
-    if (net > 0) { hostOwes=net; owesHost=0; } else { owesHost=-net; hostOwes=0; }
+    const carryInfo = await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs);
+    const before = carryInfo.settlementBalance;
+    const applied = settlementCarry.applyPartialSettlement(before, amt);
 
-    // Direction / overpay validation — with prior payment deduction (BUG56_FIXED_prior_payments_subtracted)
-    // Subtract confirmed prior payments to derive remaining payable (Bugs #5/#6 fix).
-    var priorPaid = 0;
-    try {
-      const { data: _priorRows } = await sb.from('settlement_payments')
-        .select('amount')
-        .eq('club_id', clubId).eq('player_id', playerId)
-        .eq('direction', direction).eq('status', 'confirmed');
-      priorPaid = (_priorRows||[]).reduce(function(s,r){ return s+parseFloat(r.amount||0); }, 0);
-      priorPaid = Math.round(priorPaid * 100) / 100;
-    } catch(_prErr) { console.warn('[settle-player] prior payments fetch error:', _prErr.message); }
-
-    if (direction==='player_paid_host' && owesHost<=0)
-      return res.status(400).json({ ok:false, error:'player_does_not_owe_host', owesHost, hostOwes });
-    if (direction==='host_paid_player' && hostOwes<=0)
-      return res.status(400).json({ ok:false, error:'host_does_not_owe_player', owesHost, hostOwes });
-    var grossAmt = direction==='player_paid_host' ? owesHost : hostOwes;
-    var maxAmt   = Math.round(Math.max(0, grossAmt - priorPaid) * 100) / 100;
-    if (amt > maxAmt + 0.01)
-      return res.status(400).json({ ok:false, error:'overpay_blocked', amount:amt,
-        maxAmount:maxAmt, grossOwed:grossAmt, priorPaid, remaining:maxAmt });
-
-    // 2. Phase I: settle_player_tx RPC (atomic canonical ledger)
-    const rpcDir = direction==='host_paid_player' ? 'host_owes_player' : 'player_owes_host';
-    const settlementId = idempotencyKey; // use idempotencyKey as settlementId for deduplication
-    const settleResult = await _callMoneyRpc('settle_player_tx', {
-      p_settlement_id:   settlementId,
-      p_club_id:         clubId,
-      p_player_id:       playerId,
-      p_amount:          amt,
-      p_direction:       rpcDir,
-      p_idempotency_key: idempotencyKey,
-      p_created_by:      (req._actor&&req._actor.actorId)||'host'
-    });
-    if (!settleResult.ok && !settleResult.idempotent)
-      return res.status(400).json({ ok:false, error:settleResult.error||'settlement_failed' });
-
-    // Register in settlement_payments so payment-confirm sees it as already done (R1_FIXED_double_settlement_guard)
-    // This prevents payment-confirm from writing a second SETTLEMENT_APPLIED for the same debt.
-    if (!settleResult.idempotent) {
-      const _payId = 'SETTLE_DIRECT_'+idempotencyKey;
-      sb.from('settlement_payments').upsert({
-        payment_id: _payId, period_id: 'DIRECT', revision: 0,
-        club_id: clubId, player_id: playerId, direction, amount: amt,
-        method: 'direct', status: 'confirmed', note: note||null,
-        created_at: new Date().toISOString(), created_by: (req._actor&&req._actor.actorId)||'host',
-        confirmed_at: new Date().toISOString(), confirmed_by: (req._actor&&req._actor.actorId)||'host',
-        ledger_written: true, ledger_settlement_id: idempotencyKey
-      }, { onConflict: 'payment_id' }).then(()=>{}, function(e){ console.warn('[settle-player] payment_row write error:', e.message); });
+    if (!applied.ok) {
+      if (applied.error === 'overpay_blocked') {
+        return res.status(400).json({
+          ok:false, error:'overpay_blocked',
+          amount: amt, maxAmount: applied.maxAmount,
+          balanceBefore: before,
+          message: applied.message || ('Settlement cannot cross zero. Max $'+applied.maxAmount.toFixed(2))
+        });
+      }
+      if (applied.error === 'balance_already_zero' || applied.error === 'no_op_zero_or_blank') {
+        return res.status(400).json({
+          ok:false, error: applied.error,
+          balanceBefore: before, maxAmount: 0
+        });
+      }
+      return res.status(400).json({ ok:false, error: applied.error, balanceBefore: before });
     }
 
-    // Legacy ledger_entries mirror (fire-and-forget)
+    // Direction must match carry sign (or omit — server derives)
+    const derivedDir = applied.direction;
+    if (direction && direction !== derivedDir) {
+      return res.status(400).json({
+        ok:false, error:'direction_mismatch',
+        expected: derivedDir, got: direction,
+        balanceBefore: before,
+        owesHost: carryInfo.owesHost, hostOwes: carryInfo.hostOwes
+      });
+    }
+    const finalDir = derivedDir;
+
+    // Option A: settlement_payments is the authoritative payment SoT.
+    // Do NOT call settle_player_tx (absent in prod) and do NOT rewrite bankroll.
+    const settlementId = String(clubId) + '::' + String(idempotencyKey);
+    const paymentId = 'SETTLE_DIRECT_'+clubId+'_'+idempotencyKey;
+    const actorId = (req._actor&&req._actor.actorId)||'host';
     var executedAt = new Date().toISOString();
-    sb.from('ledger_entries').upsert({
-      id:idempotencyKey, club_id:clubId, player_id:playerId,
-      type:'settlement', amount:Math.round((rpcDir==='host_owes_player'?amt:-amt)*100)/100,
-      reason:direction+(note?': '+note:''), created_at:executedAt, created_by:'host',
-      settlement_week:settlementWeek||null
-    }, { onConflict:'id' }).then(()=>{},()=>{});
+    var balanceAfter = applied.after;
+    var idempotent = false;
 
-    // 3. Audit event
-    await sb.from('audit_events').insert({
-      event_type: 'settlement_executed',
-      club_id: clubId, player_id: playerId,
-      payload: { direction, amount:amt, maxAmount:maxAmt, settlementWeek, idempotencyKey,
-                 note:note||null, balanceAfter:settleResult.balance_after }
-    });
+    // Idempotent replay if this club-scoped payment already exists.
+    try {
+      const { data: priorPay } = await sb.from('settlement_payments')
+        .select('payment_id,amount,direction,status,confirmed_at')
+        .eq('payment_id', paymentId)
+        .eq('club_id', clubId)
+        .limit(1);
+      if (priorPay && priorPay[0] && String(priorPay[0].status||'') === 'confirmed') {
+        idempotent = true;
+        balanceAfter = (await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs)).settlementBalance;
+      }
+    } catch(_idErr) {
+      // Table may be absent until proposed migration is approved/applied.
+      if (_idErr && /relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(_idErr.message||_idErr))) {
+        return res.status(503).json({
+          ok:false,
+          error:'settlement_payments_missing',
+          hint:'Apply migrations/PROPOSED_settlement_payments.sql after approval. settle_player_tx is intentionally not used.'
+        });
+      }
+    }
 
-    // 4. Return updated preview
-    const { data: updatedPreview } = await sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,placed_at')
-      .eq('club_id', clubId);
-    var byPid = {};
-    (updatedPreview||[]).forEach(function(t){
-      var pid=t.player_id; if(!byPid[pid]) byPid[pid]={owesHost:0,hostOwes:0,openRisk:0};
-      var s=t.status.toLowerCase(),r=parseFloat(t.risk_amount)||0,p=parseFloat(t.potential_profit)||0;
-      if (s==='canceled'||s==='voided'||s==='pushed'||s==='push') return;
-      if (s==='active'||s==='open')  byPid[pid].openRisk+=r;
-      else if (s==='lost')           byPid[pid].owesHost+=r;
-      else if (s==='won')            byPid[pid].hostOwes+=p;
-    });
-    var rnd=function(v){return Math.round((isNaN(v)?0:v)*100)/100;};
-    Object.values(byPid).forEach(function(p){
-      var net=p.hostOwes-p.owesHost;
-      if(net>0){p.hostOwes=rnd(net);p.owesHost=0;}else{p.owesHost=rnd(-net);p.hostOwes=0;}
-      p.openRisk=rnd(p.openRisk);
-    });
+    if (!idempotent) {
+      const payRow = {
+        payment_id: paymentId,
+        period_id: settlementWeek || 'DIRECT',
+        revision: 0,
+        club_id: clubId,
+        player_id: playerId,
+        direction: finalDir,
+        amount: applied.applied,
+        amount_cents: Math.round(applied.applied * 100),
+        method: 'direct',
+        status: 'confirmed',
+        note: (note||'') + (note ? ' | ' : '') +
+          'carry:'+before.toFixed(2)+'→'+balanceAfter.toFixed(2),
+        created_at: executedAt,
+        created_by: actorId,
+        confirmed_at: executedAt,
+        confirmed_by: actorId,
+        ledger_written: false,
+        ledger_settlement_id: settlementId,
+        balance_before: before,
+        balance_after: balanceAfter
+      };
+      const { error: payErr } = await sb.from('settlement_payments').upsert(payRow, { onConflict: 'payment_id' });
+      if (payErr) {
+        if (/relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(payErr.message||payErr))) {
+          return res.status(503).json({
+            ok:false,
+            error:'settlement_payments_missing',
+            hint:'Apply migrations/PROPOSED_settlement_payments.sql after approval. settle_player_tx is intentionally not used.'
+          });
+        }
+        // Unique race → treat as idempotent replay
+        if (payErr.code === '23505') {
+          idempotent = true;
+          balanceAfter = (await _calcPlayerSettlementCarry(sb, clubId, playerId, tickets, cutoffMs)).settlementBalance;
+        } else {
+          throw payErr;
+        }
+      }
+    }
 
-    console.log('[settle-player] success idempotencyKey='+idempotencyKey+' direction='+direction+' amount='+amt);
+    // Audit-only ledger_entries mirror. Never writes balance_after bankroll fields —
+    // settlement cash must not contaminate ticket-derived bankroll presentation.
+    if (!idempotent) {
+      sb.from('ledger_entries').upsert({
+        id: settlementId, club_id: clubId, player_id: playerId,
+        type: 'settlement_payment',
+        amount: Math.round((finalDir==='host_paid_player'?applied.applied:-applied.applied)*100)/100,
+        reason: finalDir+' carry '+before.toFixed(2)+'→'+balanceAfter.toFixed(2)+(note?': '+note:''),
+        created_at: executedAt, created_by: actorId
+      }, { onConflict:'id' }).then(function(){}, function(){});
+    }
+
+    try {
+      await sb.from('audit_events').insert({
+        event_type: 'settlement_executed',
+        club_id: clubId, player_id: playerId,
+        payload: {
+          option: 'A',
+          direction: finalDir,
+          amount: applied.applied,
+          maxAmount: applied.maxAmount,
+          settlementWeek,
+          idempotencyKey,
+          settlementId,
+          paymentId,
+          note: note||null,
+          balanceBefore: before,
+          balanceAfter: balanceAfter,
+          hostActorId: actorId,
+          period: settlementWeek || null,
+          bankrollMutated: false,
+          settlePlayerTxUsed: false,
+          idempotent: idempotent
+        }
+      });
+    } catch(_ae) { console.warn('[settle-player] audit error:', _ae.message); }
+
+    const splitAfter = settlementCarry.splitOwes(balanceAfter);
+    console.log('[settle-player] optionA club='+clubId+' paymentId='+paymentId+
+      ' dir='+finalDir+' amt='+applied.applied+' carry '+before+'→'+balanceAfter+
+      ' idempotent='+idempotent);
+
     res.json({
-      ok: true, executed: true,
-      ledgerEntryId: idempotencyKey,
-      direction, amount: amt, settlementWeek,
-      previewAfter: byPid
+      ok: true,
+      executed: !idempotent,
+      idempotent: idempotent,
+      settlementId,
+      paymentId,
+      direction: finalDir,
+      amount: applied.applied,
+      settlementWeek,
+      clubId,
+      balanceBefore: before,
+      balanceAfter: balanceAfter,
+      settlementBalance: balanceAfter,
+      owesHost: splitAfter.owesHost,
+      hostOwes: splitAfter.hostOwes,
+      maxAmount: applied.maxAmount,
+      bankrollMutated: false,
+      settlePlayerTxUsed: false,
+      previewAfter: {
+        [playerId]: {
+          owesHost: splitAfter.owesHost,
+          hostOwes: splitAfter.hostOwes,
+          settlementBalance: balanceAfter,
+          openRisk: carryInfo.openRisk
+        }
+      }
     });
   } catch(e) {
     console.error('[settle-player] error:', e.message);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// GET /api/host/settlement-payments?clubId=&playerId= — payment history (Option A)
+app.get('/api/host/settlement-payments', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
+  const { clubId, playerId } = req.query || {};
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  try {
+    let q = sb.from('settlement_payments')
+      .select('payment_id,club_id,player_id,direction,amount,amount_cents,status,method,note,created_at,confirmed_at,created_by,confirmed_by,balance_before,balance_after,period_id')
+      .eq('club_id', clubId)
+      .eq('status', 'confirmed')
+      .order('confirmed_at', { ascending: false })
+      .limit(200);
+    if (playerId) q = q.eq('player_id', playerId);
+    const { data, error } = await q;
+    if (error) {
+      if (/relation .*settlement_payments.* does not exist|Could not find the table/i.test(String(error.message||error))) {
+        return res.status(503).json({ ok:false, error:'settlement_payments_missing', payments: [] });
+      }
+      throw error;
+    }
+    res.json({ ok:true, clubId, playerId: playerId||null, payments: data||[] });
+  } catch(e) {
+    console.error('[settlement-payments] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
@@ -13817,63 +14020,41 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       });
     } catch(_balErr) { console.warn('[weekly-rollover] club_members balance fetch error:', _balErr.message); }
 
-    // 3. Derive per-player snapshot
+    // 3. Derive per-player snapshot using carried settlement balance (tickets + payments).
+    // Weekly rollover MUST NOT clear outstanding carry — snapshot only.
     var byPlayer = {};
     function goc(pid, uname) {
       if (!byPlayer[pid]) byPlayer[pid] = { playerId:pid, username:uname||pid,
-        owesHost:0, hostOwes:0, openRisk:0, settledNet:0, activeBetCount:0 };
+        owesHost:0, hostOwes:0, openRisk:0, settledNet:0, settlementBalance:0, activeBetCount:0 };
       return byPlayer[pid];
     }
     var rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
-    var _rollCutoffs = await _loadSettlementCutoffs(sb, clubId,
-      Array.from(new Set((tickets||[]).map(function(t){ return String(t.player_id||''); }).filter(Boolean)
-        .concat(Object.keys(balMap)))));
+    var allPids = Array.from(new Set((tickets||[]).map(function(t){ return String(t.player_id||''); }).filter(Boolean)
+      .concat(Object.keys(balMap))));
+    var _rollCutoffs = await _loadSettlementCutoffs(sb, clubId, allPids);
+    var ticketsByPid = {};
     (tickets||[]).forEach(function(t) {
-      var s=t.status.toLowerCase(), r=parseFloat(t.risk_amount)||0, p=parseFloat(t.potential_profit)||0;
-      var pl = goc(t.player_id, t.player_username);
-      if (s==='canceled'||s==='voided'||s==='push'||s==='pushed') return;
-      if (s==='active'||s==='open')  { pl.openRisk+=r; pl.activeBetCount++; return; }
-      var cut = _rollCutoffs[String(t.player_id)] || 0;
-      var gradeMs = new Date(t.graded_at || t.placed_at || 0).getTime();
-      if (cut && gradeMs && gradeMs <= cut) return;
-      if (s==='lost')            { pl.settledNet-=r; }
-      else if (s==='won')        { pl.settledNet+=p; }
+      var pid = String(t.player_id||'');
+      goc(pid, t.player_username);
+      if (!ticketsByPid[pid]) ticketsByPid[pid] = [];
+      ticketsByPid[pid].push(t);
+      var s=String(t.status||'').toLowerCase();
+      if (s==='active'||s==='open') byPlayer[pid].activeBetCount++;
     });
-    Object.values(byPlayer).forEach(function(pl) {
-      var net=pl.settledNet;
-      if (net<0) { pl.owesHost=rnd(-net); pl.hostOwes=0; }
-      else        { pl.hostOwes=rnd(net);  pl.owesHost=0; }
-      pl.openRisk=rnd(pl.openRisk); pl.settledNet=rnd(pl.settledNet);
+    var payMap = await _loadSettlementPaymentsAfter(sb, clubId, Object.keys(byPlayer), _rollCutoffs);
+    Object.keys(byPlayer).forEach(function(pid) {
+      var cut = _rollCutoffs[pid] || 0;
+      var net = _ticketNetAfterCutoff(ticketsByPid[pid] || [], cut);
+      var pays = payMap[pid] || { playerPaidHost: 0, hostPaidPlayer: 0 };
+      var carry = settlementCarry.deriveSettlementCarry(net.settledNet, pays.playerPaidHost, pays.hostPaidPlayer);
+      var split = settlementCarry.splitOwes(carry);
+      var pl = byPlayer[pid];
+      pl.settledNet = net.settledNet;
+      pl.openRisk = net.openRisk;
+      pl.settlementBalance = split.settlementBalance;
+      pl.owesHost = split.owesHost;
+      pl.hostOwes = split.hostOwes;
     });
-    // 3b. Subtract confirmed prior payments from snapshot (BUG56_FIXED_prior_payments_subtracted)
-    // Without this, weekly rollover snapshots show gross owed even when player
-    // already paid part of it — leading to double-collection.
-    try {
-      const _playerIds = Object.keys(byPlayer);
-      if (_playerIds.length) {
-        const { data: _pmtRows } = await sb.from('settlement_payments')
-          .select('player_id,direction,amount')
-          .eq('club_id', clubId).eq('status', 'confirmed')
-          .in('player_id', _playerIds);
-        (_pmtRows||[]).forEach(function(r) {
-          var pl = byPlayer[r.player_id];
-          if (!pl) return;
-          var a = parseFloat(r.amount)||0;
-          if (r.direction === 'player_paid_host') {
-            // Player paid host: reduces how much player still owes
-            pl.owesHost = Math.max(0, Math.round((pl.owesHost - a)*100)/100);
-          } else if (r.direction === 'host_paid_player') {
-            // Host paid player: reduces how much host still owes
-            pl.hostOwes = Math.max(0, Math.round((pl.hostOwes - a)*100)/100);
-          }
-        });
-        // Re-clamp: payments can't make a value go negative (should not happen, but guard it)
-        Object.values(byPlayer).forEach(function(pl) {
-          pl.owesHost = Math.max(0, rnd(pl.owesHost));
-          pl.hostOwes = Math.max(0, rnd(pl.hostOwes));
-        });
-      }
-    } catch(_pmtErr) { console.warn('[weekly-rollover] prior payments fetch error:', _pmtErr.message); }
 
     var players = Object.values(byPlayer);
     var playersOweTot = players.reduce(function(s,p){ return s+p.owesHost; },0);
@@ -13894,13 +14075,15 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
       const snapRows = players.map(function(p) { return {
         rollover_week: week, club_id: clubId, player_id: p.playerId, username: p.username,
         owes_host: p.owesHost, host_owes: p.hostOwes, open_risk: p.openRisk,
-        settled_net: p.settledNet, active_ticket_count: p.activeBetCount,
+        settled_net: p.settlementBalance != null ? p.settlementBalance : p.settledNet,
+        active_ticket_count: p.activeBetCount,
         snapshotted_at: performedAt
       }; });
       const { error: snapErr } = await sb.from('weekly_player_snapshots').insert(snapRows);
       if (snapErr) throw snapErr;
 
       // Write one WEEKLY_ROLLOVER ledger event per player (via RPC — idempotent per player+week)
+      // Neutral bankroll marker only — does NOT clear settlement carry.
       await Promise.all(players.map(async function(p) {
         try {
           await _callMoneyRpc('weekly_rollover_tx', {
@@ -13908,49 +14091,31 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
             p_club_id:          clubId,
             p_player_id:        p.playerId,
             p_week_start:       week,
-            p_starting_balance: balMap[String(p.playerId)] ?? null, // null if no club_members row — RPC rejects rather than using phantom $1k
+            p_starting_balance: balMap[String(p.playerId)] ?? null,
             p_created_by:       performedBy||'host'
           });
         } catch(_e) { /* non-fatal: snapshot already exists */ }
       }));
 
-      // Mirror SETTLEMENT_APPLIED into ledger_entries (cutoff marker; never double-count next week)
-      await Promise.all(players.map(async function(p) {
-        try {
-          var netAmt = rnd((p.hostOwes||0) - (p.owesHost||0)); // + host owes player
-          var entryId = 'SETTLEMENT_APPLIED_'+clubId+'_'+week+'_'+p.playerId;
-          var startBal = balMap[String(p.playerId)];
-          var balBefore = startBal != null ? startBal : null;
-          // Settlement records cash settlement of weekly net; available bankroll unchanged
-          // until cash moves — amount is signed net for audit/cutoff, balance_after unchanged.
-          await sb.from('ledger_entries').upsert({
-            id: entryId,
-            club_id: clubId,
-            player_id: p.playerId,
-            type: 'SETTLEMENT_APPLIED',
-            amount: netAmt,
-            balance_before: balBefore,
-            balance_after: balBefore,
-            reason: 'weekly_rollover:'+week,
-            created_at: performedAt,
-            created_by: performedBy||'host'
-          }, { onConflict: 'id' });
-        } catch(_se) {
-          console.warn('[weekly-rollover] SETTLEMENT_APPLIED write failed player='+p.playerId+':', _se.message||_se);
-        }
-      }));
+      // DO NOT write SETTLEMENT_APPLIED epoch markers on rollover.
+      // End of week ≠ settlement; outstanding carry must persist into next week.
     }
 
     // 6. Audit event
     await sb.from('audit_events').insert({
       event_type: 'weekly_rollover_executed', club_id: clubId,
-      payload: { rolloverWeek:week, playersCount:players.length, totals, performedBy:performedBy||'host' }
+      payload: {
+        rolloverWeek:week, playersCount:players.length, totals,
+        performedBy:performedBy||'host',
+        carryPreserved: true,
+        note: 'Rollover snapshots outstanding settlement carry; does not zero balances'
+      }
     });
 
-    console.log('[weekly-rollover] week='+week+' players='+players.length);
+    console.log('[weekly-rollover] week='+week+' players='+players.length+' carryPreserved=true');
     res.json({
       ok: true, rolloverWeek: week, playersSnapshotted: players.length,
-      totals, nextWeekInitialized: true, performedAt
+      totals, nextWeekInitialized: true, performedAt, carryPreserved: true
     });
   } catch(e) {
     console.error('[weekly-rollover] error:', e.message);
@@ -15062,14 +15227,14 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', balance:null });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   try {
-    // Tickets for this player
+    // Tickets for this player IN THIS CLUB only (never player_id alone).
     let tq = sb.from('tickets').select(
       'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id,insurance_enabled,cashout_offer_amount,cashout_offer_status'
-    ).eq('player_id', playerId);
-    if (clubId) tq = tq.eq('club_id', clubId);
+    ).eq('club_id', clubId).eq('player_id', playerId);
     tq = tq.order('placed_at', { ascending:false });
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
@@ -15248,8 +15413,11 @@ app.get('/api/club/exposure', requirePermissionScoped('view_host_dashboard'), as
 // ══ SETTLEMENT PERIODS + CLOSEOUT (Phase N) ═══════════════════════════════════════════════════════════════════════
 
 // ── PAYMENT HELPERS ───────────────────────────────────────────────────────────────────────
-async function _calcTotalPaid(sb, periodId, playerId, direction) {
+async function _calcTotalPaid(sb, periodId, playerId, direction, clubId) {
+  // club_id required — period_id+player alone can mix clubs if period IDs collide.
+  if (!clubId) return 0; // refuse unscoped aggregation
   const { data } = await sb.from('settlement_payments').select('amount')
+    .eq('club_id', clubId)
     .eq('period_id',periodId).eq('player_id',playerId)
     .eq('direction',direction).eq('status','confirmed');
   return Math.round((data||[]).reduce(function(s,r){ return s+parseFloat(r.amount||0); },0)*100)/100;
@@ -15307,18 +15475,22 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
   if (isNaN(amt)||amt<=0) return res.status(400).json({ ok:false, error:'invalid_amount' });
   try {
     // Period must be closed or reopened
-    const { data:pData } = await sb.from('settlement_periods').select('status,revision')
+    const { data:pData } = await sb.from('settlement_periods').select('status,revision,club_id')
       .eq('period_id',periodId).limit(1);
     const period = pData&&pData[0];
     if (!period||period.status==='open')
       return res.status(409).json({ ok:false, code:'period_not_closed' });
-    // Snapshot for overpayment check
-    const { data:snapData } = await sb.from('settlement_snapshots').select('amount_owed_by_player,amount_owed_to_player')
+    if (String(period.club_id) !== String(clubId))
+      return res.status(403).json({ ok:false, error:'period_club_mismatch' });
+    // Snapshot for overpayment check — scoped to period (period already club-verified)
+    const { data:snapData } = await sb.from('settlement_snapshots').select('amount_owed_by_player,amount_owed_to_player,club_id')
       .eq('period_id',periodId).eq('player_id',playerId).order('revision',{ascending:false}).limit(1);
     const snap = snapData&&snapData[0]||{ amount_owed_by_player:0, amount_owed_to_player:0 };
+    if (snap.club_id && String(snap.club_id) !== String(clubId))
+      return res.status(403).json({ ok:false, error:'snapshot_club_mismatch' });
     const owedKey = direction==='player_paid_host'?'amount_owed_by_player':'amount_owed_to_player';
     const amountOwed = parseFloat(snap[owedKey]||0);
-    const alreadyPaid = await _calcTotalPaid(sb, periodId, playerId, direction);
+    const alreadyPaid = await _calcTotalPaid(sb, periodId, playerId, direction, clubId);
     const remaining  = Math.round((amountOwed-alreadyPaid)*100)/100;
     if (amt > remaining+0.005 && !adminOverride) {
       emitRiskAlert('settlement_overpayment_attempt', clubId, actor.actorId,
@@ -15709,11 +15881,12 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
   if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   try {
     // 1. Tickets
-    let tq = sb.from('tickets').select('id,status,risk_amount,potential_profit');
-    if (clubId) tq = tq.eq('club_id', clubId);
+    let tq = sb.from('tickets').select('id,status,risk_amount,potential_profit,player_id')
+      .eq('club_id', clubId);
     const { data: tickets } = await tq;
     var activeRisk=0, settledGain=0, settledLoss=0;
     (tickets||[]).forEach(function(t){
@@ -15726,9 +15899,9 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
     var ticketTotals = { activeRisk:rnd(activeRisk), settledGain:rnd(settledGain),
       settledLoss:rnd(settledLoss), profit:rnd(settledGain-settledLoss) };
 
-    // 2. Ledger
-    let lq = sb.from('ledger_entries').select('id,type,amount');
-    if (clubId) lq = lq.eq('club_id', clubId);
+    // 2. Ledger (club-scoped; null-club legacy rows excluded)
+    let lq = sb.from('ledger_entries').select('id,type,amount')
+      .eq('club_id', clubId);
     const { data: ledger } = await lq;
     var lTotals = { bet_placed:0,bet_won:0,bet_lost:0,bet_push:0,bet_canceled:0,settlement:0,other:0 };
     (ledger||[]).forEach(function(e){
