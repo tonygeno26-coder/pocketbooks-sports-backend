@@ -1,0 +1,140 @@
+{
+  "meta": {
+    "generated_at": "2026-09-09T08:07:28.526Z",
+    "inventory_db_now": "2026-09-09T08:07:28.526461+00",
+    "supabase_project": "padgicwrrzmukahfsyhk",
+    "be_commit": "d839449e724e26014d5f078be1f481e97c7655ba",
+    "fe_commit": "46da895c1f552f9ca0922cc8e3895fff87632f89",
+    "branch": "cursor/settlement-option-a",
+    "t0_recommendation": "2026-09-09T08:00:00.000Z",
+    "t0_rule": "gradeMs <= T0 excluded; gradeMs > T0 included",
+    "production_data_touched": false,
+    "migration_applied": false,
+    "bootstrap_applied": false,
+    "merged": false,
+    "note": "DRY RUN ONLY \u2014 no SQL execute, no bootstrap, no prod writes. proposed openings are NOT lifetime P&L."
+  },
+  "counts": {
+    "total": 5,
+    "zero_A": 2,
+    "nonzero_B": 0,
+    "ambiguous_C": 3
+  },
+  "accounts": [
+    {
+      "club_id": "d616dc2a-95a6-473a-97b1-7da330878479",
+      "player_id": "0a1885b8-0fe3-4e75-aeda-f89662c87d49",
+      "proposed_opening_amount": null,
+      "candidate_opening_if_clean_start": 0,
+      "classification": "C_AMBIGUOUS",
+      "evidence": {
+        "balance_start": 1000.0,
+        "approx_available_bankroll": 2037.85,
+        "active_ticket_exposure": 0,
+        "lifetime_ticket_net_diagnostic": 1037.85,
+        "epoch_markers": 0,
+        "legacy_settlements": 0,
+        "null_club_ledger_rows_for_player": 2,
+        "note": "Do not use +1037.85 as opening. Human must choose $0+rationale or explicit B amount."
+      },
+      "requires_human_approval": true
+    },
+    {
+      "club_id": "d616dc2a-95a6-473a-97b1-7da330878479",
+      "player_id": "12bb68f1-bcca-4e63-8ae4-7065dbb19172",
+      "proposed_opening_amount": null,
+      "candidate_opening_if_clean_start": 0,
+      "classification": "C_AMBIGUOUS",
+      "evidence": {
+        "balance_start": 1000.0,
+        "approx_available_bankroll": 1176.43,
+        "active_ticket_exposure": 0,
+        "lifetime_ticket_net_diagnostic": 176.43,
+        "epoch_markers": 0,
+        "legacy_settlements": 0,
+        "note": "abs(lifetime)>=100; opening left at 0 needs rationale per bootstrap heuristic."
+      },
+      "requires_human_approval": true
+    },
+    {
+      "club_id": "d616dc2a-95a6-473a-97b1-7da330878479",
+      "player_id": "16",
+      "proposed_opening_amount": 0,
+      "classification": "A_OPEN_AT_ZERO",
+      "evidence": {
+        "balance_start": 0.0,
+        "approx_available_bankroll": 0.0,
+        "active_ticket_exposure": 0,
+        "lifetime_ticket_net_diagnostic": 0,
+        "role": "host",
+        "tickets": 0,
+        "epoch_markers": 0
+      },
+      "requires_human_approval": false
+    },
+    {
+      "club_id": "d616dc2a-95a6-473a-97b1-7da330878479",
+      "player_id": "2a3e6819-be2f-4df3-8112-54ce19d0929e",
+      "proposed_opening_amount": null,
+      "candidate_opening_if_clean_start": 0,
+      "classification": "C_AMBIGUOUS",
+      "evidence": {
+        "balance_start": 1000.0,
+        "approx_available_bankroll": 836.06,
+        "active_ticket_exposure": 0,
+        "lifetime_ticket_net_diagnostic": -163.94,
+        "epoch_markers": 0,
+        "last_graded_at": "2026-09-09T01:40:02.387055+00",
+        "note": "Do not use -163.94 as opening debt."
+      },
+      "requires_human_approval": true
+    },
+    {
+      "club_id": "d616dc2a-95a6-473a-97b1-7da330878479",
+      "player_id": "bc767309-6fc7-4585-9077-3de7b898df13",
+      "proposed_opening_amount": 0,
+      "classification": "A_OPEN_AT_ZERO",
+      "evidence": {
+        "balance_start": 1000.0,
+        "approx_available_bankroll": 955.3,
+        "active_ticket_exposure": 0,
+        "lifetime_ticket_net_diagnostic": -44.7,
+        "epoch_markers": 0,
+        "last_graded_at": "2026-09-09T01:46:56.843422+00",
+        "note": "Diagnostic lifetime only; proposed opening $0 with T0 \u2014 not bankroll conversion."
+      },
+      "requires_human_approval": false
+    }
+  ],
+  "null_club_ledger": {
+    "count": 36,
+    "by_type": {
+      "bet_placed": 13,
+      "BET_PLACED": 12,
+      "bet_won": 5,
+      "bet_canceled": 3,
+      "bet_lost": 3
+    },
+    "backfill": false,
+    "opening_impact": "club-scoped settlement excludes NULL club_id; no B inference"
+  },
+  "active_ticket_cutover": {
+    "active_ungraded": 0,
+    "accounts_with_active": 0,
+    "total_exposure": 0,
+    "quiet_window_ok": true
+  },
+  "sql_order_no_execute": [
+    "PROPOSED_cancel_bet_tx_club_isolation.sql",
+    "PROPOSED_settlement_payments.sql",
+    "PROPOSED_settlement_opening_balances.sql",
+    "PROPOSED_settle_payment_option_a_tx.sql",
+    "PROPOSED_bootstrap_settlement_opening_epoch.sql"
+  ],
+  "feature_flag": {
+    "name": "SETTLEMENT_OPTION_A_CASH_ENABLED",
+    "default": false,
+    "enabled": false,
+    "design_only": true
+  }
+}
