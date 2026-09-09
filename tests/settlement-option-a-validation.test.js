@@ -80,6 +80,11 @@ test('settle-player recomputes via serialized RPC (never trusts FE balance_befor
   assert.ok(settleFn.indexOf('balanceBefore: before') !== -1);
 });
 
+test('cash settle gated off unless SETTLEMENT_OPTION_A_CASH_ENABLED=true', function() {
+  assert.ok(src.indexOf("process.env.SETTLEMENT_OPTION_A_CASH_ENABLED === 'true'") !== -1);
+  assert.ok(settleFn.indexOf('settlement_cash_disabled') !== -1);
+});
+
 test('advisory lock + lock_timeout wiring present', function() {
   assert.ok(settleFn.indexOf('settlementLock') !== -1 || src.indexOf("require('./lib/settlement-lock')") !== -1);
   assert.ok(settleFn.indexOf('lock_timeout') !== -1);

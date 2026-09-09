@@ -18,12 +18,15 @@
 
 | Field | Value |
 |---|---|
-| **T0** | `2026-09-09T08:00:00.000Z` |
+| **T0** | **NOT APPROVED.** Do **not** use `2026-09-09T08:00:00.000Z`. Re-pick immediately before actual bootstrap. |
+| Prior candidate (superseded) | `2026-09-09T08:00:00.000Z` — owner rejected; treat as historical inventory stamp only |
 | Rule | `gradeMs <= T0` → **excluded**; `gradeMs > T0` → **included** |
-| Why safe | At inventory time: **0** active/open tickets; last grade `2026-09-09T01:46:56.843Z`; last place `2026-09-08T22:16:26.713Z`. T0 sits in the quiet window after last grade and close to activation — avoids a long T0→go-live gap. |
-| Activation | Run bootstrap **immediately** after schema+RPC deploy for signed accounts (same hour). If go-live slips >2h or any active tickets appear, **re-pick T0** at activation wall-clock instead of this stamp. |
+| Why quiet window was noted | At inventory time: **0** active/open tickets; last grade `2026-09-09T01:46:56.843Z`; last place `2026-09-08T22:16:26.713Z`. |
+| Activation | Re-pick T0 at activation wall-clock; bootstrap **immediately** after for signed accounts. If any active tickets appear, wait or re-pick after they clear. |
 
 Quiet-window ops tip: freeze new placements for ~5–10 minutes around bootstrap; re-check `active/open = 0`.
+
+**Owner decision pack:** `docs/SETTLEMENT_OWNER_DECISION_TABLE.md` (Category C blanks + Category A reconfirm).
 
 ---
 
@@ -102,17 +105,17 @@ Epoch markers: **0**. Legacy `settlements` rows: **0**. Multi-club members: **no
 
 ---
 
-## Feature flag (design only — **DO NOT ENABLE**)
+## Feature flag (scaffolded — **DO NOT ENABLE**)
 
-Missing today. Smallest gate:
+BE scaffolding on `cursor/settlement-option-a`: `SETTLEMENT_OPTION_A_CASH_ENABLED` must equal exact string `true` to allow cash settle. Default / unset / any other value = **OFF**.
 
 | Layer | Flag | Default | Effect when false |
 |---|---|---|---|
-| BE | `SETTLEMENT_OPTION_A_CASH_ENABLED=false` | **false** | `/api/host/settle-player` → `503 settlement_cash_disabled`; hide apply path |
-| BE | (same flag) | | Optional: settlements-preview returns `settlementCashEnabled:false` and zeros cash fields until bootstrap complete |
-| FE | `window.__PB_SETTLEMENT_OPTION_A_CASH__ !== true` (or env off) | **off** | Hide Settle / payment controls in host UI |
+| BE | `SETTLEMENT_OPTION_A_CASH_ENABLED` | **false** (unset) | `/api/host/settle-player` → `503 settlement_cash_disabled` **before** RPC |
+| BE | (same flag) | | `settlements-preview` returns `settlementCashEnabled:false` + `cashApplyEnabled:false` |
+| FE | `window.__PB_SETTLEMENT_OPTION_A_CASH__ !== true` (or env off) | **off** | Hide Settle / payment controls in host UI (FE still recommended) |
 
-Enable **only after** schema + signed bootstrap.
+Enable **only after** schema + signed bootstrap. Schema-first + flag-off is safe: empty tables / unused RPCs do not mutate balances; hosts cannot submit cash.
 
 ---
 
@@ -159,10 +162,11 @@ Exact apply order:
 
 ### Owner decisions required
 
-1. Confirm T0 `2026-09-09T08:00:00.000Z` or supply activation-time T0.  
-2. For each **C** account: `$0` + written rationale **or** explicit **B** signed amount **or** defer.  
-3. Confirm **A** rows (`16`, `bc767309-…`) at `$0`.  
+1. Supply activation-time T0 (**not** `2026-09-09T08:00:00.000Z`).  
+2. For each **C** account: fill `OWNER CHOICE` in `docs/SETTLEMENT_OWNER_DECISION_TABLE.md` (`$0` + rationale **or** explicit signed amount **or** DEFER). Do not auto-zero.  
+3. Confirm **A** rows (`16`, `bc767309-…`) at `$0` (reconfirmed eligible).  
 4. Approve schema apply order + later bootstrap (separate from this doc).  
 5. Keep `SETTLEMENT_OPTION_A_CASH_ENABLED` false until bootstrap verified.
 
-Companion dry-run: `docs/settlement_prod_opening_dry_run.json`
+Companion dry-run: `docs/settlement_prod_opening_dry_run.json`  
+Owner table: `docs/SETTLEMENT_OWNER_DECISION_TABLE.md`

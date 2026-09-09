@@ -6,13 +6,16 @@
     "be_commit": "d839449e724e26014d5f078be1f481e97c7655ba",
     "fe_commit": "46da895c1f552f9ca0922cc8e3895fff87632f89",
     "branch": "cursor/settlement-option-a",
-    "t0_recommendation": "2026-09-09T08:00:00.000Z",
+    "t0_recommendation": null,
+    "t0_status": "NOT_APPROVED_RE_PICK_AT_BOOTSTRAP",
+    "t0_superseded_candidate": "2026-09-09T08:00:00.000Z",
     "t0_rule": "gradeMs <= T0 excluded; gradeMs > T0 included",
     "production_data_touched": false,
     "migration_applied": false,
     "bootstrap_applied": false,
     "merged": false,
-    "note": "DRY RUN ONLY \u2014 no SQL execute, no bootstrap, no prod writes. proposed openings are NOT lifetime P&L."
+    "owner_decision_table": "docs/SETTLEMENT_OWNER_DECISION_TABLE.md",
+    "note": "DRY RUN ONLY \u2014 no SQL execute, no bootstrap, no prod writes. proposed openings are NOT lifetime P&L. Category C not approved at $0."
   },
   "counts": {
     "total": 5,
@@ -135,6 +138,15 @@
     "name": "SETTLEMENT_OPTION_A_CASH_ENABLED",
     "default": false,
     "enabled": false,
-    "design_only": true
+    "scaffolded_in_be": true,
+    "enable_requires": "exact string 'true' after signed bootstrap",
+    "settle_player_when_off": "503 settlement_cash_disabled"
+  },
+  "schema_with_flag_off_safety": {
+    "existing_balances_mutated": false,
+    "host_cash_settle_possible": false,
+    "place_grade_unchanged": true,
+    "cancel_only_via_cancel_bet_tx_when_p0_applied": true,
+    "app_operates_normally": true
   }
 }

@@ -13440,6 +13440,10 @@ async function _loadSettlementOpenings(sb, clubId, playerIds) {
   return byPid;
 }
 
+// Option A cash settle gate — default OFF. Explicit 'true' required after signed bootstrap.
+// Schema/RPC may exist while this remains false; hosts cannot submit cash settlement.
+const SETTLEMENT_OPTION_A_CASH_ENABLED = process.env.SETTLEMENT_OPTION_A_CASH_ENABLED === 'true';
+
 /** Authoritative carried settlement balance for one player. */
 async function _calcPlayerSettlementCarry(sb, clubId, playerId, ticketsForPlayer, cutoffMs) {
   var net = _ticketNetAfterCutoff(ticketsForPlayer || [], cutoffMs || 0);
@@ -13650,6 +13654,8 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
 
     res.json({
       ok: true, source:'db', clubId: clubId||null,
+      settlementCashEnabled: SETTLEMENT_OPTION_A_CASH_ENABLED,
+      cashApplyEnabled: SETTLEMENT_OPTION_A_CASH_ENABLED,
       players,
       totals: {
         playersOwe: rnd(playersOweTot),
@@ -13757,6 +13763,15 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
 app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  if (!SETTLEMENT_OPTION_A_CASH_ENABLED) {
+    return res.status(503).json({
+      ok: false,
+      error: 'settlement_cash_disabled',
+      message: 'SETTLEMENT_OPTION_A_CASH_ENABLED is not true. Cash settlement blocked until post-bootstrap enable.',
+      settlementCashEnabled: false,
+      bankrollMutated: false
+    });
+  }
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const { clubId, playerId, amount, direction, settlementWeek, note, idempotencyKey } = req.body || {};
 
