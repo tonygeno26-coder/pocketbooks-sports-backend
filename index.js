@@ -2267,12 +2267,13 @@ app.post('/api/admin/host-diamonds/seed', async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/diamond-invoice
-app.get('/api/host/diamond-invoice', async (req, res) => {
-  const actor = requireActor(req);
+app.get('/api/host/diamond-invoice', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const actor = req._actor || requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
-  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+  if (_getRoleRank(actor.role) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
     return res.status(403).json({ ok:false, error:'insufficient_role' });
-  const clubId    = req._clubId || req.query.clubId;
+  const clubId    = req._clubId || actor.clubId || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const weekStart = req.query.weekStart || _getWeekStart();
   const sb = getSupabase();
   if (!sb) return res.json({ ok:true, invoiceId:'HDI_'+clubId+'_'+weekStart, clubId, weekStart,
@@ -2319,12 +2320,13 @@ app.get('/api/host/diamond-invoice', async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/diamond-weekly-report
-app.get('/api/host/diamond-weekly-report', async (req, res) => {
-  const actor = requireActor(req);
+app.get('/api/host/diamond-weekly-report', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const actor = req._actor || requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
-  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+  if (_getRoleRank(actor.role) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
     return res.status(403).json({ ok:false, error:'insufficient_role' });
-  const clubId    = req._clubId || req.query.clubId;
+  const clubId    = req._clubId || actor.clubId || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const weekStart = req.query.weekStart || _getWeekStart();
   const sb = getSupabase();
   if (!sb) return res.json({ ok:true, weekStart, totalActiveBettors:0, totalCharges:0,
@@ -2380,12 +2382,13 @@ app.get('/api/host/diamond-weekly-report', async (req, res) => {
 // ────────────────────────────────────────────────────────────────────────────
 
 // GET /api/host/diamond-usage
-app.get('/api/host/diamond-usage', async (req, res) => {
-  const actor = requireActor(req);
+app.get('/api/host/diamond-usage', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
+  const actor = req._actor || requireActor(req);
   if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
-  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
+  if (_getRoleRank(actor.role) < ROLE_RANK.settlement_manager && actor.platformRole!=='platform_admin')
     return res.status(403).json({ ok:false, error:'insufficient_role' });
-  const clubId = req._clubId || req.query.clubId;
+  const clubId = req._clubId || actor.clubId || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const sb = getSupabase();
   if (!sb) return res.json({ ok:true, balanceDiamonds:0, activeBettorCount:0,
     feePerActiveBettor:HOST_ACTIVE_BETTOR_FEE, capacityTotal:0, capacityUsed:0,
@@ -8824,11 +8827,25 @@ app.post('/api/mirror/ledger-debug', async (req, res) => {
 });
 
 // GET /api/mirror/tickets-with-legs — tickets + legs in one call for DB primary read
+// Authz: must be authenticated; players may only read own tickets (IDOR guard).
 app.get('/api/mirror/tickets-with-legs', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ enabled:false, tickets:[], legs:[], error:actor.error });
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, tickets: [], legs: [], reason: 'not configured' });
   try {
-    const { playerId, clubId, limit: limitQ } = req.query;
+    const { playerId: qPlayerId, clubId: qClubId, limit: limitQ } = req.query;
+    const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+    const privileged = rank >= ROLE_RANK.full_admin || actor.platformRole === 'platform_admin';
+    let playerId = qPlayerId || actor.actorId;
+    if (!privileged) {
+      // Players (and non-admin staff) cannot enumerate another player's tickets.
+      playerId = String(actor.actorId);
+    } else if (qPlayerId && String(qPlayerId) !== String(actor.actorId) && actor.clubId && qClubId && String(qClubId) !== String(actor.clubId) && actor.platformRole !== 'platform_admin') {
+      return res.status(403).json({ enabled:false, tickets:[], legs:[], error:'club_scope_mismatch' });
+    }
+    const clubId = (!privileged && actor.clubId) ? actor.clubId : (qClubId || actor.clubId || null);
+    if (!playerId) return res.status(400).json({ enabled:false, tickets:[], legs:[], error:'missing_playerId' });
     const limit = Math.min(parseInt(limitQ)||200, 500);
     let tq = sb.from('tickets')
       .select('id,type,status,risk_amount,potential_profit,estimated_payout,odds,placed_at,graded_at,grading_source,grading_snapshot,player_id,club_id')
@@ -8855,11 +8872,23 @@ app.get('/api/mirror/tickets-with-legs', async (req, res) => {
 
 // GET /api/mirror/tickets — read tickets from Supabase for a player/club (shadow read)
 // Used by client runReadShadowAudit() — compare-only, never replaces localStorage.
+// Authz: must be authenticated; players may only read own tickets (IDOR guard).
 app.get('/api/mirror/tickets', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ enabled:false, tickets:[], error:actor.error });
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured', tickets: [] });
   try {
-    const { playerId, clubId, limit: limitQ } = req.query;
+    const { playerId: qPlayerId, clubId: qClubId, limit: limitQ } = req.query;
+    const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+    const privileged = rank >= ROLE_RANK.full_admin || actor.platformRole === 'platform_admin';
+    let playerId = qPlayerId || actor.actorId;
+    if (!privileged) playerId = String(actor.actorId);
+    else if (qPlayerId && String(qPlayerId) !== String(actor.actorId) && actor.clubId && qClubId && String(qClubId) !== String(actor.clubId) && actor.platformRole !== 'platform_admin') {
+      return res.status(403).json({ enabled:false, tickets:[], error:'club_scope_mismatch' });
+    }
+    const clubId = (!privileged && actor.clubId) ? actor.clubId : (qClubId || actor.clubId || null);
+    if (!playerId) return res.status(400).json({ enabled:false, tickets:[], error:'missing_playerId' });
     const limit = Math.min(parseInt(limitQ)||200, 500);
     let query = sb.from('tickets')
       .select('id, status, type, risk_amount, potential_profit, placed_at, graded_at, mirrored_at')
@@ -10894,19 +10923,39 @@ app.get('/api/admin/bets', adminAuth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ===== PLAYER LIMITS =====
-app.get('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
+// ===== PLAYER LIMITS (legacy PG routes — club + role gated; prefer /api/club/player-limits) =====
+app.get('/api/clubs/:id/limits/:userId', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const clubId = String(req.params.id || '');
+  const scope = _checkClubScope(actor, clubId);
+  if (!scope.ok) return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+    actorClubId: actor.clubId, requestedClubId: clubId });
+  const rank = _getRoleRank(actor.role);
+  const self = String(actor.actorId) === String(req.params.userId);
+  if (!self && rank < ROLE_RANK.risk_viewer && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role' });
   try {
-    const r = await query('SELECT * FROM player_limits WHERE club_id=$1 AND user_id=$2', [req.params.id, req.params.userId]);
+    const r = await query('SELECT * FROM player_limits WHERE club_id=$1 AND user_id=$2', [clubId, req.params.userId]);
     res.json(r.rows[0]||{});
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/clubs/:id/limits/:userId', auth, async (req, res) => {
-  const { max_bet, max_daily_risk, max_payout } = req.body;
+app.put('/api/clubs/:id/limits/:userId', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const clubId = String(req.params.id || '');
+  const scope = _checkClubScope(actor, clubId);
+  if (!scope.ok) return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+    actorClubId: actor.clubId, requestedClubId: clubId });
+  if (_getRoleRank(actor.role) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'full_admin' });
+  const { max_bet, max_daily_risk, max_payout } = req.body || {};
   try {
     const r = await query(`INSERT INTO player_limits (club_id,user_id,max_bet,max_daily_risk,max_payout,updated_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (club_id,user_id) DO UPDATE SET max_bet=$3,max_daily_risk=$4,max_payout=$5,updated_at=NOW() RETURNING *`,
-      [req.params.id, req.params.userId, max_bet||100, max_daily_risk||500, max_payout||2000]);
+      [clubId, req.params.userId, max_bet||100, max_daily_risk||500, max_payout||2000]);
+    _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/clubs/:id/limits/:userId',
+      { playerId: req.params.userId });
     res.json(r.rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -13959,32 +14008,34 @@ app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover')
 });
 
 // GET /api/host/rollover-history?clubId=
-app.get('/api/host/rollover-history', async (req, res) => {
+app.get('/api/host/rollover-history', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, history:[] });
-  const { clubId, limit:limitQ } = req.query;
+  const clubId = req._clubId || (req._actor && req._actor.clubId) || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  const limitQ = req.query && req.query.limit;
   try {
     const limit = Math.min(parseInt(limitQ)||12, 52);
-    let q = sb.from('weekly_rollovers')
+    const { data, error } = await sb.from('weekly_rollovers')
       .select('id,club_id,rollover_week,performed_at,totals_snapshot,players_count')
+      .eq('club_id', clubId)
       .order('rollover_week', { ascending:false }).limit(limit);
-    if (clubId) q = q.eq('club_id', clubId);
-    const { data, error } = await q;
     if (error) throw error;
     res.json({ ok:true, history: data||[] });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
 // GET /api/host/week-snapshot?clubId=&week=
-app.get('/api/host/week-snapshot', async (req, res) => {
+app.get('/api/host/week-snapshot', requireCanonicalClubId, requirePermissionScoped('view_settlement_history'), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.json({ ok:false, players:[] });
-  const { clubId, week } = req.query;
+  const clubId = req._clubId || (req._actor && req._actor.clubId) || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  const week = req.query && req.query.week;
   try {
     let q = sb.from('weekly_player_snapshots')
-      .select('*').order('owes_host', { ascending:false });
-    if (clubId) q = q.eq('club_id', clubId);
-    if (week)   q = q.eq('rollover_week', week);
+      .select('*').eq('club_id', clubId).order('owes_host', { ascending:false });
+    if (week) q = q.eq('rollover_week', week);
     const { data, error } = await q;
     if (error) throw error;
     res.json({ ok:true, week:week||'all', players:data||[] });
@@ -14023,7 +14074,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   if (!idempotencyKey)    errors.push('missing_idempotencyKey');
   if (!VALID_TYPES.has(betType)) errors.push('invalid_betType:'+betType);
   const stakeAmt = parseFloat(stake);
-  if (isNaN(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
+  if (!Number.isFinite(stakeAmt)||stakeAmt<=0) errors.push('invalid_stake');
   let legsArr = Array.isArray(legs) ? legs.map(_ingestPlaceBetLeg) : [];
   if (!legsArr.length) errors.push('no_legs');
   legsArr.forEach(function(leg,i) {
@@ -14810,11 +14861,21 @@ app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('ca
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
   try {
-    // 1. Idempotency: if already canceled with this key, return success
+    // 1. Idempotency: replay only when ledger row matches ticket+player+club
     const { data: existLedger } = await sb.from('ledger_entries')
-      .select('id,ticket_id').eq('id', idempotencyKey).limit(1);
-    if (existLedger && existLedger[0])
-      return res.json({ ok:true, idempotent:true, ticketId, ledgerEntryId:idempotencyKey });
+      .select('id,ticket_id,player_id,club_id,type,amount,balance_after').eq('id', idempotencyKey).limit(1);
+    if (existLedger && existLedger[0]) {
+      const er = existLedger[0];
+      if (er.ticket_id === ticketId
+          && String(er.player_id) === String(playerId)
+          && (!clubId || !er.club_id || String(er.club_id) === String(clubId))
+          && (er.type === 'bet_canceled' || er.type === 'BET_CANCELED_REFUND')) {
+        return res.json({ ok:true, idempotent:true, ticketId, ledgerEntryId:idempotencyKey,
+          refundAmount: er.amount, balanceAfter: er.balance_after });
+      }
+      return res.status(409).json({ ok:false, error:'idempotency_key_conflict',
+        ledgerEntryId: idempotencyKey, existingTicketId: er.ticket_id });
+    }
 
     // 2. Load ticket + legs
     const { data: tickets, error: tErr } = await sb.from('tickets')
@@ -14823,16 +14884,21 @@ app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('ca
     const ticket = tickets && tickets[0];
     if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
     const _cancelActor = req._actor || {};
-    const _cancelActorRank = ROLE_RANK[_cancelActor.role] != null ? ROLE_RANK[_cancelActor.role] : -99;
+    const _cancelActorRank = _getRoleRank(_cancelActor.role);
     const _isPrivilegedCancel = _cancelActorRank >= ROLE_RANK.full_admin || _cancelActor.platformRole === 'platform_admin';
-    // Privileged actors (full_admin+) can cancel any ticket in the club; players must own the ticket
-    if (!_isPrivilegedCancel && ticket.player_id !== playerId) {
+    // Defense in depth: non-privileged must own the ticket (actorId), not merely spoof body.playerId.
+    // requirePermissionScoped already checks body.playerId===actor for cancel_bet; bind ticket to actor here.
+    if (!_isPrivilegedCancel && String(ticket.player_id) !== String(_cancelActor.actorId)) {
       return res.status(403).json({ ok:false, error:'not_owner',
         hint:'player can only cancel own tickets; host/admin can cancel any' });
     }
+    if (!_isPrivilegedCancel && String(playerId) !== String(_cancelActor.actorId)) {
+      return res.status(403).json({ ok:false, error:'not_own_account' });
+    }
     // Use ticket's actual player_id for ledger operations (body.playerId may differ when host cancels for player)
     const _effectivePlayerId = ticket.player_id || playerId;
-    if (clubId && ticket.club_id && ticket.club_id !== clubId) return res.status(403).json({ ok:false, error:'wrong_club' });
+    if (!ticket.club_id || (clubId && ticket.club_id !== clubId))
+      return res.status(403).json({ ok:false, error:'wrong_club' });
     const s = ticket.status.toLowerCase();
     if (s === 'canceled' || s === 'voided') return res.json({ ok:true, idempotent:true, ticketId, message:'already_canceled' });
     if (s !== 'active' && s !== 'open') return res.status(400).json({ ok:false, error:'cannot_cancel_settled:status='+s });
@@ -14940,8 +15006,8 @@ app.post('/api/host/offer-cashout', requireCanonicalClubId, requirePermissionSco
     const notifId = await _notifyPlayer({
       playerId: ticket.player_id,
       type: 'cashout_offer',
-      title: 'Cash out offer',
-      message: 'Cash out offer: $'+amount.toFixed(2)+' on your '+pickLbl+' bet — accept or decline [ticket:'+ticketId+']',
+      title: 'Cash-out offer',
+      message: 'Host offered $'+amount.toFixed(2)+' to close your '+pickLbl+' bet — accept or decline [ticket:'+ticketId+']',
       metadata: { ticketId: ticketId, amount: amount, type: 'cashout_offer' }
     });
     try {
@@ -16094,10 +16160,10 @@ function _survivorDeadlinePassed(pool, nowMs) {
 
 function _survivorIsHost(actor, pool) {
   if (!actor || !pool) return false;
+  // Pool runner = creator only. Sportsbook host/admin roles do NOT grant
+  // cross-pool survivor mutation (Host A must not grade Host B's pool).
   if (String(pool.created_by) === String(actor.actorId)) return true;
   if (actor.platformRole === 'platform_admin') return true;
-  if ((ROLE_RANK[actor.role]||0) >= ROLE_RANK.full_admin) return true;
-  if (actor.role === 'owner') return true;
   return false;
 }
 
@@ -17122,11 +17188,12 @@ async function _notifyPlayer(opts) {
 app.get('/api/notifications', auth, async (req, res) => {
   try {
     var actor = req._actor || requireActor(req) || {};
-    var playerId = String((req.query && req.query.playerId) || actor.actorId || (req.user && req.user.id) || '');
+    // Always pin to authenticated actor — never honor foreign playerId (IDOR).
+    var playerId = String(actor.actorId || (req.user && req.user.id) || '');
     if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
-    // Players may only read their own notifications unless host/admin.
-    if (actor.actorId && String(actor.actorId) !== playerId && actor.role !== 'host' && actor.role !== 'admin' && actor.role !== 'owner') {
-      playerId = String(actor.actorId);
+    if (req.query && req.query.playerId && String(req.query.playerId) !== playerId) {
+      // Ignore manipulated IDs; keep response scoped to self.
+      playerId = String(actor.actorId || playerId);
     }
     var sb = getSupabase();
     if (!sb) return res.json({ ok:true, notifications: [], unread: 0 });
@@ -17145,9 +17212,9 @@ app.get('/api/notifications', auth, async (req, res) => {
 app.post('/api/notifications/read', auth, async (req, res) => {
   try {
     var actor = req._actor || requireActor(req) || {};
-    var playerId = String((req.body && req.body.playerId) || actor.actorId || (req.user && req.user.id) || '');
+    // Always pin to authenticated actor — never mark another player's notifications read.
+    var playerId = String(actor.actorId || (req.user && req.user.id) || '');
     if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
-    if (actor.actorId && String(actor.actorId) !== playerId) playerId = String(actor.actorId);
     var ids = (req.body && req.body.ids) || null;
     var sb = getSupabase();
     if (!sb) return res.json({ ok:true });
