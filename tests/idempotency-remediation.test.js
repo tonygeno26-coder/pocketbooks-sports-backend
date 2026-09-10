@@ -1,10 +1,13 @@
 'use strict';
 
 /**
- * Non-prod idempotency remediation matrix (T1, T2/fingerprint, T7 cross-scope,
- * T8 expired+ledger, fail-closed, concurrent reserve, retention helper).
+ * Non-prod idempotency remediation FINAL matrix.
  *
- * FE sticky timeout notes documented in assertions comments (T3).
+ * Covers: fingerprint, concurrent 2x/10x (ticket delta=1), conflict,
+ * cross-player/club, expired+ledger, response-loss, restart, multi-instance,
+ * stale processing reclaim, TX rollback, fail-closed store, retention.
+ *
+ * No production SQL / financial side effects.
  */
 
 const assert = require('assert');
@@ -30,10 +33,48 @@ function assertEq(a, b, msg) {
   assert.strictEqual(a, b, msg || (String(a) + ' !== ' + String(b)));
 }
 
-async function run() {
-  console.log('\n== idempotency remediation matrix ==\n');
+/** Simulated money place: ledger UNIQUE + deterministic ticket. */
+function createPlaceSimulator(ledgerMap) {
+  ledgerMap = ledgerMap || new Map();
+  const tickets = [];
+  return {
+    tickets: tickets,
+    ledger: ledgerMap,
+    async place(clubId, playerId, clientKey) {
+      const tid = engine.deterministicTicketId(clubId, playerId, clientKey);
+      const lid = engine.scopedLedgerId(clubId, playerId, clientKey);
+      if (ledgerMap.has(lid)) {
+        return {
+          ok: true,
+          idempotent: true,
+          ticketId: ledgerMap.get(lid).ticket_id,
+          ledgerEntryId: lid
+        };
+      }
+      // Simulate TX: insert ledger + ticket atomically or neither
+      const entry = {
+        id: lid,
+        ticket_id: tid,
+        club_id: clubId,
+        player_id: playerId,
+        balance_after: 100
+      };
+      ledgerMap.set(lid, entry);
+      tickets.push(tid);
+      return { ok: true, idempotent: false, ticketId: tid, ledgerEntryId: lid };
+    },
+    async placeAbortBeforeCommit(clubId, playerId, clientKey) {
+      // TX rollback: nothing written
+      void clubId; void playerId; void clientKey;
+      return { ok: false, error: 'tx_rolled_back', rolledBack: true };
+    }
+  };
+}
 
-  await test('fingerprint: same body → same hash; different stake → different hash', function () {
+async function run() {
+  console.log('\n== idempotency remediation FINAL matrix ==\n');
+
+  await test('fingerprint: canonical same body → same hash; different stake → different', function () {
     const a = engine.hashRequest('/api/bets/place', 'P1', 'C1', { stake: 10, legs: [{ x: 1 }] });
     const b = engine.hashRequest('/api/bets/place', 'P1', 'C1', { legs: [{ x: 1 }], stake: 10 });
     const c = engine.hashRequest('/api/bets/place', 'P1', 'C1', { stake: 20, legs: [{ x: 1 }] });
@@ -41,52 +82,116 @@ async function run() {
     assert(a !== c);
   });
 
-  await test('deterministic ticket_id stable across calls', function () {
+  await test('deterministic ticket_id / RR group / scoped ledger stable', function () {
     const t1 = engine.deterministicTicketId('clubA', 'player1', 'BET_abc');
     const t2 = engine.deterministicTicketId('clubA', 'player1', 'BET_abc');
     const t3 = engine.deterministicTicketId('clubB', 'player1', 'BET_abc');
     assertEq(t1, t2);
     assert(t1 !== t3);
     assert(t1.indexOf('T_') === 0);
-  });
-
-  await test('scoped ledger id decision scoped_hash_v1', function () {
     assertEq(engine.LEDGER_ID_SCOPING, 'scoped_hash_v1');
     const id = engine.scopedLedgerId('C1', 'P1', 'BET_1');
     assert(id.indexOf('IK_') === 0);
     assertEq(id.length, 3 + 40);
-    assert(id !== engine.scopedLedgerId('C2', 'P1', 'BET_1'));
+    assert(engine.deterministicRrGroupId('C1', 'P1', 'K').indexOf('RRG_') === 0);
   });
 
-  await test('T1 concurrent duplicate reserve — one winner', async function () {
+  await test('reserve writes status=processing (not bare pending-only)', async function () {
     const store = engine.createMemStore();
-    const scope = { clientKey: 'K1', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
-    const body = { stake: 5, idempotencyKey: 'K1' };
-    const results = await Promise.all([
-      engine.idemCheck(store, scope, '/api/bets/place', body, { money: true }),
-      engine.idemCheck(store, scope, '/api/bets/place', body, { money: true }),
-      engine.idemCheck(store, scope, '/api/bets/place', body, { money: true })
-    ]);
+    const scope = { clientKey: 'Kproc', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const r = await engine.idemCheck(store, scope, '/api/bets/place', { stake: 1 }, { money: true });
+    assertEq(r.action, 'execute');
+    const row = await store.load(scope);
+    assertEq(row.status, 'processing');
+  });
+
+  await test('CONCURRENT 2X — ticket delta=1, same ticket', async function () {
+    const shared = new Map();
+    const store = engine.createUniqueDbSimStore({ sharedMap: shared, latencyMs: 5 });
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'K2x', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 5 };
+
+    const results = await Promise.all([0, 1].map(async function () {
+      const r = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+      if (r.action !== 'execute') return r;
+      const placed = await sim.place(scope.clubId, scope.playerId, scope.clientKey);
+      await engine.idemComplete(store, scope, 200, { ok: true, ticketId: placed.ticketId }, placed.ticketId);
+      return { action: 'execute', ticketId: placed.ticketId, placed: placed };
+    }));
+
     const executes = results.filter(function (r) { return r.action === 'execute'; });
     const blocked = results.filter(function (r) {
       return r.action === 'in_progress' || r.action === 'replay';
     });
     assertEq(executes.length, 1, 'exactly one executor');
-    assertEq(blocked.length, 2, 'others blocked');
+    assertEq(blocked.length, 1, 'one blocked');
+    assertEq(sim.tickets.length, 1, 'ticket delta=1');
+    const tid = engine.deterministicTicketId('C1', 'P1', 'K2x');
+    assertEq(sim.tickets[0], tid);
+
+    // Loser retry after complete → same ticket replay
+    const again = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(again.action, 'replay');
+    assertEq(again.existingRow.ticket_id || again.existingRow.response_body.ticketId, tid);
   });
 
-  await test('T2 fingerprint conflict body_mismatch → 409', async function () {
+  await test('CONCURRENT 10X — ticket delta=1, same ticket', async function () {
+    const shared = new Map();
+    const store = engine.createUniqueDbSimStore({
+      sharedMap: shared,
+      latencyMs: function () { return 1 + Math.floor(Math.random() * 8); }
+    });
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'K10x', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 11 };
+    const expectedTid = engine.deterministicTicketId('C1', 'P1', 'K10x');
+
+    const results = await Promise.all(Array.from({ length: 10 }, async function () {
+      const r = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+      if (r.action !== 'execute') return r;
+      const placed = await sim.place(scope.clubId, scope.playerId, scope.clientKey);
+      await engine.idemComplete(store, scope, 200, {
+        ok: true, ticketId: placed.ticketId
+      }, placed.ticketId);
+      return { action: 'execute', ticketId: placed.ticketId };
+    }));
+
+    const executes = results.filter(function (r) { return r.action === 'execute'; });
+    assertEq(executes.length, 1, 'exactly one of 10 executes');
+    assertEq(sim.tickets.length, 1, 'ticket delta=1 under 10x');
+    assertEq(sim.tickets[0], expectedTid);
+    assert(executes[0].ticketId === expectedTid);
+  });
+
+  await test('CHANGED REQUEST CONFLICT body_mismatch → 409, no second ticket', async function () {
     const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
     const scope = { clientKey: 'K2', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
     const r1 = await engine.idemCheck(store, scope, '/api/bets/place', { stake: 10 }, { money: true });
     assertEq(r1.action, 'execute');
-    await engine.idemComplete(store, scope, 200, { ok: true, ticketId: 'T_x' });
+    const placed = await sim.place('C1', 'P1', 'K2');
+    await engine.idemComplete(store, scope, 200, { ok: true, ticketId: placed.ticketId }, placed.ticketId);
     const r2 = await engine.idemCheck(store, scope, '/api/bets/place', { stake: 99 }, { money: true });
     assertEq(r2.action, 'conflict');
     assertEq(r2.reason, 'body_mismatch');
+    assertEq(sim.tickets.length, 1);
   });
 
-  await test('T7 cross-player same bare key — isolated scopes', async function () {
+  await test('SAME REQUEST REPLAY → same ticket', async function () {
+    const store = engine.createMemStore();
+    const scope = { clientKey: 'K6', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 7 };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    const tid = engine.deterministicTicketId('C1', 'P1', 'K6');
+    await engine.idemComplete(store, scope, 200, { ok: true, ticketId: tid }, tid);
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r2.action, 'replay');
+    assertEq(r2.existingRow.response_body.ticketId, tid);
+  });
+
+  await test('CROSS-PLAYER same bare key — isolated scopes + distinct ledger ids', async function () {
     const store = engine.createMemStore();
     const body = { stake: 10 };
     const a = await engine.idemCheck(store, {
@@ -99,9 +204,11 @@ async function run() {
     assertEq(b.action, 'execute');
     assert(engine.scopedLedgerId('C1', 'P1', 'SAME') !==
       engine.scopedLedgerId('C1', 'P2', 'SAME'));
+    assert(engine.deterministicTicketId('C1', 'P1', 'SAME') !==
+      engine.deterministicTicketId('C1', 'P2', 'SAME'));
   });
 
-  await test('T7 cross-club same bare key — isolated scopes', async function () {
+  await test('CROSS-CLUB same bare key — isolated scopes', async function () {
     const store = engine.createMemStore();
     const body = { stake: 10 };
     const a = await engine.idemCheck(store, {
@@ -114,7 +221,7 @@ async function run() {
     assertEq(b.action, 'execute');
   });
 
-  await test('T8 expired + no ledger → idempotency_key_expired', async function () {
+  await test('expired + no ledger → idempotency_key_expired', async function () {
     const store = engine.createMemStore();
     const scope = { clientKey: 'Kexp', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
     const past = Date.now() - 1000;
@@ -133,7 +240,7 @@ async function run() {
     assertEq(r.error, 'idempotency_key_expired');
   });
 
-  await test('T8 expired + ledger exists → replay', async function () {
+  await test('expired + ledger exists → replay (no second wager)', async function () {
     const store = engine.createMemStore();
     const scope = { clientKey: 'Kexp2', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
     const past = Date.now() - 1000;
@@ -153,6 +260,152 @@ async function run() {
     assertEq(r.existingRow.response_body.ticketId, 'T_old');
   });
 
+  await test('RESPONSE LOSS — money posted, complete never ran → ledger_only_replay', async function () {
+    const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Kloss', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 3 };
+    // No idempotency row; money already posted (response lost / crash after RPC)
+    const placed = await sim.place('C1', 'P1', 'Kloss');
+    const r = await engine.idemCheck(store, scope, '/api/bets/place', body, {
+      money: true,
+      lookupLedger: async function () {
+        return sim.ledger.get(engine.scopedLedgerId('C1', 'P1', 'Kloss'));
+      }
+    });
+    assertEq(r.action, 'replay');
+    assertEq(r.reason, 'ledger_only_replay');
+    assertEq(r.existingRow.response_body.ticketId, placed.ticketId);
+    assertEq(sim.tickets.length, 1);
+  });
+
+  await test('RESTART — processing row + ledger → stale ledger replay, no second ticket', async function () {
+    const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Krest', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 4 };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    const placed = await sim.place('C1', 'P1', 'Krest');
+    // Crash: never idemComplete; row still processing; age it past stale window
+    const row = await store.load(scope);
+    row.created_at = new Date(Date.now() - engine.STALE_PROCESSING_MS - 1000).toISOString();
+    await store.save(scope, row);
+
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, {
+      money: true,
+      nowMs: Date.now(),
+      lookupLedger: async function () {
+        return sim.ledger.get(engine.scopedLedgerId('C1', 'P1', 'Krest'));
+      }
+    });
+    assertEq(r2.action, 'replay');
+    assertEq(r2.reason, 'stale_processing_ledger_replay');
+    assertEq(sim.tickets.length, 1);
+    assertEq(r2.existingRow.response_body.ticketId, placed.ticketId);
+  });
+
+  await test('MULTI-INSTANCE — two stores, shared UNIQUE map → one winner', async function () {
+    const shared = new Map();
+    const a = engine.createUniqueDbSimStore({ sharedMap: shared, instanceId: 'A', latencyMs: 3 });
+    const b = engine.createUniqueDbSimStore({ sharedMap: shared, instanceId: 'B', latencyMs: 3 });
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Kmi', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 8 };
+
+    const results = await Promise.all([
+      engine.idemCheck(a, scope, '/api/bets/place', body, { money: true }),
+      engine.idemCheck(b, scope, '/api/bets/place', body, { money: true })
+    ]);
+    const executes = results.filter(function (r) { return r.action === 'execute'; });
+    assertEq(executes.length, 1);
+    const winnerStore = results[0].action === 'execute' ? a : b;
+    const placed = await sim.place('C1', 'P1', 'Kmi');
+    await engine.idemComplete(winnerStore, scope, 200, { ok: true, ticketId: placed.ticketId }, placed.ticketId);
+
+    // Other instance loads completed via shared map
+    const other = winnerStore === a ? b : a;
+    const replay = await engine.idemCheck(other, scope, '/api/bets/place', body, { money: true });
+    assertEq(replay.action, 'replay');
+    assertEq(sim.tickets.length, 1);
+  });
+
+  await test('STALE PROCESSING no ledger → reclaim execute, still one ticket', async function () {
+    const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Kstale', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 6 };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    // Crash before money — leave stale processing
+    const row = await store.load(scope);
+    row.created_at = new Date(Date.now() - engine.STALE_PROCESSING_MS - 5000).toISOString();
+    await store.save(scope, row);
+
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, {
+      money: true,
+      nowMs: Date.now(),
+      lookupLedger: async function () { return null; }
+    });
+    assertEq(r2.action, 'execute');
+    assert(r2.reclaimed);
+    const placed = await sim.place('C1', 'P1', 'Kstale');
+    await engine.idemComplete(store, scope, 200, { ok: true, ticketId: placed.ticketId }, placed.ticketId);
+    assertEq(sim.tickets.length, 1);
+
+    const r3 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r3.action, 'replay');
+  });
+
+  await test('fresh processing (not stale) → in_progress 409', async function () {
+    const store = engine.createMemStore();
+    const scope = { clientKey: 'Kfresh', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 1 };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r2.action, 'in_progress');
+  });
+
+  await test('TX ROLLBACK — abort before commit; reclaim; one ticket after success', async function () {
+    const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Ktx', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 9 };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    const aborted = await sim.placeAbortBeforeCommit('C1', 'P1', 'Ktx');
+    assert(aborted.rolledBack);
+    // Mark failed (client got error) OR leave processing — test failed path
+    await engine.idemComplete(store, scope, 500, { ok: false, error: 'tx_rolled_back' }, null);
+    // Failed replay (safe — no second ticket). Client mints new key for retry in product;
+    // here we assert failed status replays without placing.
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r2.action, 'replay');
+    assertEq(r2.existingRow.status, 'failed');
+    assertEq(sim.tickets.length, 0);
+
+    // Alternate path: stale processing after abort without complete → reclaim places once
+    const store2 = engine.createMemStore();
+    const sim2 = createPlaceSimulator();
+    const scope2 = { clientKey: 'Ktx2', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    await engine.idemCheck(store2, scope2, '/api/bets/place', body, { money: true });
+    await sim2.placeAbortBeforeCommit('C1', 'P1', 'Ktx2');
+    const row = await store2.load(scope2);
+    row.created_at = new Date(Date.now() - engine.STALE_PROCESSING_MS - 1).toISOString();
+    await store2.save(scope2, row);
+    const reclaim = await engine.idemCheck(store2, scope2, '/api/bets/place', body, {
+      money: true,
+      nowMs: Date.now(),
+      lookupLedger: async function () { return null; }
+    });
+    assertEq(reclaim.action, 'execute');
+    assert(reclaim.reclaimed);
+    const placed = await sim2.place('C1', 'P1', 'Ktx2');
+    await engine.idemComplete(store2, scope2, 200, { ok: true, ticketId: placed.ticketId }, placed.ticketId);
+    assertEq(sim2.tickets.length, 1);
+  });
+
   await test('fail-closed missing club on money place', async function () {
     const store = engine.createMemStore();
     const r = await engine.idemCheck(store, {
@@ -170,7 +423,7 @@ async function run() {
     assertEq(r.action, 'reject');
   });
 
-  await test('money path store missing → 503 no mem-primary', async function () {
+  await test('money path store missing → 503 fail-closed (no mem-primary)', async function () {
     const store = {
       ensureSchema: async function () { return 'missing'; },
       load: async function () { return null; },
@@ -185,16 +438,14 @@ async function run() {
     assertEq(r.error, 'idempotency_store_unavailable');
   });
 
-  await test('completed replay same fingerprint', async function () {
-    const store = engine.createMemStore();
-    const scope = { clientKey: 'K6', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
-    const body = { stake: 7 };
-    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
-    assertEq(r1.action, 'execute');
-    await engine.idemComplete(store, scope, 200, { ok: true, ticketId: 'T_det' });
-    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
-    assertEq(r2.action, 'replay');
-    assertEq(r2.existingRow.response_body.ticketId, 'T_det');
+  await test('evaluateExisting: club_mismatch', function () {
+    const r = engine.evaluateExisting({
+      club_id: 'C1', player_id: 'P1', actor_id: 'P1',
+      request_hash: 'abc', status: 'completed',
+      expires_at: new Date(Date.now() + 99999).toISOString()
+    }, { actorId: 'P1', clubId: 'C2', playerId: 'P1', reqHash: 'abc', nowMs: Date.now() });
+    assertEq(r.action, 'conflict');
+    assertEq(r.reason, 'club_mismatch');
   });
 
   await test('retention purge deletes only expired+grace', async function () {
@@ -214,23 +465,21 @@ async function run() {
     assert(await store.load(newScope));
   });
 
-  await test('evaluateExisting: club_mismatch', function () {
-    const r = engine.evaluateExisting({
-      club_id: 'C1', player_id: 'P1', actor_id: 'P1',
-      request_hash: 'abc', status: 'completed',
-      expires_at: new Date(Date.now() + 99999).toISOString()
-    }, { actorId: 'P1', clubId: 'C2', playerId: 'P1', reqHash: 'abc', nowMs: Date.now() });
-    assertEq(r.action, 'conflict');
-    assertEq(r.reason, 'club_mismatch');
-  });
-
-  // T3 FE sticky note (documented expectation — BE-side):
-  // FE 0e1d678 lineage keeps _pendingPlaceIdemKey on uncertain timeout and
-  // reuses path-matched Idempotency-Key. BE then hits replay/ledger path.
-  await test('T3 timeout sticky FE note: same key yields deterministic ticket', function () {
+  // T3 FE sticky note: FE 0e1d678 lineage keeps sticky key on uncertain timeout.
+  await test('T3 timeout sticky: same key → deterministic same ticket', function () {
     const a = engine.deterministicTicketId('C', 'P', 'sticky-key');
     const b = engine.deterministicTicketId('C', 'P', 'sticky-key');
     assertEq(a, b);
+  });
+
+  await test('legacy pending status treated as in-progress', function () {
+    const r = engine.evaluateExisting({
+      club_id: 'C1', player_id: 'P1', actor_id: 'P1',
+      request_hash: 'h', status: 'pending',
+      created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 99999).toISOString()
+    }, { actorId: 'P1', clubId: 'C1', playerId: 'P1', reqHash: 'h', nowMs: Date.now() });
+    assertEq(r.action, 'in_progress');
   });
 
   console.log('\n' + pass + ' passed, ' + fail + ' failed\n');
