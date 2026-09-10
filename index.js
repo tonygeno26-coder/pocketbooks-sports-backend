@@ -10,6 +10,7 @@ const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const owlsLiveScores = require('./lib/owls-live-scores');
 const idempotencyEngine = require('./lib/idempotency-engine');
+const parlayCorrelation = require('./lib/parlay-correlation');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -14023,6 +14024,28 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     _validatePlaceBetLegContract(leg, i, errors);
   });
   if (errors.length) return res.status(400).json({ ok:false, errors });
+
+  // ── Parlay correlation protection (server-authoritative, fail-closed) ──
+  // Runs before any ticket / bankroll / ledger mutation. Manipulated clients
+  // cannot bypass. Never invents SGP-adjusted odds; product math only for
+  // INDEPENDENT multi-leg slips. Rejected → zero tickets, zero financial mutation.
+  if (legsArr.length > 1 && betType !== 'Single') {
+    const corrGate = parlayCorrelation.assertParlayCorrelationAllowed(legsArr, { betType: betType });
+    if (!corrGate.ok) {
+      console.warn('[bets/place] parlay correlation rejected',
+        { code: corrGate.code, reason: corrGate.reason, betType: betType,
+          playerId: playerId, clubId: clubId, legs: legsArr.length });
+      return res.status(422).json({
+        ok: false,
+        error: corrGate.error || 'parlay_correlation_rejected',
+        code: corrGate.code,
+        reason: corrGate.reason,
+        relationship: corrGate.relationship,
+        message: corrGate.message,
+        financialMutation: 'NONE'
+      });
+    }
+  }
 
   try {
     // Idempotency is handled by requireIdempotency middleware above.
