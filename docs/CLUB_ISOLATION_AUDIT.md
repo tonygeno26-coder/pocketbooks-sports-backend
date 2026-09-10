@@ -7,13 +7,13 @@
 
 ---
 
-## Verdict
+## Verdict (reconciled 2026-09-09 — `cursor/pre-beta-authz-club`)
 
-**No — not every club-owned resource hard-requires `club_id` on every read/write path.**
+**HTTP money surfaces now hard-require club** on player/host dashboards, cash-out, join queues, settlement period/payment IDs, and mirror tickets/audit (see `docs/AUTHORIZATION_AUDIT.md` / `docs/IDOR_AUDIT_WAVE.md`).
 
-Money **RPCs** for place/grade (when current migrations are live) generally hard-scope `club_id + player_id`. Several **API handlers** still use **optional** `.eq('club_id')` when `clubId` is present, and **`cancel_bet_tx` in prod (pre-PROPOSED)** remains soft-club + phantom `$1000`. Cross-club financial paths are **P0**.
+Residual: **`cancel_bet_tx` in prod (pre-PROPOSED)** remains soft-club + phantom `$1000` (**OWNER-GATED**). Grade worker may still run all-clubs when `clubId` omitted (**P1** ops). Notifications remain player-global (**P1**).
 
-`requirePermissionScoped` stamps `req._clubId` from the token for protected routes, which **usually** supplies club on host/player dashboard — but code still tolerates missing club on the query builder (`if (clubId) tq = tq.eq(...)`). Any path that skips scope middleware or drops club is unsafe for multi-club players.
+`requirePermissionScoped` stamps `req._clubId`; dashboards **fail closed** with `400 missing_clubId` and hard `.eq('club_id')` (no soft `if (clubId)`).
 
 ---
 
@@ -36,15 +36,15 @@ Money **RPCs** for place/grade (when current migrations are live) generally hard
 |---------|-------------------|------------------|---------|-----|
 | Place bet | `POST /api/bets/place` → `place_bet_tx` | Token scope + RPC `club_id+player_id` | **HARD** (RPC) | OK |
 | Place RR | `place_rr_tx` | Same pattern in migration | **HARD** if RPC deployed; else broken | Verify prod |
-| Cancel | `POST /api/bets/cancel` → `cancel_bet_tx` | App rejects mismatch if both set; **RPC soft + $1000** | **SOFT** until PROPOSED applied | **P0** |
+| Cancel | `POST /api/bets/cancel` → `cancel_bet_tx` | App rejects mismatch if both set; **RPC soft + $1000** | **SOFT** until PROPOSED applied | **P0 owner-gated** |
 | Grade | `grade_ticket_tx` (isolation migration) | Hard club match | **HARD** if applied | OK / verify |
-| Cash-out offer/accept/decline | `/api/host/offer-cashout`, `/api/bets/accept-cashout`, `decline-cashout` | `requireCanonicalClubId` + scoped perm; ticket by id | **CONDITIONAL** — must verify ticket.club_id vs token | **P1** |
-| Player dashboard | `GET /api/player/dashboard` | Tickets `.eq(player_id)` then **if clubId** `.eq(club_id)` | **CONDITIONAL** | **P0** if club omitted (multi-club) |
-| Host dashboard | `GET /api/host/dashboard` | Same optional club on tickets/ledger/members | **CONDITIONAL** | **P0** if club omitted |
-| My Bets (FE) | Hydrate from player dashboard | Depends on API | **CONDITIONAL** | follows API |
-| Host Bets (FE) | Host dashboard tickets + legs | Depends on API | **CONDITIONAL** | follows API |
-| Mirror tickets | `GET /api/mirror/tickets*` | Optional player/club; weak/no money auth story | **CONDITIONAL / NONE** | **P1**/ **P0** if public |
-| Mirror audit | `GET /api/mirror/audit*` | **No club filter** — recent global rows | **NONE** | **P1** (ops leak) |
+| Cash-out offer/accept/decline | `/api/host/offer-cashout`, `/api/bets/accept-cashout`, `decline-cashout` | Ticket `club_id` vs actor + update eq club | **HARD** | **FIXED** |
+| Player dashboard | `GET /api/player/dashboard` | Missing club → 400; hard `.eq('club_id')` | **HARD** | **FIXED** |
+| Host dashboard | `GET /api/host/dashboard` | Same fail-closed + hard eq | **HARD** | **FIXED** |
+| My Bets (FE) | Hydrate from player dashboard | Depends on API | **HARD** (API) | follows API |
+| Host Bets (FE) | Host dashboard tickets + legs | Depends on API | **HARD** (API) | follows API |
+| Mirror tickets | `GET /api/mirror/tickets*` | Auth + require clubId + hard eq | **HARD** | **FIXED** |
+| Mirror audit | `GET /api/mirror/audit*` | Privileged + club (platform_admin may omit) | **HARD** / admin escape | **FIXED** |
 
 ### Limits & risk
 
@@ -66,8 +66,8 @@ Money **RPCs** for place/grade (when current migrations are live) generally hard
 
 | Surface | Club requirement | Verdict | Sev |
 |---------|------------------|---------|-----|
-| `GET /api/notifications` | `player_id` only on `player_notifications` | **NONE** (player-global) | **P1** if notifs carry cross-club cashout CTAs |
-| Cashout notif actions | Ticket id → money routes | Must enforce ticket club | **P1** |
+| `GET /api/notifications` | `player_id` only on `player_notifications` | **NONE** (player-global) | **P1** |
+| Cashout notif actions | Ticket id → money routes | Ticket club enforced on accept/decline | **HARD** on money path | **FIXED** |
 
 ### Survivor & join requests
 
@@ -90,11 +90,12 @@ Money **RPCs** for place/grade (when current migrations are live) generally hard
 
 | ID | Risk | Evidence | Status |
 |----|------|----------|--------|
-| **CI-P0-1** | `cancel_bet_tx` soft club OR + `coalesce(balance_start,1000)` | Prior prod read + `PROPOSED_cancel_bet_tx_club_isolation.sql` header | Package prepared — **DO NOT APPLY** in this agent |
-| **CI-P0-2** | `GET /api/player/dashboard` without club → all clubs’ tickets for player | `if (clubId) tq = tq.eq('club_id', clubId)` | Latent until multi-club; token `_clubId` usually set |
-| **CI-P0-3** | `GET /api/host/dashboard` without club → cross-club host aggregate | Same pattern | Same |
-| **CI-P0-4** | `ledger_entries` with NULL `club_id` | Prior audit count | Club-scoped balance under/over count |
+| **CI-P0-1** | `cancel_bet_tx` soft club OR + `coalesce(balance_start,1000)` | Prior prod read + `PROPOSED_cancel_bet_tx_club_isolation.sql` header | **OWNER-GATED** — **DO NOT APPLY** |
+| **CI-P0-2** | `GET /api/player/dashboard` without club → all clubs’ tickets for player | Was soft `if (clubId)` | **FIXED** fail-closed + hard eq |
+| **CI-P0-3** | `GET /api/host/dashboard` without club → cross-club host aggregate | Same pattern | **FIXED** |
+| **CI-P0-4** | `ledger_entries` with NULL `club_id` | Prior audit count | Data hygiene **P1**; helpers now require club |
 | **CI-P0-5** | Settlement enablement against missing/soft primitives | Prior architecture audit | Keep recording OFF |
+| **CI-P0-6** | Cash-out / join / settlement period / mirror audit IDOR | IDOR wave | **FIXED** |
 
 Non-P0 but related: global idempotency key on `ledger_entries.id` (**P1** cross-club key collision).
 
@@ -105,22 +106,22 @@ Non-P0 but related: global idempotency key on `ledger_entries.id` (**P1** cross-
 | Resource | Requires club_id? |
 |----------|-------------------|
 | Tickets / legs / place / grade (RPC) | **Yes** (hard in current place/grade migrations) |
-| Cancel (prod RPC) | **Not hard** today |
-| Player/host dashboard handlers | **Should** — code is conditional |
+| Cancel (prod RPC) | **Not hard** today — owner gate |
+| Player/host dashboard handlers | **Yes** (fail-closed) |
 | Limits / risk settings / diamonds | **Yes** |
 | Notifications | **No** (player-scoped) |
 | Survivor | **No** (pool-scoped) |
-| Mirror audit | **No** |
+| Mirror audit | **Yes** for non–platform_admin |
 
 ---
 
 ## Recommendations (no apply)
 
-1. **Do not apply** `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` until owner prod gate (`docs/CANCEL_BET_TX_PROD_GATE.md` if present / companion scripts).
-2. Fail closed: `GET /api/player/dashboard` and `GET /api/host/dashboard` → **400 `missing_clubId`** when club absent after scope middleware (small BE change; owner-approved).
-3. Cash-out handlers: always compare `ticket.club_id` to `req._clubId`.
-4. Notifications: include `club_id` column long-term; short-term validate ticket club on accept/decline.
-5. Mirror routes: auth + required club, or disable in production.
+1. **Do not apply** `migrations/PROPOSED_cancel_bet_tx_club_isolation.sql` until owner prod gate (`docs/CANCEL_BET_TX_PROD_GATE.md`).
+2. ~~Fail closed dashboards~~ — **done** on IDOR / pre-beta-authz-club.
+3. ~~Cash-out ticket club compare~~ — **done**.
+4. Notifications: include `club_id` column long-term (P1).
+5. ~~Mirror routes auth + club~~ — **done**.
 6. Keep settlement gated; align with Option A from prior financial club isolation audit.
 
 ---

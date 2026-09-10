@@ -7,7 +7,8 @@
 ## Prior work reconciled (no regress)
 
 - BE `main` @ `f33e0e0` — survivor host-scope + mirror/notif IDOR (`cursor/away-authz-survivor`, `cursor/away-red-team`, `origin/cursor/authz-p0-merged`)
-- FE deferred `cursor/away-authz-survivor` @ `9652a24` + red-team fixtures `9d2385b` — cherry-picked onto this wave
+- FE deferred `cursor/away-authz-survivor` @ `9652a24` + red-team fixtures `9d2385b`
+- Complementary reconcile branch: `cursor/pre-beta-authz-club` (docs + ledger helper hard-club + multi-club tests) — additive only vs this wave
 
 ## P0 findings (this wave)
 
@@ -44,10 +45,12 @@
 ```bash
 # BE
 node tests/idor-audit-wave.test.js
+node tests/multi-club-isolation.test.js
 node tests/authz-idor.test.js
 node tests/red-team-authz.test.js
 
 # FE
 node tests/authz-idor.test.js
 node tests/red-team-authz.test.js
+node tests/multi-club-isolation.test.js
 ```
