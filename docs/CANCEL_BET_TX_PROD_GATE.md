@@ -1,10 +1,12 @@
 # CANCEL_BET_TX — Production Isolation Gate (READ-ONLY PREP)
 
 **Status:** `CANCEL ISOLATION PROD GATE READY`  
-**Branch:** `cursor/cancel-isolation-prod-gate`  
+**Branch:** `cursor/cancel-isolation-prod-gate` (@ `c0958d4`; docs alias also on `cursor/pre-beta-idempotency-docs`)  
+**Alias doc:** [`docs/CANCEL_ISOLATION_PROD_GATE.md`](./CANCEL_ISOLATION_PROD_GATE.md)  
 **Supabase project:** `padgicwrrzmukahfsyhk`  
-**Precheck date:** 2026-09-09  
+**Precheck date:** 2026-09-09 (inventory rechecked same day)  
 **PRODUCTION DATA TOUCHED:** **NO** (this package does not apply)  
+**Settlement:** **OFF**  
 **SAFE TO REQUEST OWNER APPLY:** **YES** (function replace only; no row backfill)
 
 ---
@@ -13,7 +15,8 @@
 
 ### CURRENT FUNCTION
 
-Live prod (`padgicwrrzmukahfsyhk`) still has the **soft-club + phantom $1000** body:
+Live prod (`padgicwrrzmukahfsyhk`) still has the **soft-club + phantom $1000** body  
+(re-verified read-only: `has_soft_club=true`, `mentions_1000=true`, `has_hard_member_reject=false`):
 
 | Marker | Live value |
 |---|---|
@@ -70,31 +73,31 @@ Guarantees:
 
 Read-only queries: `migrations/CANCEL_BET_TX_PRECHECK_READONLY.sql`
 
-**Captured results (2026-09-09):**
+**Captured results (2026-09-09 morning → same-day recheck):**
 
-| Check | Result |
-|---|---|
-| Active/open tickets | **0** |
-| Canceled/voided | **27** |
-| Settled-like (won/lost/push) | **37** |
-| Total tickets | **64** |
-| Active tickets missing `club_members` | **0** |
-| Any-status tickets missing membership | **11** (10 canceled + 1 won; all `demo-club` smoke/legacy) |
-| NULL `tickets.club_id` | **3** (all already canceled; 0 active) |
-| NULL `tickets.player_id` | **0** |
-| `bet_canceled` ledger NULL club | **3** (known smoke voids; see `docs/NULL_CLUB_LEDGER_AUDIT.md` on settlement branch) |
-| `bet_canceled` amount = 1000 | **0** |
-| `club_members.balance_start IS NULL` | **0** |
-| Dependent triggers | **none** |
+| Check | Morning | Recheck |
+|---|---|---|
+| Active/open tickets | **0** | **2** (membership present) |
+| Canceled/voided | **27** | **27** |
+| Settled-like (won/lost/push) | **37** | **37** |
+| Total tickets | **64** | **66** |
+| Active tickets missing `club_members` | **0** | **0** |
+| Any-status tickets missing membership | **11** | **14** (non-active smoke/legacy) |
+| NULL `tickets.club_id` | **3** (all already canceled; 0 active) | **3** |
+| NULL `tickets.player_id` | **0** | **0** |
+| `bet_canceled` ledger NULL club | **3** (known smoke voids; see `docs/NULL_CLUB_LEDGER_AUDIT.md` on settlement branch) | unchanged expectation |
+| `bet_canceled` amount = 1000 | **0** | not re-scanned; prior = 0 |
+| `club_members.balance_start IS NULL` | **0** | not blocking |
+| Dependent triggers | **none** | unchanged expectation |
 
 ### DATA ANOMALIES
 
 | Anomaly | Count | Impact on apply |
 |---|---|---|
-| Historical tickets without matching `club_members` | 11 | **None for apply** — all non-active (`canceled`/`won`); future cancel of those would correctly reject `no_club_member_balance_found` if ever re-activated incorrectly |
+| Historical tickets without matching `club_members` | 14 (recheck) | **None for apply** — non-active; future cancel would correctly reject `no_club_member_balance_found` |
 | NULL-club canceled tickets | 3 | Future cancel attempts with a real club id → `ticket_club_mismatch` (correct). Do not backfill in this gate. |
 | NULL-club cancel ledger rows | 3 | Historical only; club-eq reads exclude them |
-| Active orphans | **0** | Gate can apply without blocking cleanup |
+| Active orphans | **0** (2 actives both have members) | Gate can apply without blocking cleanup |
 
 **No row remediation required before function replace.**
 
@@ -183,6 +186,7 @@ Conditions:
 | `migrations/CANCEL_BET_TX_POST_VERIFY.sql` | Post-apply verification |
 | `migrations/CANCEL_BET_TX_TEST_QUERIES.sql` | Designated-account matrix |
 | `docs/CANCEL_BET_TX_PROD_GATE.md` | This owner package |
+| `docs/CANCEL_ISOLATION_PROD_GATE.md` | Alias / verify-workflow entrypoint |
 
 ---
 
