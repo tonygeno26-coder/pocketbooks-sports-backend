@@ -5456,13 +5456,14 @@ function _deriveBalanceFromLedgerEntries(startingBalance, entries) {
 async function _ledgerAvailableForPlayer(sb, clubId, playerId, startingBalance) {
   var ledgerAvailable = null;
   var ledgerEntryCount = 0;
-  if (!sb || !playerId) return { ledgerAvailable: null, ledgerEntryCount: 0 };
+  // Fail closed: never blend multi-club ledger rows for the same playerId.
+  if (!sb || !playerId || !clubId) return { ledgerAvailable: null, ledgerEntryCount: 0 };
   try {
     var lq = sb.from('ledger_entries')
       .select('id,type,amount,balance_before,balance_after,created_at,ticket_id')
       .eq('player_id', playerId)
+      .eq('club_id', clubId)
       .order('created_at', { ascending: true });
-    if (clubId) lq = lq.eq('club_id', clubId);
     var { data: ledgerRows, error: lErr } = await lq;
     if (lErr) throw lErr;
     ledgerEntryCount = (ledgerRows || []).length;
@@ -5522,6 +5523,7 @@ async function _creditPlayerAccount(opts) {
   if (!(amt > 0)) return { ok:false, error:'invalid_amount' };
   const clubId = opts.clubId || '';
   const playerId = opts.playerId || '';
+  if (!clubId || !playerId) return { ok:false, error:'missing_clubId_or_playerId' };
   const eventType = opts.eventType;
   const leType = opts.ledgerEntriesType || eventType;
   const iKey = opts.idempotencyKey || ('CR_'+eventType+'_'+Date.now());
@@ -5534,8 +5536,8 @@ async function _creditPlayerAccount(opts) {
   let before = startBal;
   try {
     var lq = sb.from('ledger_entries').select('amount,balance_after,created_at')
-      .eq('player_id', playerId).order('created_at', { ascending:true });
-    if (clubId) lq = lq.eq('club_id', clubId);
+      .eq('player_id', playerId).eq('club_id', clubId)
+      .order('created_at', { ascending:true });
     const { data: ledRows } = await lq;
     if (ledRows && ledRows.length)
       before = _deriveBalanceFromLedgerEntries(startBal, ledRows);
@@ -5543,7 +5545,7 @@ async function _creditPlayerAccount(opts) {
   const after = Math.round((before + amt)*100)/100;
   try {
     await sb.from('ledger_entries').upsert({
-      id: iKey, club_id: clubId||null, player_id: playerId,
+      id: iKey, club_id: clubId, player_id: playerId,
       ticket_id: opts.ticketId||null, type: leType, amount: amt,
       balance_before: before, balance_after: after,
       reason: opts.reason || eventType,
