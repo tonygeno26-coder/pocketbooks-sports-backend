@@ -32,7 +32,10 @@ describe('GET /api/host/dashboard', () => {
 
   test('club_members query is club-scoped; approved rows merged in JS', () => {
     expect(dash).toContain("from('club_members')");
-    expect(dash).toContain("if (clubId) plq = plq.eq('club_id', clubId)");
+    // Hard club scope (authz): never soft-fallback when clubId missing —
+    // requireCanonicalClubId + missing_clubId fail-closed precede this query.
+    expect(dash).toContain(".eq('club_id', clubId)");
+    expect(dash).not.toContain("if (clubId) plq = plq.eq('club_id', clubId)");
     expect(dash).toContain("String(r.status||'').toLowerCase() === 'approved'");
   });
 
