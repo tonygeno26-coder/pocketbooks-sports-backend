@@ -1,25 +1,27 @@
 # BET PLACEMENT IDEMPOTENCY — Production Migration Gate (DO NOT APPLY)
 
-**Status:** `IDEMPOTENCY PROD GATE READY` (package only)  
+**Status:** `IDEMPOTENCY REMEDIATION` (BE code ready; SQL still PROPOSED)  
 **Date:** 2026-09-10  
-**BE main:** `ae1d18d`  
+**BE remediation branch:** `cursor/idempotency-remediation`  
 **FE clean main:** `0e1d678` (sticky path-matched Idempotency-Key already present via `7a5ffa3`)  
 **PRODUCTION DATA TOUCHED:** **NO**  
-**Owner order:** apply **cancel isolation first**, then idempotency — **only after explicit owner apply message**.  
-**SAFE TO APPLY (now):** **NO** (owner has not approved; cancel isolation not yet applied; prod table shape must be confirmed first)
+**Owner order:** DO NOT APPLY until explicit `APPLY IDEMPOTENCY MIGRATION`  
+**SAFE TO APPLY (now):** **NO**  
+**Canonical review:** `docs/IDEMPOTENCY_FINAL_OWNER_REVIEW.md`
 
 ---
 
-## CURRENT STATE
+## CURRENT STATE (post-remediation)
 
 | Layer | Today | Gap |
 |-------|-------|-----|
-| FE sticky key + path match | On clean FE `0e1d678` | Contaminated `20f90ec` tip is redundant vs `7a5ffa3` |
-| BE `requireIdempotency` | `idempotency_keys` keyed primarily by bare `idempotency_key` PK; mem fallback if table missing | Scope is not enforced as unique `(club_id, player_id, key)` |
-| Money RPC | `ledger_entries.id = p_idempotency_key` UNIQUE | Protects same-key double debit; not different-key retry |
-| Ticket id | `T_` + time/random | Not content-addressed → retry with new key → second ticket |
+| FE sticky key + path match | On clean FE `0e1d678` | None for Gap B |
+| BE `requireIdempotency` | Dual-read/write scoped + insert-if-absent; money fail-closed | Prod SQL PK not applied yet |
+| Money RPC ledger id | `scoped_hash_v1` (`IK_<sha256(club\|player\|key)[0:40]>`) + dual-read bare | In-flight legacy bare keys dual-read |
+| Ticket id | Deterministic `T_<digest>` / `RRG_<digest>` | Optional tickets unique index still commented in SQL |
+| Retention | `PROPOSED_idempotency_keys_retention.sql` + JS purge helper | **Not scheduled** on prod |
 
-Reference DDL already embedded in `index.js` as `IDEMPOTENCY_TABLE_DDL` (docs only / bootstrap reference — **not** an applied migration artifact in this gate).
+Reference DDL: `lib/idempotency-engine.js` `IDEMPOTENCY_TABLE_DDL` (scoped). Apply artifacts: `migrations/PROPOSED_idempotency_keys_scoped.sql` + retention + ROLLBACK.
 
 ---
 
@@ -150,13 +152,14 @@ SELECT count(*) FROM public.idempotency_keys WHERE expires_at < now();
 
 ## SAFE TO REQUEST OWNER APPLY
 
-**NO — not yet.** Package is ready for review, but apply is blocked until:
+**NO — SQL still gated.** BE remediations are on `cursor/idempotency-remediation`. Apply remains blocked until:
 
-1. Owner explicitly messages apply for **this** migration (separate from cancel).
-2. Cancel isolation apply completed first (owner preference).
-3. Read-only preflight confirms current table / no surprise dual schema.
+1. This BE branch is **deployed** (dual-read/write live).
+2. Owner explicitly messages `APPLY IDEMPOTENCY MIGRATION`.
+3. Read-only preflight confirms current table / path A vs B.
 4. Prod FE SHA includes sticky idempotency (`0e1d678` lineage).
-5. Designated-account test plan scheduled.
+5. Retention schedule planned **after** SQL (not before).
+6. Designated-account smoke T1–T10.
 
 **SAFE TO APPLY:** **NO**
 
@@ -166,8 +169,14 @@ SELECT count(*) FROM public.idempotency_keys WHERE expires_at < now();
 
 | File | Role |
 |------|------|
+| `docs/IDEMPOTENCY_FINAL_OWNER_REVIEW.md` | Final owner review + remediation status |
 | `docs/BET_PLACEMENT_IDEMPOTENCY.md` | Design / failure-mode analysis |
 | `docs/BET_PLACEMENT_IDEMPOTENCY_PROD_GATE.md` | This owner gate |
-| `index.js` `IDEMPOTENCY_TABLE_DDL` | Reference DDL only |
+| `lib/idempotency-engine.js` | Scoped dual-mode engine |
+| `migrations/PROPOSED_idempotency_keys_scoped.sql` | Exact proposed SQL — **DO NOT APPLY** |
+| `migrations/PROPOSED_idempotency_keys_retention.sql` | Purge function — **DO NOT SCHEDULE YET** |
+| `migrations/ROLLBACK_idempotency_keys_scoped.sql` | Rollback companion |
+| `tests/idempotency-remediation.test.js` | Non-prod matrix |
 
-No `migrations/PROPOSED_idempotency_*.sql` applied. Create dated PROPOSED/ROLLBACK SQL files only when owner schedules apply window.
+**PRODUCTION DATA TOUCHED:** NO  
+**SETTLEMENT RECORDING:** OFF

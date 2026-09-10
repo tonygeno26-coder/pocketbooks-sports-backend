@@ -9,6 +9,7 @@ const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
 const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const owlsLiveScores = require('./lib/owls-live-scores');
+const idempotencyEngine = require('./lib/idempotency-engine');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -7517,162 +7518,40 @@ async function _callMoneyRpc(rpcName, params) {
 // ════════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════════════
-// IDEMPOTENCY ENGINE
+// IDEMPOTENCY ENGINE (scoped dual-read/write — see lib/idempotency-engine.js)
+// LEDGER ID SCOPING: scoped_hash_v1 — p_idempotency_key = IK_<sha256(club|player|key)[0:40]>
+// Retention: purgeExpiredIdempotencyKeys — code-only; do NOT auto-cron against prod.
 // ════════════════════════════════════════════════════════════════════════════
 
-const KEY_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-// In-memory fallback when Supabase is unavailable
-const _idemMemStore = new Map();
-
-function _sortKeys(obj) {
-  if (Array.isArray(obj)) return obj.map(_sortKeys);
-  if (obj && typeof obj === 'object') {
-    return Object.keys(obj).sort().reduce((acc,k) => { acc[k]=_sortKeys(obj[k]); return acc; }, {});
+const KEY_TTL_MS = idempotencyEngine.KEY_TTL_MS;
+const _idemStore = idempotencyEngine.createSupabaseStore(getSupabase);
+const _requireIdempotencyFactory = idempotencyEngine.createRequireIdempotency({
+  store: _idemStore,
+  lookupLedger: function (clubId, playerId, clientKey) {
+    return idempotencyEngine.lookupLedgerForKey(getSupabase, clubId, playerId, clientKey);
   }
-  return obj;
-}
+});
+const requireIdempotency = _requireIdempotencyFactory;
 
 function _hashRequest(endpoint, actorId, clubId, body) {
-  const canonical = JSON.stringify({ endpoint, actorId, clubId:clubId||'', body:_sortKeys(body||{}) });
-  return require('crypto').createHash('sha256').update(canonical).digest('hex').slice(0,32);
+  return idempotencyEngine.hashRequest(endpoint, actorId, clubId, body);
+}
+function _deterministicTicketId(clubId, playerId, clientKey) {
+  return idempotencyEngine.deterministicTicketId(clubId, playerId, clientKey);
+}
+function _deterministicRrGroupId(clubId, playerId, clientKey) {
+  return idempotencyEngine.deterministicRrGroupId(clubId, playerId, clientKey);
+}
+function _scopedLedgerId(clubId, playerId, clientKey) {
+  return idempotencyEngine.scopedLedgerId(clubId, playerId, clientKey);
 }
 
-// Load an idempotency record (DB first, memory fallback)
-async function _idemLoad(key) {
-  try {
-    const sb = getSupabase();
-    if (sb) {
-      const { data } = await sb.from('idempotency_keys').select('*').eq('idempotency_key',key).limit(1);
-      if (data && data[0]) return data[0];
-    }
-  } catch(_e) {}
-  return _idemMemStore.get(key) || null;
+/** Retention helper — safe as code-only. Owner must schedule; not boot-enqueued. */
+async function purgeExpiredIdempotencyKeys() {
+  return idempotencyEngine.purgeExpiredKeys(_idemStore);
 }
 
-// Save an idempotency record
-async function _idemSave(row) {
-  try {
-    const sb = getSupabase();
-    if (sb) await sb.from('idempotency_keys').upsert(row, { onConflict:'idempotency_key' });
-  } catch(_e) {}
-  _idemMemStore.set(row.idempotency_key, row); // always update memory
-}
-
-// Core: check and reserve (or replay)
-async function _idemCheck(key, endpoint, actorId, clubId, body) {
-  if (!key) return { action:'execute', warn:'no_idempotency_key' };
-  const reqHash = _hashRequest(endpoint, actorId, clubId, body);
-  const nowMs   = Date.now();
-  const existing = await _idemLoad(key);
-
-  if (!existing) {
-    // Reserve as pending
-    const row = {
-      idempotency_key:key, actor_id:actorId, club_id:clubId||'', endpoint,
-      request_hash:reqHash, status:'pending',
-      response_status:null, response_body:null,
-      created_at:new Date(nowMs).toISOString(),
-      completed_at:null,
-      expires_at:new Date(nowMs+KEY_TTL_MS).toISOString()
-    };
-    await _idemSave(row);
-    return { action:'execute', row };
-  }
-
-  // Expired?
-  if (existing.expires_at && nowMs > new Date(existing.expires_at).getTime()) {
-    console.log('[idem] key expired, re-executing:', key);
-    return { action:'execute', warn:'key_expired_reused' };
-  }
-
-  // Actor/club/hash conflicts
-  if (existing.actor_id !== actorId)
-    return { action:'conflict', reason:'actor_mismatch', status:409 };
-  if (existing.club_id !== (clubId||''))
-    return { action:'conflict', reason:'club_mismatch', status:409 };
-  if (existing.request_hash !== reqHash)
-    return { action:'conflict', reason:'body_mismatch', status:409 };
-
-  if (existing.status === 'pending')
-    return { action:'in_progress', status:409, existingRow:existing };
-
-  // Completed or failed — replay
-  console.log('[idem] replaying key='+key+' status='+existing.status+
-    ' responseStatus='+existing.response_status);
-  return { action:'replay', existingRow:existing };
-}
-
-// Mark completed after execution
-async function _idemComplete(key, responseStatus, responseBody) {
-  const existing = await _idemLoad(key);
-  if (!existing) return;
-  const row = Object.assign({}, existing, {
-    status: (responseStatus >= 200 && responseStatus < 300) ? 'completed' : 'failed',
-    response_status: responseStatus,
-    response_body: responseBody,
-    completed_at: new Date().toISOString()
-  });
-  await _idemSave(row);
-}
-
-// Express middleware factory: enforce idempotency for money endpoints
-function requireIdempotency(opts) {
-  return async function(req, res, next) {
-    const key = (req.headers['idempotency-key'] || '').trim() ||
-                (req.body && req.body.idempotencyKey) || null;
-    if (!key && opts && opts.required) {
-      return res.status(400).json({ ok:false, error:'missing_idempotency_key',
-        hint:'Include Idempotency-Key header or idempotencyKey in body' });
-    }
-    if (!key) return next(); // optional endpoints skip
-
-    const actor  = req._actor || {};
-    const clubId = req._clubId || '';
-    const result = await _idemCheck(key, req.path, actor.actorId||'anon', clubId, req.body);
-
-    if (result.action === 'replay') {
-      const stored = result.existingRow;
-      console.log('[idem] REPLAY key='+key+' endpoint='+req.path);
-      return res.status(stored.response_status||200).json(stored.response_body);
-    }
-    if (result.action === 'conflict') {
-      console.log('[idem] CONFLICT key='+key+' reason='+result.reason);
-      return res.status(409).json({ ok:false, error:'idempotency_conflict', reason:result.reason });
-    }
-    if (result.action === 'in_progress') {
-      return res.status(409).json({ ok:false, error:'request_in_progress',
-        hint:'Identical request is being processed. Retry after 2s.' });
-    }
-
-    // Store key for completion after handler
-    req._idemKey = key;
-    // Monkey-patch res.json to auto-complete idempotency after response
-    const _origJson = res.json.bind(res);
-    res.json = function(body) {
-      _idemComplete(key, res.statusCode||200, body).catch(()=>{});
-      return _origJson(body);
-    };
-    next();
-  };
-}
-
-// Supabase migration DDL for idempotency_keys table (for reference/docs)
-const IDEMPOTENCY_TABLE_DDL = `
-CREATE TABLE IF NOT EXISTS idempotency_keys (
-  idempotency_key  TEXT PRIMARY KEY,
-  actor_id         TEXT NOT NULL,
-  club_id          TEXT NOT NULL DEFAULT '',
-  endpoint         TEXT NOT NULL,
-  request_hash     TEXT NOT NULL,
-  status           TEXT NOT NULL DEFAULT 'pending',
-  response_status  INTEGER,
-  response_body    JSONB,
-  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  completed_at     TIMESTAMPTZ,
-  expires_at       TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idempotency_keys_expires_at ON idempotency_keys(expires_at);
-`;
+const IDEMPOTENCY_TABLE_DDL = idempotencyEngine.IDEMPOTENCY_TABLE_DDL;
 
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -13746,7 +13625,7 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
 });
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
-app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true, money:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -13895,7 +13774,7 @@ function _getISOWeek(date) {
 }
 
 // POST /api/host/weekly-rollover
-app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), requireIdempotency({required:true, money:true, requirePlayer:false}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -14111,7 +13990,7 @@ app.get('/api/host/week-snapshot', requireCanonicalClubId, requirePermissionScop
 app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('place_bet', function(req) {
   const actor = requireActor(req);
   return (req.body && req.body.playerId) || (actor && actor.actorId) || null;
-}), requireIdempotency({required:true}), async (req, res) => {
+}), requireIdempotency({required:true, money:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -14146,10 +14025,26 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
   if (errors.length) return res.status(400).json({ ok:false, errors });
 
   try {
-    // Idempotency is handled entirely by requireIdempotency middleware above.
-    // The middleware checks idempotency_keys, marks requests pending/completed,
-    // and replays stored responses — no second preflight check needed here.
-    // The RPC's DB unique constraint on p_idempotency_key is the final atomic guard.
+    // Idempotency is handled by requireIdempotency middleware above.
+    // Dual-read ledger: if a prior place already wrote bare client_key or scoped
+    // IK_ hash, replay without re-debit (deploy-order sticky safety).
+    const _ledgerResolved = await idempotencyEngine.resolvePlaceLedgerId(
+      getSupabase, clubId||'', playerId, idempotencyKey);
+    if (_ledgerResolved.existing) {
+      const _ex = _ledgerResolved.existing;
+      const _tid = _ex.ticket_id || _deterministicTicketId(clubId, playerId, idempotencyKey);
+      return res.json({
+        ok: true,
+        idempotent: true,
+        ticketId: _tid,
+        ledgerEntryId: _ex.id,
+        balanceAfter: _ex.balance_after,
+        replayedFrom: 'ledger'
+      });
+    }
+    // Stash for RR / single paths below
+    req._idemLedgerId = _ledgerResolved.ledgerId;
+    req._idemTicketId = req._idemTicketId || _deterministicTicketId(clubId, playerId, idempotencyKey);
 
     // 2. Derive DB balance for player — MUST filter by club_id (Bug #1 fix)
     // Without the club filter, losses/open risk from OTHER clubs reduce this
@@ -14410,8 +14305,9 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           message:'rrStakes must contain at least one active combo size with a positive stake.' });
       }
 
-      // Generate group ID — shared across all combo tickets in this slip.
-      const groupId = 'RRG_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+      // Generate group ID — deterministic from club|player|client_key (orphan-safe).
+      const groupId = _deterministicRrGroupId(clubId, playerId, idempotencyKey);
+      const rrLedgerId = (req._idemLedgerId) || _scopedLedgerId(clubId, playerId, idempotencyKey);
 
       // Build combo payloads using server-accepted odds (authoritative).
       // legsArr at this point is enriched with accepted_odds_american / accepted_odds_decimal
@@ -14475,7 +14371,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         p_player_id:       playerId,
         p_player_username: playerUsername||null,
         p_total_stake:     rnd(stakeAmt),
-        p_idempotency_key: idempotencyKey,
+        p_idempotency_key: rrLedgerId,
         p_created_by:      playerId,
         p_combos:          rpcCombos
       });
@@ -14571,7 +14467,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
               p_ticket_id:       rrCombos[ci].id,
               p_club_id:         clubId||'',
               p_player_id:       playerId,
-              p_idempotency_key: idempotencyKey+':rr_compensate:'+ci,
+              p_idempotency_key: rrLedgerId+':rr_compensate:'+ci,
               p_reason:          'rr_ticket_legs_insert_failed',
               p_created_by:      playerId
             });
@@ -14595,7 +14491,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
               p_ticket_id:       rrCombos[ci].id,
               p_club_id:         clubId||'',
               p_player_id:       playerId,
-              p_idempotency_key: idempotencyKey+':rr_hab_compensate:'+ci,
+              p_idempotency_key: rrLedgerId+':rr_hab_compensate:'+ci,
               p_reason:          'rr_active_bettor_charge_failed',
               p_created_by:      playerId
             });
@@ -14634,12 +14530,13 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       emitRiskAlert('rapid_bet_velocity', clubId, playerId, { groupId, stake:stakeAmt });
 
       return res.json({ ok:true, groupId, comboCount:rrCombos.length,
-        balanceAfter:rrRpcResult.balance_after, ledgerEntryId:idempotencyKey });
+        balanceAfter:rrRpcResult.balance_after, ledgerEntryId:rrLedgerId });
     }
     // ── End RR placement path ─────────────────────────────────────────────────
 
-    // 4. Generate ticket ID
-    const ticketId = 'T_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    // 4. Deterministic ticket ID from club|player|client_key (prevents orphan races)
+    const ticketId = (req._idemTicketId) || _deterministicTicketId(clubId, playerId, idempotencyKey);
+    const placeLedgerId = (req._idemLedgerId) || _scopedLedgerId(clubId, playerId, idempotencyKey);
 
     // 5. Build ticket_legs rows in memory (Phase K accepted-odds snapshot +
     //    priority #11 canonical identity fields). NOTE: we no longer insert
@@ -14692,7 +14589,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       p_stake:            rnd(stakeAmt),
       p_potential_profit: serverProfit != null ? serverProfit : rnd(parseFloat(potentialProfit)||0),
       p_estimated_payout: serverPayout != null ? rnd(serverPayout) : rnd(parseFloat(payout)||0),
-      p_idempotency_key:  idempotencyKey,
+      p_idempotency_key:  placeLedgerId,
       p_created_by:       playerId,
       // Phase J risk limit params
       p_leg_count:        legsArr.length,
@@ -14800,7 +14697,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           p_ticket_id:       ticketId,
           p_club_id:         clubId||'',
           p_player_id:       playerId,
-          p_idempotency_key: idempotencyKey+':compensate',
+          p_idempotency_key: placeLedgerId+':compensate',
           p_reason:          'ticket_legs_insert_failed',
           p_created_by:      playerId
         });
@@ -14828,7 +14725,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           p_ticket_id:       ticketId,
           p_club_id:         clubId||'',
           p_player_id:       playerId,
-          p_idempotency_key: idempotencyKey+':hab_compensate',
+          p_idempotency_key: placeLedgerId+':hab_compensate',
           p_reason:          'active_bettor_charge_failed',
           p_created_by:      playerId
         });
@@ -14862,7 +14759,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     // until awaited or .then()'d — calling .catch() directly throws
     // "upsert(...).catch is not a function". Use .then(noop, noop) instead.
     sb.from('ledger_entries').upsert({
-      id: idempotencyKey, club_id: clubId||null, player_id: playerId,
+      id: placeLedgerId, club_id: clubId||null, player_id: playerId,
       ticket_id: ticketId, type: 'bet_placed',
       amount: rnd(-stakeAmt), reason: 'bet_placed:'+betType,
       created_at: now, created_by: playerId
@@ -14902,7 +14799,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     // Velocity signal: track rapid bet placement
     emitRiskAlert('rapid_bet_velocity', clubId, playerId, { ticketId, stake:stakeAmt });
     res.json({ ok:true, ticketId, ticket:ticketRow, legs:legRows,
-               ledgerEntryId:idempotencyKey, balanceAfter:rpcResult.balance_after });
+               ledgerEntryId:placeLedgerId, balanceAfter:rpcResult.balance_after });
   } catch(e) {
     console.error('[bets/place] error:', e.message);
     res.status(500).json({ ok:false, error:e.message });
@@ -14911,7 +14808,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
 // ───────────────────────────────────────────────────────────────────────═
 
 // POST /api/bets/cancel — DB-authoritative ticket cancellation
-app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('cancel_bet'), requireIdempotency({required:true}), async (req, res) => {
+app.post('/api/bets/cancel', requireCanonicalClubId, requirePermissionScoped('cancel_bet'), requireIdempotency({required:true, money:true}), async (req, res) => {
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });

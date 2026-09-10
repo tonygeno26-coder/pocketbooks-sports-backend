@@ -82,6 +82,9 @@ CREATE INDEX IF NOT EXISTS idempotency_keys_expires_at_idx
 -- ---------------------------------------------------------------------------
 -- D. Retention helper (schedule externally — not auto-cron in this file)
 -- ---------------------------------------------------------------------------
+-- Prefer: migrations/PROPOSED_idempotency_keys_retention.sql
+--   CREATE FUNCTION public.purge_expired_idempotency_keys(...)
+-- Or one-shot:
 -- DELETE FROM public.idempotency_keys
 --  WHERE expires_at < now() - interval '7 days';
 
