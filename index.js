@@ -3469,6 +3469,14 @@ app.get('/api/clubs/:id/members', auth, async (req, res) => {
 app.get('/api/clubs/:id/requests', auth, async (req, res) => {
   try {
     const clubId = String(req.params.id);
+    // IDOR: any authenticated user must not enumerate another club's join queue.
+    const actor = requireActor(req);
+    if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+    const scope = _checkClubScope(actor, clubId);
+    if (!scope.ok) return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+      actorClubId: actor.clubId, requestedClubId: clubId });
+    if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+      return res.status(403).json({ ok:false, error:'insufficient_role', required:'host/admin' });
     const sb = getSupabase();
     if (sb) {
       const { data, error } = await sb.from('club_memberships')
@@ -3532,6 +3540,14 @@ app.get('/api/club/pending-requests', auth, async (req, res) => {
   const clubId = (req.query && (req.query.clubId || req.query.club_id)) || req._clubId
     || (req.body && (req.body.clubId || req.body.club_id));
   if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+  // IDOR: host-scoped only — do not leak pending memberships across clubs.
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ ok:false, error:actor.error });
+  const scope = _checkClubScope(actor, String(clubId));
+  if (!scope.ok) return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+    actorClubId: actor.clubId, requestedClubId: String(clubId) });
+  if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ ok:false, error:'insufficient_role', required:'host/admin' });
   // Reuse /api/clubs/:id/requests handler by mutating params and delegating.
   req.params = Object.assign({}, req.params || {}, { id: String(clubId) });
   try {
@@ -8846,12 +8862,13 @@ app.get('/api/mirror/tickets-with-legs', async (req, res) => {
     }
     const clubId = (!privileged && actor.clubId) ? actor.clubId : (qClubId || actor.clubId || null);
     if (!playerId) return res.status(400).json({ enabled:false, tickets:[], legs:[], error:'missing_playerId' });
+    if (!clubId) return res.status(400).json({ enabled:false, tickets:[], legs:[], error:'missing_clubId' });
     const limit = Math.min(parseInt(limitQ)||200, 500);
     let tq = sb.from('tickets')
       .select('id,type,status,risk_amount,potential_profit,estimated_payout,odds,placed_at,graded_at,grading_source,grading_snapshot,player_id,club_id')
+      .eq('player_id', playerId)
+      .eq('club_id', clubId)
       .order('placed_at', { ascending: false }).limit(limit);
-    if (playerId) tq = tq.eq('player_id', playerId);
-    if (clubId)   tq = tq.eq('club_id', clubId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
     // Fetch legs for these ticket IDs
@@ -8889,13 +8906,14 @@ app.get('/api/mirror/tickets', async (req, res) => {
     }
     const clubId = (!privileged && actor.clubId) ? actor.clubId : (qClubId || actor.clubId || null);
     if (!playerId) return res.status(400).json({ enabled:false, tickets:[], error:'missing_playerId' });
+    if (!clubId) return res.status(400).json({ enabled:false, tickets:[], error:'missing_clubId' });
     const limit = Math.min(parseInt(limitQ)||200, 500);
     let query = sb.from('tickets')
       .select('id, status, type, risk_amount, potential_profit, placed_at, graded_at, mirrored_at')
+      .eq('player_id', playerId)
+      .eq('club_id', clubId)
       .order('placed_at', { ascending: false })
       .limit(limit);
-    if (playerId) query = query.eq('player_id', playerId);
-    if (clubId)   query = query.eq('club_id', clubId);
     const { data, error, count } = await query;
     if (error) throw error;
     res.json({ enabled: true, tickets: data || [], count: count });
@@ -8904,31 +8922,60 @@ app.get('/api/mirror/tickets', async (req, res) => {
   }
 });
 
-// GET /api/mirror/audit — ticket mirror status
+// GET /api/mirror/audit — ticket mirror status (privileged ops only; never public)
 app.get('/api/mirror/audit', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ enabled:false, error:actor.error });
+  const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+  if (rank < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ enabled:false, error:'insufficient_role' });
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
   try {
+    const clubId = actor.platformRole === 'platform_admin'
+      ? ((req.query && req.query.clubId) || actor.clubId || null)
+      : (actor.clubId || null);
+    if (!clubId && actor.platformRole !== 'platform_admin')
+      return res.status(400).json({ enabled:false, error:'missing_clubId' });
     const limit = Math.min(parseInt(req.query.limit)||20, 100);
-    const { data, error, count } = await sb
-      .from('tickets')
+    let q = sb.from('tickets')
       .select('id, type, status, risk_amount, placed_at, mirrored_at', { count: 'exact' })
       .order('mirrored_at', { ascending: false })
       .limit(limit);
+    if (clubId) q = q.eq('club_id', clubId);
+    const { data, error, count } = await q;
     if (error) throw error;
-    res.json({ enabled: true, total_mirrored: count, recent: data || [] });
+    res.json({ enabled: true, total_mirrored: count, recent: data || [], clubId: clubId || null });
   } catch(e) { res.status(500).json({ enabled: true, error: e.message }); }
 });
 
 // GET /api/mirror/audit/legs — ticket_legs mirror status
 app.get('/api/mirror/audit/legs', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ enabled:false, error:actor.error });
+  const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+  if (rank < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ enabled:false, error:'insufficient_role' });
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
   try {
+    const clubId = actor.platformRole === 'platform_admin'
+      ? ((req.query && req.query.clubId) || actor.clubId || null)
+      : (actor.clubId || null);
+    if (!clubId && actor.platformRole !== 'platform_admin')
+      return res.status(400).json({ enabled:false, error:'missing_clubId' });
     const limit = Math.min(parseInt(req.query.limit)||50, 200);
+    // Legs join through tickets for club scope
+    let tq = sb.from('tickets').select('id').limit(500);
+    if (clubId) tq = tq.eq('club_id', clubId);
+    const { data: tix, error: tErr } = await tq;
+    if (tErr) throw tErr;
+    const ids = (tix||[]).map(function(t){ return t.id; });
+    if (!ids.length) return res.json({ enabled: true, total_mirrored: 0, recent: [] });
     const { data, error, count } = await sb
       .from('ticket_legs')
       .select('id, ticket_id, leg_index, canonical_game_key, market, pick, odds', { count: 'exact' })
+      .in('ticket_id', ids.slice(0, limit))
       .order('ticket_id', { ascending: false })
       .limit(limit);
     if (error) throw error;
@@ -8938,15 +8985,26 @@ app.get('/api/mirror/audit/legs', async (req, res) => {
 
 // GET /api/mirror/audit/ledger — ledger_entries mirror status
 app.get('/api/mirror/audit/ledger', async (req, res) => {
+  const actor = requireActor(req);
+  if (actor.error) return res.status(actor.status||401).json({ enabled:false, error:actor.error });
+  const rank = ROLE_RANK[actor.role] != null ? ROLE_RANK[actor.role] : -99;
+  if (rank < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
+    return res.status(403).json({ enabled:false, error:'insufficient_role' });
   const sb = getSupabase();
   if (!sb) return res.json({ enabled: false, reason: 'SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY not configured' });
   try {
+    const clubId = actor.platformRole === 'platform_admin'
+      ? ((req.query && req.query.clubId) || actor.clubId || null)
+      : (actor.clubId || null);
+    if (!clubId && actor.platformRole !== 'platform_admin')
+      return res.status(400).json({ enabled:false, error:'missing_clubId' });
     const limit = Math.min(parseInt(req.query.limit)||50, 200);
-    const { data, error, count } = await sb
-      .from('ledger_entries')
+    let q = sb.from('ledger_entries')
       .select('id, ticket_id, type, amount, balance_before, balance_after, reason, created_at', { count: 'exact' })
       .order('created_at', { ascending: false })
       .limit(limit);
+    if (clubId) q = q.eq('club_id', clubId);
+    const { data, error, count } = await q;
     if (error) throw error;
     res.json({ enabled: true, total_mirrored: count, recent: data || [] });
   } catch(e) { res.status(500).json({ enabled: true, error: e.message }); }
@@ -12986,13 +13044,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', stats:null });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
+  // Fail closed: never aggregate tickets/ledger/members across clubs.
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   try {
     // Load tickets (club-scoped). Extra columns are additive for the host Bets tab.
     let tq = sb.from('tickets')
       .select('id,status,type,odds,risk_amount,potential_profit,estimated_payout,player_id,player_username,placed_at,graded_at,insurance_enabled,cashout_offer_amount,cashout_offer_status')
+      .eq('club_id', clubId)
       .order('placed_at', { ascending:false })
       .limit(1000);
-    if (clubId)   tq = tq.eq('club_id',   clubId);
     if (playerId) tq = tq.eq('player_id', playerId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
@@ -13000,8 +13060,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     // Load recent ledger entries
     let lq = sb.from('ledger_entries')
       .select('id,ticket_id,player_id,type,amount,balance_before,balance_after,reason,created_at')
+      .eq('club_id', clubId)
       .order('created_at', { ascending:false }).limit(200);
-    if (clubId)   lq = lq.eq('club_id',   clubId);
     if (playerId) lq = lq.eq('player_id', playerId);
     const { data: ledger, error: lErr } = await lq;
     if (lErr) throw lErr;
@@ -13034,8 +13094,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
     var playerMemberCount = 0;
     var skippedHostIds = {};
     try {
-      var memQ = sb.from('club_memberships').select('actor_id,role,status');
-      if (clubId) memQ = memQ.eq('club_id', clubId);
+      var memQ = sb.from('club_memberships').select('actor_id,role,status')
+        .eq('club_id', clubId);
       const { data: memRows, error: memErr } = await memQ;
       if (memErr) throw memErr;
       membershipCount = (memRows||[]).length;
@@ -13061,8 +13121,8 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
 
     // Starting balances from club_members (canonical balance table).
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start,status');
-      if (clubId) plq = plq.eq('club_id', clubId);
+      let plq = sb.from('club_members').select('player_id,balance_start,status')
+        .eq('club_id', clubId);
       const { data: plRows, error: mErr } = await plq;
       if (mErr) throw mErr;
       (plRows||[]).forEach(function(r) {
@@ -13409,11 +13469,12 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
   if (!sb) return res.json({ ok:false, source:'supabase_not_configured', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId', players:[], totals:{playersOwe:0,hostOwes:0,net:0} });
   try {
     // Load all tickets for this club
     let tq = sb.from('tickets')
-      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at,type');
-    if (clubId) tq = tq.eq('club_id', clubId);
+      .select('id,status,risk_amount,potential_profit,player_id,player_username,placed_at,graded_at,type')
+      .eq('club_id', clubId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
@@ -13422,8 +13483,8 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     var memberMap = {};
     var skippedHostIds = {};
     try {
-      var memQ = sb.from('club_memberships').select('actor_id,role,status');
-      if (clubId) memQ = memQ.eq('club_id', clubId);
+      var memQ = sb.from('club_memberships').select('actor_id,role,status')
+        .eq('club_id', clubId);
       const { data: memRows, error: memErr } = await memQ;
       if (memErr) throw memErr;
       (memRows||[]).forEach(function(r) {
@@ -13440,8 +13501,8 @@ app.get('/api/host/settlements-preview', requireCanonicalClubId, requirePermissi
     } catch(_e) { console.warn('[settlements-preview] club_memberships fetch error:', _e.message); }
 
     try {
-      let plq = sb.from('club_members').select('player_id,balance_start,status');
-      if (clubId) plq = plq.eq('club_id', clubId);
+      let plq = sb.from('club_members').select('player_id,balance_start,status')
+        .eq('club_id', clubId);
       const { data: plRows } = await plq;
       (plRows||[]).forEach(function(r) {
         if (r.player_id == null) return;
@@ -14991,6 +15052,11 @@ app.post('/api/host/offer-cashout', requireCanonicalClubId, requirePermissionSco
     if (tErr) throw tErr;
     const ticket = tix && tix[0];
     if (!ticket) return res.status(404).json({ ok:false, error:'ticket_not_found' });
+    const offerClubId = req._clubId || actor.clubId || null;
+    if (!offerClubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+    if (!ticket.club_id || String(ticket.club_id) !== String(offerClubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+        ticketClubId: ticket.club_id, actorClubId: offerClubId });
     const st = String(ticket.status||'').toLowerCase();
     if (st !== 'active' && st !== 'open')
       return res.status(400).json({ ok:false, error:'ticket_not_active' });
@@ -15002,7 +15068,7 @@ app.post('/api/host/offer-cashout', requireCanonicalClubId, requirePermissionSco
     await sb.from('tickets').update({
       cashout_offer_amount: amount,
       cashout_offer_status: 'offered'
-    }).eq('id', ticketId);
+    }).eq('id', ticketId).eq('club_id', offerClubId);
     const notifId = await _notifyPlayer({
       playerId: ticket.player_id,
       type: 'cashout_offer',
@@ -15045,6 +15111,11 @@ app.post('/api/bets/accept-cashout', requireCanonicalClubId, requirePermissionSc
     if (actor.actorId && String(actor.actorId) !== String(ticket.player_id)
         && (ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
       return res.status(403).json({ ok:false, error:'not_owner' });
+    const acceptClubId = req._clubId || actor.clubId || null;
+    if (!acceptClubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+    if (!ticket.club_id || String(ticket.club_id) !== String(acceptClubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+        ticketClubId: ticket.club_id, actorClubId: acceptClubId });
     const st = String(ticket.status||'').toLowerCase();
     if (st === 'cashed_out') return res.json({ ok:true, idempotent:true, ticketId, status:'cashed_out' });
     if (st !== 'active' && st !== 'open')
@@ -15065,10 +15136,11 @@ app.post('/api/bets/accept-cashout', requireCanonicalClubId, requirePermissionSc
       status: 'cashed_out',
       cashout_offer_status: 'accepted',
       graded_at: new Date().toISOString()
-    }).eq('id', ticketId);
+    }).eq('id', ticketId).eq('club_id', acceptClubId);
     if (notificationId) {
       try {
-        await sb.from('player_notifications').update({ read: true }).eq('id', notificationId);
+        await sb.from('player_notifications').update({ read: true })
+          .eq('id', notificationId).eq('player_id', String(ticket.player_id));
       } catch(_n) {}
     }
     try {
@@ -15109,10 +15181,17 @@ app.post('/api/bets/decline-cashout', requireCanonicalClubId, requirePermissionS
     if (actor.actorId && String(actor.actorId) !== String(ticket.player_id)
         && (ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin && actor.platformRole !== 'platform_admin')
       return res.status(403).json({ ok:false, error:'not_owner' });
-    await sb.from('tickets').update({ cashout_offer_status: 'declined' }).eq('id', ticketId);
+    const declineClubId = req._clubId || actor.clubId || null;
+    if (!declineClubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+    if (!ticket.club_id || String(ticket.club_id) !== String(declineClubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch',
+        ticketClubId: ticket.club_id, actorClubId: declineClubId });
+    await sb.from('tickets').update({ cashout_offer_status: 'declined' })
+      .eq('id', ticketId).eq('club_id', declineClubId);
     if (notificationId) {
       try {
-        await sb.from('player_notifications').update({ read: true }).eq('id', notificationId);
+        await sb.from('player_notifications').update({ read: true })
+          .eq('id', notificationId).eq('player_id', String(ticket.player_id));
       } catch(_n) {}
     }
     res.json({ ok:true, ticketId, status: ticket.status, declined: true });
@@ -15129,13 +15208,14 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId, playerId } = req.query;
   if (!playerId) return res.status(400).json({ ok:false, error:'missing_playerId' });
+  // Fail closed: multi-club players must never see cross-club tickets/balances.
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   try {
     // Tickets for this player
     let tq = sb.from('tickets').select(
       'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id,insurance_enabled,cashout_offer_amount,cashout_offer_status'
-    ).eq('player_id', playerId);
-    if (clubId) tq = tq.eq('club_id', clubId);
+    ).eq('player_id', playerId).eq('club_id', clubId);
     tq = tq.order('placed_at', { ascending:false });
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
@@ -15342,8 +15422,17 @@ app.get('/api/host/settlements/:periodId/snapshots', requirePermissionScoped('vi
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { periodId } = req.params;
+  const clubId = req._clubId || (req.query && req.query.clubId) || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const revision = req.query.revision != null ? parseInt(req.query.revision,10) : null;
   try {
+    // Bind period to actor club — periodId alone is an IDOR vector.
+    const { data: pRows } = await sb.from('settlement_periods').select('period_id,club_id')
+      .eq('period_id', periodId).limit(1);
+    const period = pRows && pRows[0];
+    if (!period) return res.status(404).json({ ok:false, error:'period_not_found' });
+    if (String(period.club_id) !== String(clubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch' });
     let q = sb.from('settlement_snapshots').select('*').eq('period_id',periodId);
     if (revision != null) q = q.eq('revision',revision);
     else {
@@ -15372,12 +15461,14 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
   const amt = parseFloat(amount);
   if (isNaN(amt)||amt<=0) return res.status(400).json({ ok:false, error:'invalid_amount' });
   try {
-    // Period must be closed or reopened
-    const { data:pData } = await sb.from('settlement_periods').select('status,revision')
+    // Period must be closed or reopened + belong to actor club
+    const { data:pData } = await sb.from('settlement_periods').select('status,revision,club_id')
       .eq('period_id',periodId).limit(1);
     const period = pData&&pData[0];
     if (!period||period.status==='open')
       return res.status(409).json({ ok:false, code:'period_not_closed' });
+    if (String(period.club_id) !== String(clubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch' });
     // Snapshot for overpayment check
     const { data:snapData } = await sb.from('settlement_snapshots').select('amount_owed_by_player,amount_owed_to_player')
       .eq('period_id',periodId).eq('player_id',playerId).order('revision',{ascending:false}).limit(1);
@@ -15425,6 +15516,10 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
     const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
     const pay = pData&&pData[0];
     if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
+    const confirmClubId = req._clubId || actor.clubId || null;
+    if (!confirmClubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+    if (!pay.club_id || String(pay.club_id) !== String(confirmClubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch' });
     if (pay.status==='confirmed') return res.json({ ok:true, idempotent:true, paymentId });
     if (pay.status==='voided')    return res.status(409).json({ ok:false, error:'payment_voided' });
     const iKey = 'CONFIRM_PAY_'+paymentId;
@@ -15505,6 +15600,10 @@ app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_p
     const { data:pData } = await sb.from('settlement_payments').select('*').eq('payment_id',paymentId).limit(1);
     const pay = pData&&pData[0];
     if (!pay) return res.status(404).json({ ok:false, error:'payment_not_found' });
+    const voidClubId = req._clubId || actor.clubId || null;
+    if (!voidClubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
+    if (!pay.club_id || String(pay.club_id) !== String(voidClubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch' });
     if (pay.status==='voided') return res.json({ ok:true, idempotent:true, paymentId });
     let reversalLedgerId = null;
     // If already ledger-applied, write reversal
@@ -15538,8 +15637,16 @@ app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('vie
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   const { periodId } = req.params;
+  const clubId = req._clubId || (req.query && req.query.clubId) || null;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const actor = req._actor||{};
   try {
+    const { data: pRows } = await sb.from('settlement_periods').select('period_id,club_id')
+      .eq('period_id', periodId).limit(1);
+    const period = pRows && pRows[0];
+    if (!period) return res.status(404).json({ ok:false, error:'period_not_found' });
+    if (String(period.club_id) !== String(clubId))
+      return res.status(403).json({ ok:false, error:'club_scope_mismatch' });
     // Load snapshots (latest revision)
     const { data:revData } = await sb.from('settlement_snapshots').select('revision')
       .eq('period_id',periodId).order('revision',{ascending:false}).limit(1);
@@ -15547,7 +15654,7 @@ app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('vie
     const { data:snaps } = await sb.from('settlement_snapshots').select('*')
       .eq('period_id',periodId).eq('revision',latestRev);
     const { data:payments } = await sb.from('settlement_payments').select('*')
-      .eq('period_id',periodId).order('created_at');
+      .eq('period_id',periodId).eq('club_id', clubId).order('created_at');
     // Build per-player balance view
     const byPlayer = {};
     (snaps||[]).forEach(function(s) {
@@ -15775,11 +15882,12 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
   if (!sb) return res.json({ ok:false, status:'supabase_not_configured' });
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
   const { clubId } = req.query;
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId' });
   const rnd = function(v){ return Math.round((isNaN(v)?0:v)*100)/100; };
   try {
     // 1. Tickets
-    let tq = sb.from('tickets').select('id,status,risk_amount,potential_profit');
-    if (clubId) tq = tq.eq('club_id', clubId);
+    let tq = sb.from('tickets').select('id,status,risk_amount,potential_profit')
+      .eq('club_id', clubId);
     const { data: tickets } = await tq;
     var activeRisk=0, settledGain=0, settledLoss=0;
     (tickets||[]).forEach(function(t){
@@ -15793,8 +15901,8 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
       settledLoss:rnd(settledLoss), profit:rnd(settledGain-settledLoss) };
 
     // 2. Ledger
-    let lq = sb.from('ledger_entries').select('id,type,amount');
-    if (clubId) lq = lq.eq('club_id', clubId);
+    let lq = sb.from('ledger_entries').select('id,type,amount')
+      .eq('club_id', clubId);
     const { data: ledger } = await lq;
     var lTotals = { bet_placed:0,bet_won:0,bet_lost:0,bet_push:0,bet_canceled:0,settlement:0,other:0 };
     (ledger||[]).forEach(function(e){
@@ -15969,13 +16077,14 @@ app.get('/api/host/unresolved-grading', requireCanonicalClubId, requirePermissio
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured', autoGrade:false });
   const clubId = req._clubId || (req.query && req.query.clubId) || '';
+  if (!clubId) return res.status(400).json({ ok:false, error:'missing_clubId', autoGrade:false });
   try {
     let tq = sb.from('tickets')
       .select('id,status,type,player_id,player_username,placed_at,graded_at,grading_source')
+      .eq('club_id', clubId)
       .in('status', ['active', 'open'])
       .order('placed_at', { ascending:true })
       .limit(500);
-    if (clubId) tq = tq.eq('club_id', clubId);
     const { data: tickets, error: tErr } = await tq;
     if (tErr) throw tErr;
 
