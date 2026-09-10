@@ -472,6 +472,83 @@ async function run() {
     assertEq(a, b);
   });
 
+  await test('CORRELATION REJECT: failed row, no phantom ticket, exact retry stays rejected', async function () {
+    const store = engine.createMemStore();
+    const sim = createPlaceSimulator();
+    const scope = { clientKey: 'Kcorr', clubId: 'C1', playerId: 'P1', actorId: 'P1' };
+    const body = { stake: 1, betType: 'Parlay', legs: [{ e: 1 }, { e: 1 }] };
+    const r1 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r1.action, 'execute');
+    // Simulate place handler correlation gate: 422, zero money, no ticket created.
+    // Middleware must NOT pass pre-reserved deterministic ticket id on error.
+    const phantom = engine.deterministicTicketId('C1', 'P1', 'Kcorr');
+    await engine.idemComplete(store, scope, 422, {
+      ok: false,
+      error: 'parlay_correlation_rejected',
+      financialMutation: 'NONE'
+    }, null);
+    const row = await store.load(scope);
+    assertEq(row.status, 'failed');
+    assertEq(row.response_status, 422);
+    assertEq(row.ticket_id, null);
+    assert(row.ticket_id !== phantom);
+    assertEq(sim.tickets.length, 0);
+
+    // Exact retry must replay rejection — never place, never promote to completed.
+    const r2 = await engine.idemCheck(store, scope, '/api/bets/place', body, { money: true });
+    assertEq(r2.action, 'replay');
+    assertEq(r2.existingRow.status, 'failed');
+    assertEq(r2.existingRow.response_status, 422);
+    assertEq(r2.existingRow.ticket_id, null);
+    assertEq(sim.tickets.length, 0);
+  });
+
+  await test('middleware res.json: error path omits deterministic ticket_id', async function () {
+    const store = engine.createMemStore();
+    const requireIdem = engine.createRequireIdempotency({ store: store });
+    const mw = requireIdem({ required: true, money: true });
+    const req = {
+      headers: { 'idempotency-key': 'Kmw422' },
+      body: { clubId: 'C1', playerId: 'P1', stake: 1 },
+      path: '/api/bets/place',
+      _actor: { actorId: 'P1' },
+      _clubId: 'C1'
+    };
+    let completedBody = null;
+    let completedStatus = null;
+    const res = {
+      statusCode: 200,
+      status: function (code) { this.statusCode = code; return this; },
+      json: function (body) {
+        completedStatus = this.statusCode;
+        completedBody = body;
+        return this;
+      }
+    };
+    await new Promise(function (resolve, reject) {
+      mw(req, res, function (err) {
+        if (err) return reject(err);
+        // Mimic correlation reject after reserve
+        res.status(422).json({
+          ok: false,
+          error: 'parlay_correlation_rejected',
+          financialMutation: 'NONE'
+        });
+        resolve();
+      });
+    });
+    // Allow async idemComplete
+    await new Promise(function (r) { setTimeout(r, 20); });
+    const scope = { clientKey: 'Kmw422', clubId: 'C1', playerId: 'P1' };
+    const row = await store.load(scope);
+    assert(row, 'idempotency row should exist');
+    assertEq(row.status, 'failed');
+    assertEq(row.response_status, 422);
+    assertEq(row.ticket_id, null);
+    assertEq(completedStatus, 422);
+    assertEq(completedBody.error, 'parlay_correlation_rejected');
+  });
+
   await test('legacy pending status treated as in-progress', function () {
     const r = engine.evaluateExisting({
       club_id: 'C1', player_id: 'P1', actor_id: 'P1',
