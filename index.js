@@ -70,18 +70,19 @@ function _envFlag(name, defaultValue) {
   return String(raw).toLowerCase() === 'true';
 }
 
-// Production defaults: settlement ON unless explicitly disabled via env.
-// Set GRADING_SETTLEMENT_ENABLED=false to opt out (e.g. during migration testing).
-const _GRADING_DEFAULT_ON = process.env.NODE_ENV === 'production';
-const GRADING_SETTLEMENT_ENABLED = _envFlag('GRADING_SETTLEMENT_ENABLED', _GRADING_DEFAULT_ON);
-const GRADE_RUN_DRY_RUN_ENABLED = _envFlag('GRADE_RUN_DRY_RUN_ENABLED', !_GRADING_DEFAULT_ON);
-const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLED', _GRADING_DEFAULT_ON);
-const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', _GRADING_DEFAULT_ON);
+// Settlement money path is fail-closed. A missing env var must not arm settlement.
+// Explicit GRADING_SETTLEMENT_ENABLED=true is required to write grade_ticket_tx.
+// Live betting does not follow the settlement default.
+const _LIVE_BETTING_DEFAULT_ON = process.env.NODE_ENV === 'production';
+const GRADING_SETTLEMENT_ENABLED = _envFlag('GRADING_SETTLEMENT_ENABLED', false);
+const GRADE_RUN_DRY_RUN_ENABLED = _envFlag('GRADE_RUN_DRY_RUN_ENABLED', true);
+const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLED', false);
+const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', false);
 const BROWSER_TICKET_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_TICKET_MIRROR_WRITES_ENABLED', false);
 const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRITES_ENABLED', false);
-// Live betting: on in production unless explicitly disabled (matches grading default).
+// Live betting: on in production unless explicitly disabled.
 // Set LIVE_BETTING_ENABLED=false to opt out during migration / testing.
-const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', _GRADING_DEFAULT_ON);
+const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', _LIVE_BETTING_DEFAULT_ON);
 // Player beta: ordinary accounts cannot create clubs. Leave unset / false in production.
 const PUBLIC_CLUB_CREATION_ENABLED = _envFlag('PUBLIC_CLUB_CREATION_ENABLED', false);
 const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
@@ -2835,6 +2836,10 @@ app.get('/api/health', async (req, res) => {
     resultStatus:_lastResultSuccessAt?'healthy':(_mlbGradePollerStarted?'starting':'unknown'),
     queueStatus:'not_implemented',
     liveBettingEnabled: !!LIVE_BETTING_ENABLED,
+    settlementEnabled: !!GRADING_SETTLEMENT_ENABLED,
+    workerSettlementEnabled: !!WORKER_GRADE_SETTLEMENT_ENABLED,
+    manualSettlementEnabled: !!MANUAL_GRADE_SETTLEMENT_ENABLED,
+    gradeRunDryRunEnabled: !!GRADE_RUN_DRY_RUN_ENABLED,
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
     lastGradePollAt:_lastGradePollAt, lastGradeRunAt:_lastGradeRunAt,
     lastGradedAt:_lastGradedAt,
