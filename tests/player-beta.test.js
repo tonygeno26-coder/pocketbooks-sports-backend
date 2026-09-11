@@ -158,5 +158,24 @@ test('member approval and denial verify pending status transition', function() {
     'denial route must use verified membership transition');
 });
 
+test('pending request listing matches production membership schema', function() {
+  const firstRoute = indexSrc.slice(
+    indexSrc.indexOf("app.get('/api/clubs/:id/requests'"),
+    indexSrc.indexOf("// Alias used by overnight join-request flow")
+  );
+  const aliasRoute = indexSrc.slice(
+    indexSrc.indexOf("app.get('/api/club/pending-requests'"),
+    indexSrc.indexOf("app.patch('/api/clubs/:id/requests/:memberId'")
+  );
+  assert(firstRoute.indexOf("select('actor_id,club_id,role,status,joined_at,updated_at')") !== -1,
+    'club request listing must not select nonexistent club_memberships.id');
+  assert(aliasRoute.indexOf("select('actor_id,club_id,role,status,joined_at,updated_at')") !== -1,
+    'pending-request alias must not select nonexistent club_memberships.id');
+  assert(firstRoute.indexOf('membershipId: null') !== -1,
+    'request listing should not invent a membership id');
+  assert(aliasRoute.indexOf('membershipId: null') !== -1,
+    'pending-request alias should not invent a membership id');
+});
+
 console.log('\nPlayer beta tests: ' + pass + ' passed, ' + fail + ' failed');
 if (fail) process.exit(1);

@@ -3466,7 +3466,7 @@ app.get('/api/clubs/:id/requests', auth, async (req, res) => {
     const sb = getSupabase();
     if (sb) {
       const { data, error } = await sb.from('club_memberships')
-        .select('id,actor_id,club_id,role,status,joined_at,updated_at')
+        .select('actor_id,club_id,role,status,joined_at,updated_at')
         .eq('club_id', clubId)
         .eq('status', 'pending')
         .order('joined_at', { ascending: false });
@@ -3483,8 +3483,8 @@ app.get('/api/clubs/:id/requests', auth, async (req, res) => {
       const requests = rows.map(function(r){
         var u = usersById[String(r.actor_id)] || {};
         return {
-          id: r.id,
-          membershipId: r.id,
+          id: r.actor_id,
+          membershipId: null,
           actor_id: r.actor_id,
           player_id: r.actor_id,
           playerId: r.actor_id,
@@ -3540,7 +3540,7 @@ app.get('/api/club/pending-requests', auth, async (req, res) => {
     const sb = getSupabase();
     if (sb) {
       const { data, error } = await sb.from('club_memberships')
-        .select('id,actor_id,club_id,role,status,joined_at,updated_at')
+        .select('actor_id,club_id,role,status,joined_at,updated_at')
         .eq('club_id', String(clubId))
         .eq('status', 'pending')
         .order('joined_at', { ascending: false });
@@ -3557,8 +3557,8 @@ app.get('/api/club/pending-requests', auth, async (req, res) => {
       const requests = rows.map(function(r){
         var u = usersById[String(r.actor_id)] || {};
         return {
-          id: r.id,
-          membershipId: r.id,
+          id: r.actor_id,
+          membershipId: null,
           actor_id: r.actor_id,
           player_id: r.actor_id,
           playerId: r.actor_id,
