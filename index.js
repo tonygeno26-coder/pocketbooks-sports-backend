@@ -3290,7 +3290,21 @@ function auth(req, res, next) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'No token' });
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
-  catch(e) { res.status(401).json({ error: 'Invalid token' }); }
+  catch(e) {
+    const actor = requireActor(req);
+    if (actor && !actor.error && actor.actorId) {
+      req.user = {
+        id: actor.actorId,
+        role: actor.role,
+        clubId: actor.clubId || '',
+        platformRole: actor.platformRole || null
+      };
+      req._actor = actor;
+      req._clubId = actor.clubId || '';
+      return next();
+    }
+    res.status(401).json({ error: 'Invalid token' });
+  }
 }
 
 function adminAuth(req, res, next) {
