@@ -133,5 +133,30 @@ test('signup and join are rate limited', function() {
   assert(indexSrc.indexOf("'/api/club/join-request'") !== -1);
 });
 
+test('member approval and denial verify pending status transition', function() {
+  assert(indexSrc.indexOf('async function _membershipSetPendingStatus') !== -1,
+    'membership transition helper missing');
+  assert(indexSrc.indexOf("throw new Error('membership_status_update_failed')") !== -1,
+    'membership transition must fail when the row status does not change');
+  assert(indexSrc.indexOf('updatePendingCompat') !== -1,
+    'membership transition must tolerate schemas without optional approved_at');
+  assert(indexSrc.indexOf('/approved_at/i.test') !== -1,
+    'membership transition must retry without approved_at on schema-cache mismatch');
+
+  const approveRoute = indexSrc.slice(
+    indexSrc.indexOf("app.post('/api/club/members/approve'"),
+    indexSrc.indexOf("app.post('/api/club/members/deny'")
+  );
+  assert(approveRoute.indexOf("_membershipSetPendingStatus(targetActorId, clubId, 'approved'") !== -1,
+    'approval route must use verified membership transition');
+
+  const denyRoute = indexSrc.slice(
+    indexSrc.indexOf("app.post('/api/club/members/deny'"),
+    indexSrc.indexOf("app.post('/api/club/members/role'")
+  );
+  assert(denyRoute.indexOf("_membershipSetPendingStatus(targetActorId, clubId, 'rejected'") !== -1,
+    'denial route must use verified membership transition');
+});
+
 console.log('\nPlayer beta tests: ' + pass + ' passed, ' + fail + ' failed');
 if (fail) process.exit(1);

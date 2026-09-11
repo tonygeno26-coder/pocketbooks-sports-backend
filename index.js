@@ -5018,6 +5018,90 @@ function _membershipInvalidate(actorId, clubId) {
   _membershipMemCache.delete(_mKey(actorId, clubId));
 }
 
+async function _membershipLoadUncached(actorId, clubId) {
+  const sb = getSupabase();
+  if (sb) {
+    const actorKey = String(actorId);
+    const clubKey = String(clubId);
+    const byActor = await sb.from('club_memberships').select('*')
+      .eq('actor_id', actorKey).eq('club_id', clubKey).limit(1);
+    if (byActor.error) throw byActor.error;
+    if (byActor.data && byActor.data[0]) return byActor.data[0];
+
+    const byPlayer = await sb.from('club_memberships').select('*')
+      .eq('player_id', actorKey).eq('club_id', clubKey).limit(1);
+    if (byPlayer.error) throw byPlayer.error;
+    return byPlayer.data && byPlayer.data[0] ? byPlayer.data[0] : null;
+  }
+  const r = await query(
+    'SELECT * FROM club_memberships WHERE club_id=$1 AND (actor_id=$2 OR player_id=$2) LIMIT 1',
+    [clubId, actorId]
+  );
+  return r.rows[0] || null;
+}
+
+async function _membershipSetPendingStatus(actorId, clubId, status, updatedBy) {
+  const actorKey = String(actorId);
+  const clubKey = String(clubId);
+  const now = new Date().toISOString();
+  const update = { status, updated_at:now, updated_by:updatedBy || null };
+  if (status === 'approved') update.approved_at = now;
+  if (status === 'rejected') update.approved_at = null;
+
+  const sb = getSupabase();
+  if (sb) {
+    async function updatePending(column, patch) {
+      return sb.from('club_memberships')
+        .update(patch)
+        .eq(column, actorKey).eq('club_id', clubKey).eq('status','pending');
+    }
+    async function updatePendingCompat(column) {
+      let result = await updatePending(column, update);
+      if (result.error && /approved_at/i.test(String(result.error.message || result.error))) {
+        const compact = { status, updated_at:now, updated_by:updatedBy || null };
+        result = await updatePending(column, compact);
+      }
+      return result;
+    }
+
+    const byActor = await updatePendingCompat('actor_id');
+    if (byActor.error) throw byActor.error;
+
+    let row = await _membershipLoadUncached(actorKey, clubKey);
+    if (row && String(row.status || '').toLowerCase() === status) {
+      _membershipInvalidate(actorKey, clubKey);
+      return row;
+    }
+
+    const byPlayer = await updatePendingCompat('player_id');
+    if (byPlayer.error) throw byPlayer.error;
+
+    row = await _membershipLoadUncached(actorKey, clubKey);
+    if (!row) {
+      throw new Error('membership_not_found');
+    }
+    if (String(row.status || '').toLowerCase() !== status) {
+      throw new Error('membership_status_update_failed');
+    }
+    _membershipInvalidate(actorKey, clubKey);
+    return row;
+  }
+
+  const approvedSql = status === 'approved' ? ',approved_at=NOW()' : ',approved_at=NULL';
+  await query(
+    `UPDATE club_memberships SET status=$1,updated_at=NOW(),updated_by=$2${approvedSql} ` +
+    `WHERE club_id=$3 AND (actor_id=$4 OR player_id=$4) AND status='pending'`,
+    [status, updatedBy || null, clubKey, actorKey]
+  );
+  const row = await _membershipLoadUncached(actorKey, clubKey);
+  if (!row) throw new Error('membership_not_found');
+  if (String(row.status || '').toLowerCase() !== status) {
+    throw new Error('membership_status_update_failed');
+  }
+  _membershipInvalidate(actorKey, clubKey);
+  return row;
+}
+
 // Resolve role for token issuance (production: DB wins; dev: fallback allowed)
 function _membershipStatusActive(status) {
   const s = String(status || '').toLowerCase();
@@ -12116,16 +12200,8 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
   try {
     const sb = getSupabase();
     if (sb) {
-      // Prefer status=approved (host approval flow); auth accepts approved|active.
-      const { error: memErr } = await sb.from('club_memberships')
-        .update({ status:'approved', updated_at:now, updated_by:actor.actorId, approved_at:now })
-        .eq('actor_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
-      if (memErr) {
-        // Some schemas use player_id instead of actor_id
-        await sb.from('club_memberships')
-          .update({ status:'approved', updated_at:now, updated_by:actor.actorId, approved_at:now })
-          .eq('player_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
-      }
+      // Auth accepts approved|active; verify that the pending row actually moved.
+      await _membershipSetPendingStatus(targetActorId, clubId, 'approved', actor.actorId);
 
       await sb.from('player_limits').upsert(limitsRow, { onConflict:'club_id,player_id' });
 
@@ -12193,14 +12269,7 @@ app.post('/api/club/members/deny', requirePermissionScoped('settle_player'), asy
   try {
     const sb = getSupabase();
     if (sb) {
-      let { error } = await sb.from('club_memberships')
-        .update({ status:'rejected', updated_at:now, updated_by:actor.actorId })
-        .eq('actor_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
-      if (error) {
-        await sb.from('club_memberships')
-          .update({ status:'rejected', updated_at:now, updated_by:actor.actorId })
-          .eq('player_id', String(targetActorId)).eq('club_id', String(clubId)).eq('status','pending');
-      }
+      await _membershipSetPendingStatus(targetActorId, clubId, 'rejected', actor.actorId);
       try {
         await sb.from('notifications').insert({
           user_id: String(targetActorId),
