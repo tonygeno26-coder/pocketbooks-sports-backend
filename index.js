@@ -9,6 +9,7 @@ const ncaafTeamLogos = require('./lib/ncaaf-team-logos');
 const soccerTeamLogos = require('./lib/soccer-team-logos');
 const owlsBookmakerAdapter = require('./lib/owls-bookmaker-adapter');
 const owlsLiveScores = require('./lib/owls-live-scores');
+const playerBeta = require('./lib/player-beta');
 const idempotencyEngine = require('./lib/idempotency-engine');
 const parlayCorrelation = require('./lib/parlay-correlation');
 const { io: socketIoClient } = require('socket.io-client');
@@ -40,7 +41,12 @@ const RATE_LIMIT_CONFIG = {
   '/api/markets/refresh':    { maxReqs:5,   windowMs:60000, keyBy:'club' },
   '/api/host/settlements':   { maxReqs:20,  windowMs:60000, keyBy:'actor' },
   '/api/club/members':       { maxReqs:20,  windowMs:60000, keyBy:'actor' },
-  '/api/club/risk-settings': { maxReqs:20,  windowMs:60000, keyBy:'actor' }
+  '/api/club/risk-settings': { maxReqs:20,  windowMs:60000, keyBy:'actor' },
+  '/api/auth/signup':        { maxReqs:8,   windowMs:900000, keyBy:'ip' },
+  '/api/auth/login':         { maxReqs:20,  windowMs:900000, keyBy:'ip' },
+  '/api/club/join-request':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
+  '/api/club/request-join':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
+  '/api/clubs/request':      { maxReqs:10,  windowMs:60000, keyBy:'actor' }
 };
 
 function _getRlConfig(path) {
@@ -76,6 +82,8 @@ const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRI
 // Live betting: on in production unless explicitly disabled (matches grading default).
 // Set LIVE_BETTING_ENABLED=false to opt out during migration / testing.
 const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', _GRADING_DEFAULT_ON);
+// Player beta: ordinary accounts cannot create clubs. Leave unset / false in production.
+const PUBLIC_CLUB_CREATION_ENABLED = _envFlag('PUBLIC_CLUB_CREATION_ENABLED', false);
 const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
 const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
 const LIVE_PLACEMENT_REJECTION_CODES = new Set([
@@ -3297,7 +3305,8 @@ app.post('/api/auth/signup', async (req, res) => {
   if (!email || !password || !name) return res.status(400).json({ error: 'Missing fields' });
   try {
     const hashed = await bcrypt.hash(password, 10);
-    const assignedRole = (process.env.MASTER_ADMIN_EMAIL && email.toLowerCase() === process.env.MASTER_ADMIN_EMAIL.toLowerCase()) ? 'master_admin' : 'user';
+    // Client role is ignored. New accounts are ordinary users, never host/admin.
+    const assignedRole = playerBeta.assignedSignupRole(role, email, process.env.MASTER_ADMIN_EMAIL);
     const r = await query(
       'INSERT INTO users (email,password,name,role,diamonds) VALUES ($1,$2,$3,$4,$5) RETURNING id,email,name,role,diamonds',
       [email.toLowerCase(), hashed, name, assignedRole, 500]
@@ -3372,6 +3381,8 @@ app.get('/api/auth/me', auth, async (req, res) => {
 function genCode() { return Math.random().toString(36).substring(2,8).toUpperCase(); }
 
 app.post('/api/clubs', auth, async (req, res) => {
+  const denied = playerBeta.createClubDenial(PUBLIC_CLUB_CREATION_ENABLED);
+  if (denied) return res.status(denied.http).json(denied.body);
   const { name, description, max_bet, max_parlay } = req.body;
   if (!name) return res.status(400).json({ error: 'Name required' });
   let code = genCode();
@@ -3400,65 +3411,19 @@ app.get('/api/clubs/search/:code', async (req, res) => {
         .limit(1)
         .maybeSingle();
       if (error) throw error;
-      if (!data || data.active === false) return res.status(404).json({ error: 'Club not found' });
-      return res.json(Object.assign({}, data, {
-        is_locked: !!data.is_locked,
-        is_active: data.active !== false
-      }));
+      const card = data && data.active !== false ? playerBeta.publicClubCard(data) : null;
+      if (!card) return res.status(404).json({ error: 'Club not found' });
+      return res.json(Object.assign({ ok:true }, card));
     }
     const r = await query('SELECT id,name,code,description,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [code]);
-    if (!r.rows.length) return res.status(404).json({ error: 'Club not found' });
-    const row = r.rows[0];
-    res.json(Object.assign({}, row, { is_locked: !!row.is_locked, is_active: !!row.active }));
+    const card = r.rows.length ? playerBeta.publicClubCard(r.rows[0]) : null;
+    if (!card) return res.status(404).json({ error: 'Club not found' });
+    res.json(Object.assign({ ok:true }, card));
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/clubs/request', auth, async (req, res) => {
-  const { code } = req.body || {};
-  if (!code) return res.status(400).json({ ok:false, error: 'missing_code' });
-  try {
-    const codeUp = String(code).toUpperCase();
-    const actorId = String(req.user.id);
-    const sb = getSupabase();
-    let c = null;
-    if (sb) {
-      const { data, error } = await sb.from('clubs').select('*').eq('code', codeUp).limit(1).maybeSingle();
-      if (error) throw error;
-      if (!data || data.active === false) return res.status(404).json({ ok:false, error: 'Club not found' });
-      c = data;
-    } else {
-      const club = await query('SELECT * FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [codeUp]);
-      if (!club.rows.length) return res.status(404).json({ ok:false, error: 'Club not found' });
-      c = club.rows[0];
-    }
-    if (c.is_locked) {
-      return res.status(403).json({
-        ok: false,
-        error: 'club_locked',
-        message: 'This club is not accepting new members right now'
-      });
-    }
-    const clubId = String(c.id);
-    if (sb) {
-      const { data: existing } = await sb.from('club_memberships')
-        .select('actor_id,status').eq('club_id', clubId).eq('actor_id', actorId).limit(1);
-      if (existing && existing.length) {
-        return res.status(400).json({ ok:false, error: 'Already a member', status: existing[0].status });
-      }
-      const now = new Date().toISOString();
-      const { error: insErr } = await sb.from('club_memberships').insert({
-        actor_id: actorId, club_id: clubId, role: 'player', status: 'pending',
-        joined_at: now, updated_at: now
-      });
-      if (insErr) throw insErr;
-    } else {
-      const exists = await query('SELECT actor_id,status FROM club_memberships WHERE club_id=$1 AND actor_id=$2', [clubId, actorId]);
-      if (exists.rows.length) return res.status(400).json({ ok:false, error: 'Already a member', status: exists.rows[0].status });
-      await query('INSERT INTO club_memberships (club_id,actor_id,status,role,joined_at,updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())',
-        [clubId, actorId, 'pending', 'player']);
-    }
-    res.json({ ok:true, success: true, club: { id: c.id, name: c.name, code: c.code, is_locked: !!c.is_locked } });
-  } catch(e) { res.status(500).json({ ok:false, error: e.message }); }
+app.post('/api/clubs/request', auth, function(req, res) {
+  return _clubJoinRequestHandler(req, res);
 });
 
 app.get('/api/clubs/:id/members', auth, async (req, res) => {
@@ -12351,97 +12316,130 @@ app.post('/api/club/toggle-lock', requirePermissionScoped('settle_player'), asyn
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// POST /api/club/join-request — player requests to join (respects clubs.is_locked)
+// POST /api/club/join-request — player joins the beta club only.
+// Open → approved player membership. Locked → pending host approval.
 // Alias: POST /api/club/request-join (same handler)
+async function _loadBetaClubRow(opts) {
+  const code = opts && opts.code ? String(opts.code).toUpperCase() : '';
+  const clubIdIn = (opts && opts.clubId) || null;
+  if (clubIdIn && !playerBeta.isDiscoverableClubId(clubIdIn)) return null;
+  const sb = getSupabase();
+  if (sb) {
+    let q = sb.from('clubs').select('id,name,description,is_locked,active,code');
+    if (code && !clubIdIn) q = q.eq('code', code);
+    else q = q.eq('id', String(clubIdIn || playerBeta.BETA_CLUB_ID));
+    const { data, error } = await q.limit(1).maybeSingle();
+    if (error) throw error;
+    if (!data || data.active === false) return null;
+    if (!playerBeta.isDiscoverableClubId(data.id)) return null;
+    return data;
+  }
+  let r;
+  if (code && !clubIdIn) {
+    r = await query('SELECT id,name,description,code,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [code]);
+  } else {
+    r = await query('SELECT id,name,description,code,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE id=$1 AND COALESCE(active,true)=true', [clubIdIn || playerBeta.BETA_CLUB_ID]);
+  }
+  const row = r.rows[0];
+  if (!row || !playerBeta.isDiscoverableClubId(row.id)) return null;
+  return row;
+}
+
+async function _loadActorMembership(actorId, clubId) {
+  const sb = getSupabase();
+  if (sb) return _membershipLoad(actorId, clubId);
+  const exists = await query(
+    'SELECT actor_id,status,role FROM club_memberships WHERE club_id=$1 AND (actor_id=$2 OR player_id=$2) LIMIT 1',
+    [clubId, actorId]
+  );
+  return exists.rows[0] || null;
+}
+
+async function _insertPlayerMembership(actorId, clubId, status) {
+  // Role is always player. Do not seed a starting balance.
+  const sb = getSupabase();
+  if (sb) {
+    const now = new Date().toISOString();
+    const { error } = await sb.from('club_memberships').insert({
+      actor_id: actorId, club_id: clubId, role: 'player', status: status,
+      joined_at: now, updated_at: now
+    });
+    if (error) throw error;
+    _membershipInvalidate(actorId, clubId);
+    return;
+  }
+  await query(
+    'INSERT INTO club_memberships (club_id,actor_id,status,role,joined_at,updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())',
+    [clubId, actorId, status, 'player']
+  );
+}
+
 async function _clubJoinRequestHandler(req, res) {
   const body = req.body || {};
-  const code = body.code || body.clubCode;
+  const code = body.code || body.clubCode || null;
   const clubIdIn = body.clubId || body.club_id || null;
   try {
     const actorId = String(req.user.id);
-    const sb = getSupabase();
-    let c = null;
-    if (sb) {
-      let q = sb.from('clubs').select('*');
-      if (code) q = q.eq('code', String(code).toUpperCase());
-      else if (clubIdIn) q = q.eq('id', String(clubIdIn));
-      else return res.status(400).json({ ok:false, error:'missing_code' });
-      const { data, error } = await q.limit(1).maybeSingle();
-      if (error) throw error;
-      if (!data || data.active === false) return res.status(404).json({ ok:false, error:'Club not found' });
-      c = data;
-    } else if (code) {
-      const club = await query('SELECT * FROM clubs WHERE code=$1 AND COALESCE(active,true)=true', [String(code).toUpperCase()]);
-      if (!club.rows.length) return res.status(404).json({ ok:false, error:'Club not found' });
-      c = club.rows[0];
-    } else if (clubIdIn) {
-      const club = await query('SELECT * FROM clubs WHERE id=$1 AND COALESCE(active,true)=true', [clubIdIn]);
-      if (!club.rows.length) return res.status(404).json({ ok:false, error:'Club not found' });
-      c = club.rows[0];
-    } else {
-      return res.status(400).json({ ok:false, error:'missing_code' });
+    if (clubIdIn && !playerBeta.isDiscoverableClubId(clubIdIn)) {
+      return res.status(404).json({ ok:false, error:'club_not_found' });
     }
-    if (c.is_locked) {
-      return res.status(403).json({
-        ok: false,
-        error: 'club_locked',
-        message: 'This club is not accepting new members right now'
-      });
-    }
-    const clubId = String(c.id);
-    if (sb) {
-      const { data: existing } = await sb.from('club_memberships')
-        .select('actor_id,status').eq('club_id', clubId).eq('actor_id', actorId).limit(1);
-      if (existing && existing.length) {
-        return res.status(400).json({ ok:false, error:'Already a member', status: existing[0].status });
+    const c = await _loadBetaClubRow({ code: code, clubId: clubIdIn || (code ? null : playerBeta.BETA_CLUB_ID) });
+    const existing = c ? await _loadActorMembership(actorId, String(c.id)) : null;
+    const decision = playerBeta.resolveJoin({
+      requestedClubId: clubIdIn || null,
+      clubFound: !!c,
+      foundClubId: c && c.id,
+      isLocked: !!(c && c.is_locked),
+      existingStatus: existing && existing.status,
+      existingRole: existing && existing.role
+    });
+    if (decision.http !== 200) return res.status(decision.http).json(decision.body);
+    if (decision.insert) {
+      try {
+        await _insertPlayerMembership(actorId, String(c.id), decision.insert.status);
+      } catch (insErr) {
+        const msg = String((insErr && (insErr.message || insErr.code)) || '');
+        if (insErr && (insErr.code === '23505' || /duplicate|unique/i.test(msg))) {
+          _membershipInvalidate(actorId, String(c.id));
+          const again = await _loadActorMembership(actorId, String(c.id));
+          decision.already = true;
+          decision.insert = null;
+          decision.status = (again && again.status) || decision.status;
+          decision.role = (again && again.role) || 'player';
+        } else {
+          throw insErr;
+        }
       }
-      const now = new Date().toISOString();
-      const { error: insErr } = await sb.from('club_memberships').insert({
-        actor_id: actorId, club_id: clubId, role: 'player', status: 'pending',
-        joined_at: now, updated_at: now
-      });
-      if (insErr) throw insErr;
-    } else {
-      const exists = await query('SELECT actor_id,status FROM club_memberships WHERE club_id=$1 AND actor_id=$2', [clubId, actorId]);
-      if (exists.rows.length) {
-        return res.status(400).json({ ok:false, error:'Already a member', status: exists.rows[0].status });
-      }
-      await query(
-        'INSERT INTO club_memberships (club_id,actor_id,status,role,joined_at,updated_at) VALUES ($1,$2,$3,$4,NOW(),NOW())',
-        [clubId, actorId, 'pending', 'player']
-      );
     }
-    res.json({ ok:true, success:true, club: { id: c.id, name: c.name, code: c.code, is_locked: false } });
-  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+    return res.json(playerBeta.joinResponse(decision, c));
+  } catch(e) { return res.status(500).json({ ok:false, error:e.message }); }
 }
 app.post('/api/club/join-request', auth, _clubJoinRequestHandler);
 app.post('/api/club/request-join', auth, _clubJoinRequestHandler);
 
-// GET /api/club/:id — public club info including lock status (UUID only)
+// Lobby card + caller membership only. Does not list clubs or balances.
+app.get('/api/player-beta', auth, async (req, res) => {
+  try {
+    const actorId = String(req.user.id);
+    const c = await _loadBetaClubRow({ clubId: playerBeta.BETA_CLUB_ID });
+    if (!c) return res.status(404).json({ ok:false, error:'club_not_found' });
+    const existing = await _loadActorMembership(actorId, String(c.id));
+    return res.json({
+      ok: true,
+      club: playerBeta.publicClubCard(c),
+      membership: playerBeta.membershipView(existing)
+    });
+  } catch(e) { return res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// GET /api/club/:id — public card for the beta club only (UUID only)
 app.get('/api/club/:id([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})', async (req, res) => {
   try {
     const id = req.params.id;
-    const sb = getSupabase();
-    if (sb) {
-      const { data, error } = await sb.from('clubs')
-        .select('id,name,code,description,is_locked,active')
-        .eq('id', id)
-        .limit(1)
-        .maybeSingle();
-      if (error) throw error;
-      if (!data) return res.status(404).json({ ok:false, error:'club_not_found' });
-      return res.json(Object.assign({ ok:true }, data, {
-        is_locked: !!data.is_locked,
-        is_active: data.active !== false
-      }));
-    }
-    const r = await query(
-      'SELECT id,name,code,description,COALESCE(is_locked,false) AS is_locked,COALESCE(active,true) AS active FROM clubs WHERE id=$1',
-      [id]
-    );
-    if (!r.rows.length) return res.status(404).json({ ok:false, error:'club_not_found' });
-    const row = r.rows[0];
-    res.json(Object.assign({ ok:true }, row, { is_locked: !!row.is_locked, is_active: !!row.active }));
+    if (!playerBeta.isDiscoverableClubId(id)) return res.status(404).json({ ok:false, error:'club_not_found' });
+    const c = await _loadBetaClubRow({ clubId: id });
+    if (!c) return res.status(404).json({ ok:false, error:'club_not_found' });
+    return res.json(Object.assign({ ok:true }, playerBeta.publicClubCard(c)));
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 // ───────────────────────────────────────────────────────────────────────────
