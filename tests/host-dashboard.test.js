@@ -7,6 +7,9 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'index.js'), 'utf8');
 const dashIdx = src.indexOf("app.get('/api/host/dashboard'");
 const dashEnd = src.indexOf('// GET /api/host/settlements-preview', dashIdx);
 const dash = dashIdx === -1 ? '' : src.slice(dashIdx, dashEnd === -1 ? src.length : dashEnd);
+const identityStart = src.indexOf('async function _lookupUserIdentities');
+const identityEnd = src.indexOf("app.get('/api/clubs/:id/requests'", identityStart);
+const identityHelper = identityStart === -1 ? '' : src.slice(identityStart, identityEnd);
 
 function _uuidLike(s) {
   return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
@@ -25,18 +28,32 @@ describe('GET /api/host/dashboard', () => {
     expect(dash.length).toBeGreaterThan(100);
   });
 
-  test('users lookup does not select missing name column', () => {
-    expect(dash).toContain(".select('id,username,display_name')");
-    expect(dash).not.toContain(".select('id,name,username,display_name')");
+  test('tolerant users lookup prefers display_name and matches IDs as text', () => {
+    expect(identityHelper).toContain("'id,display_name,username,email'");
+    expect(identityHelper).toContain('id::text = ANY($1::text[])');
+    expect(dash).toContain('_lookupUserIdentities(sb, playerIds)');
   });
 
-  test('club_members query is club-scoped; approved rows merged in JS', () => {
+  test('both pending request routes use real user identities', () => {
+    const pendingRoutes = src.slice(
+      src.indexOf("app.get('/api/clubs/:id/requests'"),
+      src.indexOf("app.patch('/api/clubs/:id/requests/:memberId'")
+    );
+    expect((pendingRoutes.match(/await _lookupUserIdentities\(sb, actorIds\)/g) || [])).toHaveLength(2);
+    expect((pendingRoutes.match(/await _lookupUserIdentities\(null,/g) || [])).toHaveLength(2);
+    expect(pendingRoutes).toContain('playerName: u.display_name || u.username || _shortActorId');
+    expect(pendingRoutes).toContain('username: u.username || null');
+  });
+
+  test('club_members is the only approved roster source and is club-scoped', () => {
     expect(dash).toContain("from('club_members')");
+    expect(dash).not.toContain("from('club_memberships')");
     // Hard club scope (authz): never soft-fallback when clubId missing —
     // requireCanonicalClubId + missing_clubId fail-closed precede this query.
     expect(dash).toContain(".eq('club_id', clubId)");
     expect(dash).not.toContain("if (clubId) plq = plq.eq('club_id', clubId)");
-    expect(dash).toContain("String(r.status||'').toLowerCase() === 'approved'");
+    expect(dash).toContain("st !== 'active' && st !== 'approved'");
+    expect(dash).toContain("if (playerId) plq = plq.eq('player_id', playerId)");
   });
 
   test('tickets query does not cap at 1', () => {
@@ -79,9 +96,17 @@ describe('GET /api/host/dashboard', () => {
     expect(dash).toContain('weeklyStats');
   });
 
-  test('players array is built from club_members plus tickets', () => {
+  test('players array is built from club_members and tickets cannot add actors', () => {
     expect(dash).toContain('Object.keys(memberMap).forEach');
+    expect(dash).toContain('var p      = memberMap[pid] ? getOrCreatePlayer(pid, uname) : null');
     expect(dash).toContain('players:        players');
+  });
+
+  test('legacy/test ticket actors cannot inflate Host Players', () => {
+    ['21', '22', '23', '25', '27'].forEach((actorId) => {
+      expect(playerLabel(actorId, actorId, {})).toBe('');
+    });
+    expect(dash).not.toMatch(/getOrCreatePlayer\(pid,\s*uname\);\s*if \(uname\)/);
   });
 
   test('playerLabel prefers users.username over UUID ticket username', () => {
@@ -93,5 +118,15 @@ describe('GET /api/host/dashboard', () => {
       '2a3e6819-be2f-4df3-8112-54ce19d0929e': 'testplayer1'
     })).toBe('testplayer1');
     expect(playerLabel(pid, 'smoketest', {})).toBe('smoketest');
+  });
+
+  test('player limit writes resolve canonical member by club and player', () => {
+    const limitsIdx = src.indexOf("app.post('/api/club/player-limits'");
+    const limitsEnd = src.indexOf("app.get('/api/club/exposure'", limitsIdx);
+    const limitsRoute = src.slice(limitsIdx, limitsEnd);
+    expect(limitsRoute).toContain("from('club_members')");
+    expect(limitsRoute).toContain(".eq('club_id', clubId)");
+    expect(limitsRoute).toContain(".eq('player_id', playerId)");
+    expect(limitsRoute).toContain("onConflict:'club_id,player_id'");
   });
 });
