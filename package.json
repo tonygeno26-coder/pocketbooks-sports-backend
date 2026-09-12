@@ -7,6 +7,7 @@
     "dev": "node index.js",
     "test": "jest --runInBand --testTimeout=15000",
     "test:watch": "jest --watch",
+    "smoke:place-bet-contract": "node scripts/place-bet-contract-harness.js",
     "sync:ncaaf-logos": "node scripts/sync-ncaaf-team-logos.js",
     "audit:ncaaf-logos": "node scripts/audit-ncaaf-team-logos.js",
     "sync:soccer-logos": "node scripts/sync-soccer-team-logos.js",

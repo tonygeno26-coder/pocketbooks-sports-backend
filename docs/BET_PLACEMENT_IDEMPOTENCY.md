@@ -103,7 +103,10 @@ Middleware race: use `INSERT … ON CONFLICT` / advisory lock instead of load-th
 | T7 | Cross-club same bare key | No collision after club-scoped uniqueness |
 | T8 | Key TTL expiry with existing ledger | Replay ticket; no new debit |
 
-Unit anchors: `tests/idempotency.test.js`, `tests/bet-placement.test.js`, BE `tests/place-bet-contract.test.js`.
+Unit anchors: `tests/idempotency.test.js`, `tests/bet-placement.test.js`.
+The network-writing contract harness is intentionally outside Jest at
+`scripts/place-bet-contract-harness.js`; direct execution is a no-op unless
+all fail-closed safety inputs are explicitly supplied.
 
 ---
 

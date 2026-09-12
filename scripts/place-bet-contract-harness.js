@@ -1,28 +1,40 @@
 'use strict';
 
 // Snapshot place-bet contract: frontend builder fields === backend ingest
-// fields, then a live single + 3-leg parlay against real Owls markets.
+// fields, then an explicitly authorized single + 3-leg parlay against a
+// designated non-production environment.
 //
-// Run: node tests/place-bet-contract.test.js
-// Optional: PLACE_BET_BASE=https://... PLACE_BET_SKIP_LIVE=1
+// Direct execution with no explicit configuration is a successful no-op.
+// See lib/place-bet-harness-safety.js for the required acknowledgements.
 
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { spawn } = require('child_process');
+const { resolveHarnessConfig } = require('../lib/place-bet-harness-safety');
+
+const HARNESS_CONFIG = resolveHarnessConfig(process.env);
+if (!HARNESS_CONFIG.enabled) {
+  console.log('Place-bet write harness disabled; no network requests made.');
+  process.exit(0);
+}
+if (!HARNESS_CONFIG.safe) {
+  console.error('Place-bet write harness refused: ' + HARNESS_CONFIG.reason);
+  process.exit(2);
+}
 
 const CONTRACT_FIELDS = [
   'pick', 'market', 'odds', 'line', 'canonicalGameKey', 'scheduledStart', 'gameId'
 ];
-const LIVE_BASE = process.env.PLACE_BET_BASE
-  || 'https://pocketbooks-sports-backend-production.up.railway.app';
-const ACTOR_ID = '2a3e6819-be2f-4df3-8112-54ce19d0929e';
-const CLUB_ID  = 'd616dc2a-95a6-473a-97b1-7da330878479';
+const LIVE_BASE = HARNESS_CONFIG.baseUrl;
+const ACTOR_ID = HARNESS_CONFIG.actorId;
+const CLUB_ID = HARNESS_CONFIG.clubId;
+const RUN_ID = HARNESS_CONFIG.runId;
 const FE_PLAYER = path.resolve(__dirname, '../../pocketbooks-sports/player.html');
 const INDEX_JS  = path.join(__dirname, '..', 'index.js');
 
 let _pass = 0;
 let _fail = 0;
-const results = { liveBase: LIVE_BASE, localBase: null, single: null, parlay: null };
+const results = { designatedBase: LIVE_BASE, single: null, parlay: null };
 
 function test(name, fn) {
   try {
@@ -305,6 +317,25 @@ function ticketPayout(stake, legs) {
   return Math.round(stake * product * 100) / 100;
 }
 
+function deterministicPlacementKey(betType, legs) {
+  const intent = JSON.stringify({
+    runId: RUN_ID,
+    betType: betType,
+    legs: (legs || []).map(function(leg) {
+      return {
+        gameId: leg.gameId,
+        canonicalGameKey: leg.canonicalGameKey,
+        market: leg.market,
+        pick: leg.pick,
+        odds: leg.odds,
+        line: leg.line
+      };
+    })
+  });
+  return 'CONTRACT_' + RUN_ID + '_' + betType + '_'
+    + crypto.createHash('sha256').update(intent).digest('hex').slice(0, 16);
+}
+
 async function mintSession(base) {
   const r = await httpJson(base, 'POST', '/api/auth/token', {
     actorId: ACTOR_ID,
@@ -326,7 +357,7 @@ async function placeBet(base, session, betType, legs, stake) {
     stake: stake,
     payout: ticketPayout(stake, legs),
     potentialProfit: Math.round((ticketPayout(stake, legs) - stake) * 100) / 100,
-    idempotencyKey: 'CONTRACT_' + betType + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+    idempotencyKey: deterministicPlacementKey(betType, legs),
     legs: legs
   };
   let r = await httpJson(base, 'POST', '/api/bets/place', payload, session.token, {
@@ -431,94 +462,18 @@ async function runAgainst(base, label) {
   return true;
 }
 
-function waitHealth(base, ms) {
-  const deadline = Date.now() + ms;
-  return (async function poll() {
-    while (Date.now() < deadline) {
-      try {
-        const r = await httpJson(base, 'GET', '/api/health', null, null);
-        if (r.status === 200) return r;
-      } catch (_) {}
-      await new Promise(function(res) { setTimeout(res, 1000); });
-    }
-    throw new Error('local backend did not become healthy at ' + base);
-  })();
-}
-
-async function maybeStartLocal() {
-  const local = process.env.PLACE_BET_LOCAL_BASE || 'http://127.0.0.1:3000';
-  try {
-    const r = await httpJson(local, 'GET', '/api/health', null, null);
-    if (r.status === 200) {
-      results.localBase = local;
-      return { base: local, started: false };
-    }
-  } catch (_) {}
-  const envPath = path.join(__dirname, '..', '.env');
-  if (!fs.existsSync(envPath)) {
-    return { base: null, started: false, reason: 'no_local_env' };
-  }
-  console.log('  starting local backend on :3000');
-  const child = spawn('node', ['index.js'], {
-    cwd: path.join(__dirname, '..'),
-    env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe']
-  });
-  child.stdout.on('data', function() {});
-  child.stderr.on('data', function() {});
-  try {
-    await waitHealth(local, 25000);
-    results.localBase = local;
-    return { base: local, started: true, child: child };
-  } catch (e) {
-    try { child.kill(); } catch (_) {}
-    return { base: null, started: false, reason: String(e.message || e) };
-  }
-}
-
 async function runLive() {
-  if (process.env.PLACE_BET_SKIP_LIVE === '1' || process.env.JEST_WORKER_ID) {
-    console.log('  skip live (PLACE_BET_SKIP_LIVE or jest)');
-    return;
-  }
-  let liveErr = null;
-  try {
-    await runAgainst(LIVE_BASE, 'live');
-    results.live = 'passed';
-    return;
-  } catch (e) {
-    liveErr = e;
-    results.live = 'failed';
-    results.liveError = e.message;
-    console.error('  FAIL live: ' + e.message);
-  }
-
-  const local = await maybeStartLocal();
-  if (!local.base) {
-    throw new Error('live failed and local unavailable (' + (local.reason || 'unknown')
-      + '): ' + (liveErr && liveErr.message));
-  }
-  try {
-    await runAgainst(local.base, 'local');
-    results.local = 'passed';
-    if (liveErr) {
-      throw new Error('live failed because Railway is likely on an old SHA; local passed. live error: '
-        + liveErr.message);
-    }
-  } finally {
-    if (local.child) {
-      try { local.child.kill(); } catch (_) {}
-    }
-  }
+  await runAgainst(LIVE_BASE, HARNESS_CONFIG.local ? 'local' : 'designated');
+  results.designated = 'passed';
 }
 
 (async function main() {
   try {
     await runLive();
-    console.log('  OK  live single + 3-leg parlay');
+    console.log('  OK  explicitly authorized single + 3-leg parlay');
     _pass++;
   } catch (e) {
-    console.error('  FAIL live single + 3-leg parlay\n     ' + e.message);
+    console.error('  FAIL explicitly authorized single + 3-leg parlay\n     ' + e.message);
     _fail++;
   }
   console.log('\nPlace-bet contract tests: ' + _pass + ' passed, ' + _fail + ' failed');
