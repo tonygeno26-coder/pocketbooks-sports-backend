@@ -13,6 +13,7 @@ const playerBeta = require('./lib/player-beta');
 const idempotencyEngine = require('./lib/idempotency-engine');
 const parlayCorrelation = require('./lib/parlay-correlation');
 const authAudit = require('./lib/auth-audit');
+const propsFoundation = require('./lib/props-foundation');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4314,78 +4315,22 @@ function _logOwlsUnavailableMarketSkip(payload) {
   }
 }
 
-// Expand nested alternateLines on spread/total outcomes into flat cache entries.
+// Expand nested alternateLines on spread/total/player_prop outcomes into flat
+// cache entries. Prop alts are single-sided when Owls only posts `odds` —
+// never invent the missing under/over price.
 function _expandOwlsOutcomeAlternates(oc, mt, baseEntry, ck, pushFn) {
-  var altLines = oc.alternateLines || oc.alternate_lines;
-  if (!Array.isArray(altLines) || !altLines.length) return;
-  if (mt !== 'spread' && mt !== 'total') return;
-  altLines.forEach(function(alt) {
-    if (!alt || typeof alt !== 'object') return;
-    var altPoint = alt.point != null ? alt.point
-                 : alt.handicap != null ? alt.handicap
-                 : alt.spread != null ? alt.spread : undefined;
-    if (altPoint == null) return;
-    // Some feeds bundle both sides on one alt row for totals.
-    if (mt === 'total' && (alt.overPrice != null || alt.underPrice != null
-        || alt.over != null || alt.under != null)) {
-      var overP = alt.overPrice != null ? alt.overPrice : alt.over;
-      var underP = alt.underPrice != null ? alt.underPrice : alt.under;
-      if (overP != null) {
-        var overEntry = Object.assign({}, baseEntry, {
-          teamOrSide: 'Over', line: altPoint,
-          odds: _toAmericanOdds(parseFloat(overP) || 0),
-          overUnder: 'Over', isAlternate: true
-        });
-        overEntry.canonicalMarketKey = _buildCanonicalMarketKey({
-          canonicalGameKey: ck, marketType: overEntry.marketType,
-          propType: overEntry.propType, team: overEntry.teamOrSide
-        });
-        overEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
-          marketType: overEntry.marketType, team: overEntry.teamOrSide,
-          player: overEntry.playerName, side: overEntry.overUnder || overEntry.teamOrSide,
-          line: overEntry.line
-        });
-        pushFn(overEntry);
-      }
-      if (underP != null) {
-        var underEntry = Object.assign({}, baseEntry, {
-          teamOrSide: 'Under', line: altPoint,
-          odds: _toAmericanOdds(parseFloat(underP) || 0),
-          overUnder: 'Under', isAlternate: true
-        });
-        underEntry.canonicalMarketKey = _buildCanonicalMarketKey({
-          canonicalGameKey: ck, marketType: underEntry.marketType,
-          propType: underEntry.propType, team: underEntry.teamOrSide
-        });
-        underEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
-          marketType: underEntry.marketType, team: underEntry.teamOrSide,
-          player: underEntry.playerName, side: underEntry.overUnder || underEntry.teamOrSide,
-          line: underEntry.line
-        });
-        pushFn(underEntry);
-      }
-      return;
-    }
-    var altPrice = alt.price != null ? alt.price
-                 : alt.odds != null ? alt.odds
-                 : alt.american != null ? alt.american : null;
-    if (altPrice == null) return;
-    var altEntry = Object.assign({}, baseEntry, {
-      line: altPoint,
-      odds: _toAmericanOdds(parseFloat(altPrice) || 0),
-      isAlternate: true
+  var expanded = propsFoundation.expandOwlsOutcomeAlternates(oc, mt, baseEntry, function(entry) {
+    entry.canonicalMarketKey = _buildCanonicalMarketKey({
+      canonicalGameKey: ck, marketType: entry.marketType,
+      propType: entry.propType, team: entry.teamOrSide
     });
-    altEntry.canonicalMarketKey = _buildCanonicalMarketKey({
-      canonicalGameKey: ck, marketType: altEntry.marketType,
-      propType: altEntry.propType, team: altEntry.teamOrSide
+    entry.canonicalSelectionKey = _buildCanonicalSelectionKey({
+      marketType: entry.marketType, team: entry.teamOrSide,
+      player: entry.playerName, side: entry.overUnder || entry.teamOrSide,
+      line: entry.line
     });
-    altEntry.canonicalSelectionKey = _buildCanonicalSelectionKey({
-      marketType: altEntry.marketType, team: altEntry.teamOrSide,
-      player: altEntry.playerName, side: altEntry.overUnder || altEntry.teamOrSide,
-      line: altEntry.line
-    });
-    pushFn(altEntry);
   });
+  for (var i = 0; i < expanded.length; i++) pushFn(expanded[i]);
 }
 
 function _owlsIsAlternateMarketKey(mktKeyLc, mt) {
@@ -7299,6 +7244,35 @@ function _validatePlaceBetLegContract(leg, i, errors) {
   if (!leg.canonicalGameKey) errors.push('leg'+i+'_missing_canonicalGameKey');
   if (!leg.scheduledStart) errors.push('leg'+i+'_missing_scheduledStart');
   if (!leg.gameId) errors.push('leg'+i+'_missing_gameId');
+  // Props foundation: unknown / unsupported markets fail closed for betting.
+  // Only gate explicit player-prop legs — never regular totals/spreads/ML.
+  var mt = String(leg.market || '').toLowerCase();
+  var isProp = !!leg.isPlayerProp || mt === 'player_prop' || mt === 'prop'
+    || !!(leg.propType || leg.prop_type);
+  if (!isProp) return;
+  var propType = leg.propType || leg.prop_type || null;
+  if (!propType && leg.pick && typeof _parseLegacyPropPick === 'function') {
+    var parsed = _parseLegacyPropPick(String(leg.pick));
+    propType = parsed && parsed.propType;
+  }
+  if (!propType) {
+    errors.push('leg'+i+'_prop_type_required');
+    return;
+  }
+  var status = propsFoundation.classifySupportStatus({
+    propType: propType,
+    playerName: leg.playerName || leg.player || '',
+    rawCategory: leg.category || null,
+    rawMarketName: leg.rawMarketName || null
+  });
+  if (status !== propsFoundation.SUPPORT.SUPPORTED_NORMALIZED
+      || !propsFoundation.isBettablePropType(propType)) {
+    errors.push('leg'+i+'_prop_market_not_bettable:'+propType);
+    return;
+  }
+  if (leg.line != null && !propsFoundation.isAllowedPropLine(propType, Number(leg.line))) {
+    errors.push('leg'+i+'_prop_line_not_allowed:'+propType+':'+leg.line);
+  }
 }
 
 // Classify a snapshot into a market state.
@@ -9264,12 +9238,22 @@ function _projectOwlsGameToFlat(g, sportLabel) {
           line:           m.line,
           overOdds:       null,
           underOdds:      null,
+          isPrimary:      !m.isAlternate,
+          isAlternate:    !!m.isAlternate,
           marketKey:      m.marketKey || null,
           providerGameId: m.providerGameId || null,
           canonicalGameKey: m.canonicalGameKey || canonicalGameKey,
           scheduledStart: g.commence_time || null,
+          identity: {
+            playerName: m.playerName,
+            team: m.playerTeam || null,
+            photoPolicy: propsFoundation.PHOTO_POLICY
+          }
         };
         propsByKey[propKey] = p;
+      } else if (!m.isAlternate) {
+        p.isPrimary = true;
+        p.isAlternate = false;
       }
       if (m.overUnder === 'under') p.underOdds = price;
       else                          p.overOdds  = price;
@@ -9690,7 +9674,7 @@ app.get('/api/odds-comparison/:sport', async (req, res) => {
 // Fetches player props from Owls /api/v1/{sport}/props. 60s response cache.
 const _PROPS_RESPONSE_CACHE = Object.create(null);
 const PROPS_CACHE_TTL_MS = 60 * 1000;
-const PROPS_SUPPORTED_SPORTS = ['mlb', 'nba', 'nfl', 'nhl', 'ncaab', 'ncaaf', 'wnba'];
+const PROPS_SUPPORTED_SPORTS = propsFoundation.PROPS_CAPABLE_SPORTS.slice();
 const _PROPS_DISPLAY_BOOKS = ['draftkings', 'fanduel', 'betmgm', 'caesars'];
 const _PROPS_EXCLUDED_BOOKS = ['pinnacle'];
 // Props fetch books — prefer mainstream US books (not sharp/pinnacle-only).
@@ -9704,61 +9688,10 @@ const _NFL_PROP_TYPES_INCLUDE = {
   'Receptions': 1, 'Anytime TD': 1, 'First TD': 1, 'Sacks': 1, 'Tackles': 1,
   'Rushing TDs': 1, 'Receiving TDs': 1, 'Pass Attempts': 1, 'Tackles + Asts': 1
 };
-// Discrete allowed lines (exact match). MLB keep tight; NFL counting stats use
-// ranges below so milestone / alt half-points aren't wiped.
-const _PROPS_ALLOWED_LINES_BY_CATEGORY = {
-  // MLB
-  'Hits': [0.5, 1.5, 2.5],
-  'Strikeouts': [0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.5],
-  'Home Runs': [0.5],
-  'RBIs': [0.5, 1.5, 2.5]
-};
-// Continuous ranges — NFL yardage + counting stats (alts included).
-const _PROPS_LINE_RANGES_BY_CATEGORY = {
-  'Passing Yards': { min: 0.5, max: 499.5 },
-  'Rushing Yards': { min: 0.5, max: 249.5 },
-  'Receiving Yards': { min: 0.5, max: 249.5 },
-  'Passing TDs': { min: 0.5, max: 7.5 },
-  'Rushing TDs': { min: 0.5, max: 5.5 },
-  'Receiving TDs': { min: 0.5, max: 5.5 },
-  'Anytime TD': { min: 0.5, max: 0.5 },
-  'First TD': { min: 0.5, max: 0.5 },
-  'Receptions': { min: 0.5, max: 20.5 },
-  'Pass Completions': { min: 0.5, max: 55.5 },
-  'Pass Attempts': { min: 0.5, max: 70.5 },
-  'Interceptions Thrown': { min: 0.5, max: 5.5 },
-  'Sacks': { min: 0.5, max: 6.5 },
-  'Tackles': { min: 0.5, max: 20.5 },
-  'Tackles + Asts': { min: 0.5, max: 20.5 }
-};
-const _OWLS_PROP_CATEGORY_LABELS = {
-  hits: 'Hits', runs: 'Runs Scored', rbis: 'RBIs', home_runs: 'Home Runs',
-  stolen_bases: 'Stolen Bases', total_bases: 'Total Bases',
-  strikeouts_pitcher: 'Strikeouts', strikeouts_batter: 'Strikeouts',
-  walks: 'Walks', earned_runs: 'Earned Runs', outs_recorded: 'Pitching Outs',
-  hits_allowed: 'Hits Allowed', hits_runs_rbis: 'Hits + Runs + RBIs',
-  points: 'Points', rebounds: 'Rebounds', assists: 'Assists',
-  threes_made: '3-Pointers Made', steals: 'Steals', blocks: 'Blocks',
-  pts_rebs: 'Pts + Reb', pts_asts: 'Pts + Ast', rebs_asts: 'Reb + Ast',
-  pts_rebs_asts: 'Pts + Reb + Ast',
-  passing_yards: 'Passing Yards', passing_tds: 'Passing TDs',
-  pass_yards: 'Passing Yards', pass_tds: 'Passing TDs',
-  pass_completions: 'Pass Completions', completions: 'Pass Completions',
-  pass_attempts: 'Pass Attempts', attempts: 'Pass Attempts',
-  pass_interceptions: 'Interceptions Thrown', interceptions: 'Interceptions Thrown',
-  rushing_yards: 'Rushing Yards', rushing_tds: 'Rushing TDs',
-  rush_yards: 'Rushing Yards', rush_tds: 'Rushing TDs',
-  receiving_yards: 'Receiving Yards', reception_yards: 'Receiving Yards',
-  receiving_tds: 'Receiving TDs', reception_tds: 'Receiving TDs',
-  receptions: 'Receptions',
-  touchdowns: 'Anytime TD', anytime_td: 'Anytime TD',
-  first_td: 'First TD', player_first_td: 'First TD',
-  sacks: 'Sacks', player_sacks: 'Sacks',
-  tackles: 'Tackles', player_tackles: 'Tackles',
-  player_tackles_assists: 'Tackles + Asts', tackles_assists: 'Tackles + Asts',
-  goals: 'Goals', hockey_assists: 'Assists', hockey_points: 'Points',
-  shots_on_goal: 'Shots on Goal'
-};
+// Delegated to lib/props-foundation (expanded MLB allowlists + ranges).
+const _PROPS_ALLOWED_LINES_BY_CATEGORY = propsFoundation.ALLOWED_LINES_BY_CATEGORY;
+const _PROPS_LINE_RANGES_BY_CATEGORY = propsFoundation.LINE_RANGES_BY_CATEGORY;
+const _OWLS_PROP_CATEGORY_LABELS = Object.assign({}, propsFoundation.CATEGORY_LABELS);
 
 function _americanToImpliedPct(odds) {
   var o = parseInt(odds, 10);
@@ -9768,11 +9701,7 @@ function _americanToImpliedPct(odds) {
 }
 
 function _owlsPropCategoryLabel(category) {
-  var k = String(category || '').toLowerCase();
-  if (_OWLS_PROP_CATEGORY_LABELS[k]) return _OWLS_PROP_CATEGORY_LABELS[k];
-  var mapped = _owlsPropType(k);
-  if (mapped) return mapped;
-  return k.replace(/_/g, ' ').replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+  return propsFoundation.categoryLabel(category);
 }
 
 function _betterAmericanOdds(a, b) {
@@ -9782,53 +9711,15 @@ function _betterAmericanOdds(a, b) {
 }
 
 function _propLineCategory(propType) {
-  var t = String(propType || '').trim();
-  // ----- MLB (exact / narrow — must not match NFL labels) -----
-  if (t === 'Hits' || /to record a hit/i.test(t)) return 'Hits';
-  if (t === 'Strikeouts' || /^pitcher\s+strikeouts$/i.test(t) || /\bstrikeouts?\b/i.test(t)) {
-    // Guard: only treat as MLB Ks when it looks like a pitching/batter K market
-    if (/pass|rush|receiv|sack|yard|completion|attempt|td|touchdown/i.test(t)) return null;
-    return 'Strikeouts';
-  }
-  if (t === 'Home Runs' || /home\s*runs?/i.test(t)) return 'Home Runs';
-  if (t === 'RBIs' || /\brbis?\b/i.test(t)) return 'RBIs';
-  // ----- NFL / NCAAF -----
-  if (t === 'Passing Yards' || /passing\s*yards?/i.test(t) || /pass\s*yards?/i.test(t)) return 'Passing Yards';
-  if (t === 'Rushing Yards' || /rushing\s*yards?/i.test(t) || /rush\s*yards?/i.test(t)) return 'Rushing Yards';
-  if (t === 'Receiving Yards' || /receiving\s*yards?/i.test(t) || /reception\s*yards?/i.test(t)) return 'Receiving Yards';
-  if (t === 'Passing TDs' || /passing\s*t(?:d|ouchdown)s?/i.test(t) || /pass\s*t(?:d|ouchdown)s?/i.test(t)) return 'Passing TDs';
-  if (t === 'Rushing TDs' || /rushing\s*t(?:d|ouchdown)s?/i.test(t) || /rush\s*t(?:d|ouchdown)s?/i.test(t)) return 'Rushing TDs';
-  if (t === 'Receiving TDs' || /receiving\s*t(?:d|ouchdown)s?/i.test(t) || /reception\s*t(?:d|ouchdown)s?/i.test(t)) return 'Receiving TDs';
-  if (t === 'Anytime TD' || /anytime\s*t(?:d|ouchdown)/i.test(t)) return 'Anytime TD';
-  if (t === 'First TD' || /first\s*t(?:d|ouchdown)/i.test(t)) return 'First TD';
-  if (t === 'Receptions' || /^receptions$/i.test(t)) return 'Receptions';
-  if (t === 'Pass Completions' || /pass\s*completions?/i.test(t) || /^completions$/i.test(t)) return 'Pass Completions';
-  if (t === 'Pass Attempts' || /pass\s*attempts?/i.test(t) || /^attempts$/i.test(t)) return 'Pass Attempts';
-  if (t === 'Interceptions Thrown' || /interceptions?\s*(thrown)?$/i.test(t)) return 'Interceptions Thrown';
-  if (t === 'Sacks' || /^sacks?$/i.test(t)) return 'Sacks';
-  if (t === 'Tackles' || /^tackles$/i.test(t)) return 'Tackles';
-  if (t === 'Tackles + Asts' || /tackles?\s*\+?\s*asts?/i.test(t)) return 'Tackles + Asts';
-  return null;
+  return propsFoundation.propLineCategory(propType);
 }
 
 function _isHalfPointLine(line) {
-  // Books almost always post .5 lines for O/U props; allow integers too.
   return Number.isFinite(line) && (Math.abs(line * 2) % 1 < 1e-9);
 }
 
 function _isAllowedPropLine(propType, line) {
-  if (typeof line !== 'number' || isNaN(line)) return false;
-  var cat = _propLineCategory(propType);
-  // Unknown categories: keep (do not let MLB-only rules wipe NFL/NBA/etc.).
-  if (!cat) return true;
-  var allowed = _PROPS_ALLOWED_LINES_BY_CATEGORY[cat];
-  if (allowed) return allowed.indexOf(line) >= 0;
-  var range = _PROPS_LINE_RANGES_BY_CATEGORY[cat];
-  if (range) {
-    if (line < range.min || line > range.max) return false;
-    return _isHalfPointLine(line);
-  }
-  return true;
+  return propsFoundation.isAllowedPropLine(propType, line);
 }
 
 function _normalizePropsSportParam(sport) {
@@ -9866,143 +9757,23 @@ function _propYesNoOdds(prop) {
 }
 
 function _propsDedupeKey(p) {
-  // Exact identity for display: player + prop type + line + side (case-insensitive).
-  // Keep best American odds only — never emit book-level duplicates.
-  return [
-    String(p.playerName || '').toLowerCase().trim(),
-    String(p.propType || '').toLowerCase().trim(),
-    String(p.line),
-    String(p.side || '').toLowerCase().trim()
-  ].join('|');
+  return propsFoundation.selectionDedupeKey(p);
 }
 
 function _filterPropsForDisplay(props) {
-  var list = Array.isArray(props) ? props : [];
-  var bestByKey = Object.create(null);
-  for (var i = 0; i < list.length; i++) {
-    var p = list[i];
-    if (!p || !p.playerName) continue;
-    if (typeof p.odds !== 'number' || isNaN(p.odds)) continue;
-    if (Math.abs(p.odds) > _PROPS_MAX_ABS_ODDS) continue;
-    // Drop basketball "Points" that sometimes leaks into NFL Owls payloads.
-    if (String(p.sport || '').toUpperCase() === 'NFL' && String(p.propType || '') === 'Points') continue;
-    if (!_isAllowedPropLine(p.propType, p.line)) continue;
-    var dedupeKey = _propsDedupeKey(p);
-    var prev = bestByKey[dedupeKey];
-    if (!prev || p.odds > prev.odds) bestByKey[dedupeKey] = p;
-  }
-  var out = Object.keys(bestByKey).map(function(k) { return bestByKey[k]; });
-  out.sort(function(a, b) {
-    if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
-    if (a.playerName !== b.playerName) return (a.playerName || '').localeCompare(b.playerName || '');
-    if (a.line !== b.line) return Number(a.line) - Number(b.line);
-    return (a.side || '').localeCompare(b.side || '');
-  });
-  return out;
+  // Legacy flat board: bettable/supported subset only (sportsbook UI frozen).
+  return propsFoundation.filterPropsForDisplay(props, { bettableOnly: true, retainUnknown: false });
+}
+
+function _filterPropsInventory(props) {
+  // Full inventory for future Props UI — retain unknowns for audit; never invent odds.
+  return propsFoundation.filterPropsForDisplay(props, { bettableOnly: false, retainUnknown: true });
 }
 
 function _normalizeOwlsPropsApiResponse(owlsData, sportShort) {
-  if (!owlsData || owlsData.success === false) return [];
-  var games = Array.isArray(owlsData.data) ? owlsData.data
-    : (Array.isArray(owlsData.games) ? owlsData.games
-    : (Array.isArray(owlsData) ? owlsData : []));
-  var out = [];
-  var sportLabel = String(sportShort || '').toUpperCase();
-  for (var gi = 0; gi < games.length; gi++) {
-    var game = games[gi];
-    if (!game) continue;
-    var home = game.homeTeam || game.home_team || '';
-    var away = game.awayTeam || game.away_team || '';
-    var gameId = game.gameId || game.id || null;
-    var books = _selectMainstreamPropBooks(game.books || game.bookmakers || []);
-    // Some Owls payloads put props on the game itself (no per-book nesting).
-    if ((!books || !books.length) && Array.isArray(game.props) && game.props.length) {
-      books = [{ key: 'owls', props: game.props }];
-    }
-    var bestByKey = Object.create(null);
-    for (var bi = 0; bi < books.length; bi++) {
-      var book = books[bi];
-      var props = Array.isArray(book && book.props) ? book.props
-        : (Array.isArray(book && book.markets) ? book.markets : []);
-      for (var pi = 0; pi < props.length; pi++) {
-        var prop = props[pi];
-        if (!prop) continue;
-        var playerName = prop.playerName || prop.player || prop.name || null;
-        if (!playerName) continue;
-        var propType = _owlsPropCategoryLabel(
-          prop.category || prop.propType || prop.market || prop.marketKey || prop.key
-        );
-        var line = prop.line;
-        if (typeof line !== 'number' || isNaN(line)) {
-          // Yes/no TD markets often omit line — treat as 0.5 so UI can show them.
-          if (/anytime\s*td|first\s*td|last\s*td/i.test(propType) || prop.yesPrice != null || prop.noPrice != null) {
-            line = 0.5;
-          } else {
-            continue;
-          }
-        }
-        var overOdds = (typeof prop.overPrice === 'number') ? prop.overPrice
-          : ((typeof prop.overOdds === 'number') ? prop.overOdds : null);
-        var underOdds = (typeof prop.underPrice === 'number') ? prop.underPrice
-          : ((typeof prop.underOdds === 'number') ? prop.underOdds : null);
-        if (overOdds == null && underOdds == null) {
-          var yn = _propYesNoOdds(prop);
-          if (typeof yn.yesOdds === 'number') overOdds = yn.yesOdds;
-          if (typeof yn.noOdds === 'number') underOdds = yn.noOdds;
-        }
-        var dedupeKey = String(playerName).toLowerCase() + '|' + propType + '|' + line;
-        if (bestByKey[dedupeKey]) {
-          var existing = bestByKey[dedupeKey];
-          existing.overOdds = _betterAmericanOdds(existing.overOdds, overOdds);
-          existing.underOdds = _betterAmericanOdds(existing.underOdds, underOdds);
-        } else {
-          bestByKey[dedupeKey] = {
-            propType: propType,
-            playerName: playerName,
-            team: prop.team || prop.playerTeam || null,
-            line: line,
-            overOdds: overOdds,
-            underOdds: underOdds
-          };
-        }
-      }
-    }
-    Object.keys(bestByKey).forEach(function(key) {
-      var p = bestByKey[key];
-      var base = {
-        gameId: gameId,
-        canonicalGameKey: game.canonicalGameKey || null,
-        home: home,
-        away: away,
-        scheduledStart: game.commenceTime || game.commence_time || game.startTime || null,
-        sport: sportLabel,
-        propType: p.propType,
-        playerName: p.playerName,
-        team: p.team,
-        line: p.line
-      };
-      if (typeof p.overOdds === 'number') {
-        out.push(Object.assign({}, base, {
-          side: 'over',
-          odds: p.overOdds,
-          pick: p.playerName + ' Over ' + p.line + ' ' + p.propType
-        }));
-      }
-      if (typeof p.underOdds === 'number') {
-        out.push(Object.assign({}, base, {
-          side: 'under',
-          odds: p.underOdds,
-          pick: p.playerName + ' Under ' + p.line + ' ' + p.propType
-        }));
-      }
-    });
-  }
-  out.sort(function(a, b) {
-    if (a.propType !== b.propType) return a.propType < b.propType ? -1 : 1;
-    if (a.playerName !== b.playerName) return (a.playerName || '').localeCompare(b.playerName || '');
-    return (a.side || '').localeCompare(b.side || '');
+  return propsFoundation.normalizeOwlsPropsApiResponse(owlsData, sportShort, {
+    selectBooks: _selectMainstreamPropBooks
   });
-  return out;
 }
 
 function _fetchOwlsPropsOnce(sportShort, booksCsv) {
@@ -10251,20 +10022,37 @@ function _collectPropsForSport(sportShort) {
         propType: p.propType,
         playerName: p.playerName,
         team: p.team || null,
-        line: p.line
+        line: p.line,
+        isPrimary: p.isPrimary !== false && !p.isAlternate,
+        isAlternate: !!p.isAlternate,
+        identity: p.identity || {
+          playerName: p.playerName,
+          team: p.team || null,
+          photoPolicy: propsFoundation.PHOTO_POLICY
+        },
+        supportStatus: propsFoundation.classifySupportStatus({
+          propType: p.propType,
+          playerName: p.playerName
+        })
       };
       if (typeof p.overOdds === 'number') {
         out.push(Object.assign({}, base, {
           side: 'over',
           odds: p.overOdds,
-          pick: p.playerName + ' Over ' + p.line + ' ' + p.propType
+          pick: p.playerName + ' Over ' + p.line + ' ' + p.propType,
+          bettable: propsFoundation.isBettablePropSelection(Object.assign({}, base, {
+            side: 'over', odds: p.overOdds
+          }))
         }));
       }
       if (typeof p.underOdds === 'number') {
         out.push(Object.assign({}, base, {
           side: 'under',
           odds: p.underOdds,
-          pick: p.playerName + ' Under ' + p.line + ' ' + p.propType
+          pick: p.playerName + ' Under ' + p.line + ' ' + p.propType,
+          bettable: propsFoundation.isBettablePropSelection(Object.assign({}, base, {
+            side: 'under', odds: p.underOdds
+          }))
         }));
       }
     }
@@ -10358,13 +10146,24 @@ app.get('/api/props/:sport', async function(req, res) {
   var gameId = req.query.gameId ? String(req.query.gameId) : null;
   var homeTeam = req.query.home ? String(req.query.home) : null;
   var awayTeam = req.query.away ? String(req.query.away) : null;
+  var view = String(req.query.view || req.query.structure || 'flat').toLowerCase();
+  var wantInventory = view === 'inventory' || view === 'tree' || view === 'grouped';
+  if (wantInventory && !gameId && !homeTeam && !awayTeam) {
+    return res.status(400).json({
+      ok: false,
+      error: 'props_inventory_requires_game_scope',
+      hint: 'Pass gameId or home+away; or GET /api/props/:sport/inventory?gameId=...'
+    });
+  }
   var now = Date.now();
   var cached = _PROPS_RESPONSE_CACHE[sport];
   var fullProps = [];
+  var inventoryProps = [];
   var source = 'owls_props_api';
   var cacheHit = false;
   if (cached && (now - cached.at) < PROPS_CACHE_TTL_MS) {
     fullProps = cached.data.props || [];
+    inventoryProps = cached.data.inventoryProps || fullProps;
     source = cached.data.source || source;
     cacheHit = true;
   } else {
@@ -10373,12 +10172,15 @@ app.get('/api/props/:sport', async function(req, res) {
       var fromApi = (fetched.ok && fetched.props) ? fetched.props : [];
       var fromCache = _collectPropsForSport(sport) || [];
       var mergedRaw = fromApi.concat(fromCache);
+      inventoryProps = _filterPropsInventory(mergedRaw);
       fullProps = _filterPropsForDisplay(mergedRaw);
       if (fromApi.length && fromCache.length) source = 'owls_props_api+cache';
       else if (fromApi.length) source = 'owls_props_api';
       else source = 'owls_cache_fallback';
     } else {
-      fullProps = _filterPropsForDisplay(_collectPropsForSport(sport));
+      var cacheOnly = _collectPropsForSport(sport);
+      inventoryProps = _filterPropsInventory(cacheOnly);
+      fullProps = _filterPropsForDisplay(cacheOnly);
       source = 'owls_cache_fallback';
     }
     // Short-circuit cache when NFL slate is still thin so expand-fetch can retry soon.
@@ -10389,7 +10191,9 @@ app.get('/api/props/:sport', async function(req, res) {
         ok: true,
         sport: sport,
         props: fullProps,
+        inventoryProps: inventoryProps,
         count: fullProps.length,
+        inventoryCount: inventoryProps.length,
         source: source,
         updatedAt: new Date().toISOString()
       }
@@ -10397,24 +10201,63 @@ app.get('/api/props/:sport', async function(req, res) {
   }
   // Prefer gameId when present; fall back to home/away whenever teams are
   // provided (including when gameId is absent or matches nothing).
-  var outProps = fullProps;
+  var baseList = wantInventory ? inventoryProps : fullProps;
+  var outProps = baseList;
   var filterMode = null;
   if (gameId) {
-    outProps = _filterPropsByGameId(fullProps, gameId);
+    outProps = _filterPropsByGameId(baseList, gameId);
     filterMode = 'gameId';
   }
   if ((homeTeam || awayTeam) && (!gameId || outProps.length === 0)) {
-    outProps = _filterPropsByTeams(fullProps, homeTeam, awayTeam);
+    outProps = _filterPropsByTeams(baseList, homeTeam, awayTeam);
     filterMode = 'teams';
   }
-  var data = {
-    ok: true,
-    sport: sport,
-    props: outProps,
-    count: outProps.length,
-    source: source,
-    updatedAt: new Date().toISOString()
-  };
+
+  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length);
+  var hasExplicitLimit = req.query.limit != null && String(req.query.limit).trim() !== '';
+  var page = wantInventory || hasExplicitLimit
+    ? propsFoundation.paginateProps(outProps, {
+        offset: req.query.offset,
+        limit: req.query.limit || (wantInventory ? 500 : outProps.length || 1)
+      })
+    : { items: outProps, offset: 0, limit: outProps.length, total: outProps.length, hasMore: false };
+
+  var data;
+  if (wantInventory) {
+    var tree = propsFoundation.buildPropsInventoryTree(page.items);
+    data = {
+      ok: true,
+      sport: sport,
+      view: 'inventory',
+      contract: 'GAME>CATEGORY>PLAYER>MARKET>PRIMARY>ALTS',
+      games: tree.games,
+      gameCount: tree.gameCount,
+      props: page.items,
+      count: page.total,
+      page: { offset: page.offset, limit: page.limit, hasMore: page.hasMore },
+      maxAltSample: tree.maxAltSample,
+      categoryGroups: tree.categoryGroups,
+      photoPolicy: tree.photoPolicy,
+      capability: capability,
+      source: source,
+      updatedAt: new Date().toISOString(),
+      payloadBytes: null
+    };
+    data.payloadBytes = propsFoundation.measurePayloadBytes(data);
+  } else {
+    data = {
+      ok: true,
+      sport: sport,
+      props: page.items,
+      count: page.total,
+      capability: capability,
+      source: source,
+      updatedAt: new Date().toISOString()
+    };
+    if (hasExplicitLimit) {
+      data.page = { offset: page.offset, limit: page.limit, hasMore: page.hasMore };
+    }
+  }
   if (gameId) {
     data.gameId = gameId;
     data.filtered = true;
@@ -10428,7 +10271,102 @@ app.get('/api/props/:sport', async function(req, res) {
   res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
+  res.setHeader('X-Props-View', wantInventory ? 'inventory' : 'flat');
   if (filterMode) res.setHeader('X-Props-Filter', filterMode);
+  res.json(data);
+});
+
+// Explicit inventory path for future Props UI (no sportsbook UI change).
+app.get('/api/props/:sport/inventory', async function(req, res) {
+  req.query = Object.assign({}, req.query || {}, { view: 'inventory' });
+  // Delegate to the same sport handler by temporarily rewriting params path logic:
+  var sport = _normalizePropsSportParam(req.params.sport);
+  if (PROPS_SUPPORTED_SPORTS.indexOf(sport) < 0) {
+    return res.status(400).json({ ok: false, error: 'props_not_supported', sport: sport });
+  }
+  // Reuse by calling the flat route implementation via query view.
+  // Inline minimal re-fetch using cache + inventory tree.
+  var gameId = req.query.gameId ? String(req.query.gameId) : null;
+  var homeTeam = req.query.home ? String(req.query.home) : null;
+  var awayTeam = req.query.away ? String(req.query.away) : null;
+  var now = Date.now();
+  var cached = _PROPS_RESPONSE_CACHE[sport];
+  var inventoryProps = [];
+  var source = 'owls_props_api';
+  var cacheHit = false;
+  if (cached && (now - cached.at) < PROPS_CACHE_TTL_MS && cached.data.inventoryProps) {
+    inventoryProps = cached.data.inventoryProps;
+    source = cached.data.source || source;
+    cacheHit = true;
+  } else {
+    // Trigger the main handler cache fill by awaiting fetch path.
+    if (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY) {
+      var fetched = await fetchPropsFromOwlsInsight(sport);
+      var fromApi = (fetched.ok && fetched.props) ? fetched.props : [];
+      var fromCache = _collectPropsForSport(sport) || [];
+      var mergedRaw = fromApi.concat(fromCache);
+      inventoryProps = _filterPropsInventory(mergedRaw);
+      var fullProps = _filterPropsForDisplay(mergedRaw);
+      if (fromApi.length && fromCache.length) source = 'owls_props_api+cache';
+      else if (fromApi.length) source = 'owls_props_api';
+      else source = 'owls_cache_fallback';
+      _PROPS_RESPONSE_CACHE[sport] = {
+        at: now,
+        data: {
+          ok: true, sport: sport, props: fullProps, inventoryProps: inventoryProps,
+          count: fullProps.length, inventoryCount: inventoryProps.length,
+          source: source, updatedAt: new Date().toISOString()
+        }
+      };
+    } else {
+      inventoryProps = _filterPropsInventory(_collectPropsForSport(sport));
+      source = 'owls_cache_fallback';
+    }
+  }
+  var outProps = inventoryProps;
+  if (gameId) outProps = _filterPropsByGameId(outProps, gameId);
+  if ((homeTeam || awayTeam) && (!gameId || outProps.length === 0)) {
+    outProps = _filterPropsByTeams(outProps, homeTeam, awayTeam);
+  }
+  // Prefer game-scoped inventory to avoid entire-league dumps.
+  if (!gameId && !homeTeam && !awayTeam) {
+    return res.status(400).json({
+      ok: false,
+      error: 'props_inventory_requires_game_scope',
+      hint: 'Pass gameId or home+away to scope inventory; or use ?view=inventory&gameId=...'
+    });
+  }
+  var page = propsFoundation.paginateProps(outProps, {
+    offset: req.query.offset,
+    limit: req.query.limit || 800
+  });
+  var tree = propsFoundation.buildPropsInventoryTree(page.items);
+  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length);
+  var data = {
+    ok: true,
+    sport: sport,
+    view: 'inventory',
+    contract: 'GAME>CATEGORY>PLAYER>MARKET>PRIMARY>ALTS',
+    games: tree.games,
+    gameCount: tree.gameCount,
+    props: page.items,
+    count: page.total,
+    page: { offset: page.offset, limit: page.limit, hasMore: page.hasMore },
+    maxAltSample: tree.maxAltSample,
+    categoryGroups: tree.categoryGroups,
+    photoPolicy: tree.photoPolicy,
+    capability: capability,
+    source: source,
+    updatedAt: new Date().toISOString(),
+    payloadBytes: null
+  };
+  if (gameId) { data.gameId = gameId; data.filtered = true; }
+  if (homeTeam || awayTeam) { data.home = homeTeam; data.away = awayTeam; data.filtered = true; }
+  data.payloadBytes = propsFoundation.measurePayloadBytes(data);
+  res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
+  res.setHeader('X-Provider', 'owls_insight');
+  res.setHeader('X-Props-Source', source);
+  res.setHeader('X-Props-View', 'inventory');
   res.json(data);
 });
 
@@ -10914,6 +10852,13 @@ app.get('/api/sports', (req, res) => {
     };
     const c    = counts[key] || { games:0, markets:0, live:0, upcoming:0, final:0 };
     const owlsKey = OWLS_SPORT_MAP[key] || OWLS_SPORT_MAP[_CACHE_SPORT_KEY_BY_SHORT[key]||''] || null;
+    const propsCache = _PROPS_RESPONSE_CACHE[key];
+    const propsCount = propsCache && propsCache.data
+      ? (propsCache.data.inventoryCount != null
+          ? propsCache.data.inventoryCount
+          : (propsCache.data.props || []).length)
+      : 0;
+    const propsCap = propsFoundation.sportPropsCapability(key, propsCount);
     return {
       key:               key,
       label:             meta.label,
@@ -10923,6 +10868,10 @@ app.get('/api/sports', (req, res) => {
       logoUrl:           meta.logoUrl || null,
       enabled:           !!enabledSet[key],
       hasGames:          c.games > 0,
+      hasProps:          !!propsCap.hasProps,
+      propsStatus:       propsCap.propsStatus,
+      propsCount:        propsCap.propsCount,
+      propsCapable:      !!propsCap.propsCapable,
       liveGameCount:     c.live,
       upcomingGameCount: c.upcoming,
       totalGameCount:    c.games,
