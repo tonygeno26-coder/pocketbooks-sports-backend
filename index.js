@@ -12,6 +12,7 @@ const owlsLiveScores = require('./lib/owls-live-scores');
 const playerBeta = require('./lib/player-beta');
 const idempotencyEngine = require('./lib/idempotency-engine');
 const parlayCorrelation = require('./lib/parlay-correlation');
+const authAudit = require('./lib/auth-audit');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -5461,11 +5462,23 @@ function requireActor(req) {
 function _writeAuthAudit(eventType, actorId, clubId, endpoint, extra) {
   try {
     const sb = getSupabase();
-    if (sb) sb.from('audit_events').insert({
-      event_type: eventType, player_id: actorId||null, club_id: clubId||null,
-      payload: Object.assign({ endpoint, eventType }, extra||{})
-    }).then(()=>{}).catch(()=>{});
-  } catch(_e){}
+    if (!sb) return;
+    Promise.resolve(sb.from('audit_events').insert(authAudit.buildAuthAuditRow({
+      eventType,
+      actorId,
+      clubId,
+      endpoint,
+      metadata:extra
+    }))).then(function(result) {
+      if (result && result.error) {
+        console.warn('[auth-audit] best-effort persistence failed event='+eventType);
+      }
+    }, function() {
+      console.warn('[auth-audit] best-effort persistence threw event='+eventType);
+    });
+  } catch(_e) {
+    console.warn('[auth-audit] best-effort setup failed event='+eventType);
+  }
 }
 
 // ── CLUB SCOPE ENFORCEMENT ────────────────────────────────────────────────────────────────────
@@ -12396,6 +12409,23 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
     if (limitValues.max_payout == null && defaults.max_payout != null)
       limitValues.max_payout = defaults.max_payout;
 
+    // Required pre-mutation audit: without a DB RPC this multi-table approval
+    // is not transactionally atomic with audit_events. Persist a truthful
+    // authorization/request event before any limit or membership write so an
+    // audit outage fails closed with zero approval-flow mutation.
+    await authAudit.persistRequiredAuthAudit(sb, {
+      eventType:'member_approval_requested',
+      actorId:actor.actorId,
+      clubId,
+      endpoint:'/club/members/approve',
+      targetPlayerId:targetActorId,
+      metadata:{
+        requested_status:'approved',
+        balance_start:startBal,
+        fields:PLAYER_LIMIT_FIELDS.filter(function(field){ return limitValues[field] != null; })
+      }
+    });
+
     // No transaction/RPC exists for this cross-table operation. Persist and
     // verify limits first so an approved actor can never have a failed save.
     let persistedLimits = await _persistAndVerifyPlayerLimits(
@@ -12443,7 +12473,7 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
       } catch(_n) { /* notifications table may not exist */ }
     _membershipInvalidate(targetActorId, clubId);
     _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', {
-      targetActorId, balanceStart:startBal,
+      target_player_id:String(targetActorId), balanceStart:startBal,
       fields:PLAYER_LIMIT_FIELDS.filter(function(field){ return persistedLimits[field] != null; })
     });
     res.json({
@@ -15563,6 +15593,17 @@ app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), as
     if (!member || !['active','approved'].includes(String(member.status || '').toLowerCase()))
       return res.status(404).json({ ok:false, error:'member_not_found' });
 
+    // Required audit precedes the upsert. If audit_events is unavailable or
+    // rejects the production actor_id shape, no limit mutation begins.
+    await authAudit.persistRequiredAuthAudit(sb, {
+      eventType:'player_limits_update_requested',
+      actorId:actor.actorId,
+      clubId,
+      endpoint:'/club/player-limits',
+      targetPlayerId:playerId,
+      metadata:{ fields:Object.keys(validated.values) }
+    });
+
     const row = Object.assign({
       club_id:String(clubId),
       player_id:String(playerId),
@@ -15578,7 +15619,7 @@ app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), as
     });
     if (mismatch) throw new Error('player_limits_verification_failed');
     _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/club/player-limits',
-      { playerId, fields:PLAYER_LIMIT_FIELDS });
+      { target_player_id:String(playerId), fields:PLAYER_LIMIT_FIELDS });
     res.json({
       ok:true,
       clubId:String(clubId),
