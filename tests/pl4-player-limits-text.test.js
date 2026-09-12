@@ -534,6 +534,25 @@ test('G2: stake one cent above max_single_bet fails', async function() {
   assertEq(r.code, 'stake_above_max', 'code');
 });
 
+test('G2b: player limit 100 accepts 50 and rejects 101', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', max_single_bet: 100, blocked_sports: [], blocked_markets: [], allowed_sports: [] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const accepted = await checkRiskLimits(sb, 'c1', 'p1', { stake: 50, potentialPayout: 95, betType: 'Single', legs: [] });
+  const rejected = await checkRiskLimits(sb, 'c1', 'p1', { stake: 101, potentialPayout: 190, betType: 'Single', legs: [] });
+  assert(accepted.ok, '50 must be accepted under a 100 limit');
+  assert(!rejected.ok, '101 must be rejected over a 100 limit');
+  assertEq(rejected.code, 'stake_above_max', 'code');
+});
+
+test('G2c: changed player limit 25 rejects 50 and accepts 20', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', max_single_bet: 25, blocked_sports: [], blocked_markets: [], allowed_sports: [] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const rejected = await checkRiskLimits(sb, 'c1', 'p1', { stake: 50, potentialPayout: 95, betType: 'Single', legs: [] });
+  const accepted = await checkRiskLimits(sb, 'c1', 'p1', { stake: 20, potentialPayout: 38, betType: 'Single', legs: [] });
+  assert(!rejected.ok, '50 must be rejected over a 25 limit');
+  assert(accepted.ok, '20 must be accepted under a 25 limit');
+});
+
 test('G3: zero max_single_bet (unset) does not constrain stake', async function() {
   const rows = [{ club_id: 'c1', player_id: 'p1', max_single_bet: 0, blocked_sports: [], blocked_markets: [], allowed_sports: [] }];
   const sb = makeSupabaseHarness({ uuidMode: false, rows });
