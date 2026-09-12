@@ -3452,6 +3452,76 @@ app.get('/api/clubs/:id/members', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+function _normalizeUserIdentity(row) {
+  row = row || {};
+  return {
+    id: row.id == null ? '' : String(row.id),
+    display_name: row.display_name || row.name || '',
+    username: row.username || '',
+    email: row.email || ''
+  };
+}
+
+function _shortActorId(id) {
+  var value = id == null ? '' : String(id);
+  return value.length > 8 ? value.slice(0, 8) : value;
+}
+
+// users schemas differ between the legacy PG routes and the Supabase mirror.
+// Resolve only the requested IDs, and use id::text in PG so UUID and legacy
+// actor IDs match the text player_id/actor_id stored by club tables.
+async function _lookupUserIdentities(sb, ids) {
+  var wanted = Array.from(new Set((ids || []).filter(function(id) {
+    return id != null && String(id).trim();
+  }).map(String)));
+  var out = Object.create(null);
+  if (!wanted.length) return out;
+
+  if (sb) {
+    var uuidIds = wanted.filter(function(id) { return !!_uuidOrNull(id); });
+    var selectCandidates = [
+      'id,display_name,username,email',
+      'id,name,username,email',
+      'id,username,email'
+    ];
+    if (uuidIds.length) {
+      for (var i = 0; i < selectCandidates.length; i++) {
+        try {
+          const { data, error } = await sb.from('users')
+            .select(selectCandidates[i])
+            .in('id', uuidIds);
+          if (error) continue;
+          (data || []).forEach(function(row) {
+            var identity = _normalizeUserIdentity(row);
+            if (identity.id) out[identity.id] = identity;
+          });
+          break;
+        } catch(_e) {}
+      }
+    }
+  }
+
+  var unresolved = wanted.filter(function(id) { return !out[id]; });
+  if (unresolved.length) {
+    var sqlCandidates = [
+      'SELECT id::text AS id, display_name, username, email FROM users WHERE id::text = ANY($1::text[])',
+      'SELECT id::text AS id, name, username, email FROM users WHERE id::text = ANY($1::text[])',
+      'SELECT id::text AS id, username, email FROM users WHERE id::text = ANY($1::text[])'
+    ];
+    for (var j = 0; j < sqlCandidates.length; j++) {
+      try {
+        const result = await query(sqlCandidates[j], [unresolved]);
+        (result.rows || []).forEach(function(row) {
+          var identity = _normalizeUserIdentity(row);
+          if (identity.id) out[identity.id] = identity;
+        });
+        break;
+      } catch(_e) {}
+    }
+  }
+  return out;
+}
+
 app.get('/api/clubs/:id/requests', auth, async (req, res) => {
   try {
     const clubId = String(req.params.id);
@@ -3473,13 +3543,7 @@ app.get('/api/clubs/:id/requests', auth, async (req, res) => {
       if (error) throw error;
       const rows = data || [];
       const actorIds = rows.map(function(r){ return r.actor_id; }).filter(Boolean);
-      var usersById = Object.create(null);
-      if (actorIds.length) {
-        const { data: users } = await sb.from('users')
-          .select('id,name,email,username')
-          .in('id', actorIds);
-        (users || []).forEach(function(u){ usersById[String(u.id)] = u; });
-      }
+      var usersById = await _lookupUserIdentities(sb, actorIds);
       const requests = rows.map(function(r){
         var u = usersById[String(r.actor_id)] || {};
         return {
@@ -3492,28 +3556,37 @@ app.get('/api/clubs/:id/requests', auth, async (req, res) => {
           status: r.status,
           role: r.role,
           joined_at: r.joined_at,
-          name: u.name || u.username || null,
-          username: u.username || u.name || null,
+          name: u.display_name || u.username || null,
+          display_name: u.display_name || null,
+          username: u.username || null,
           email: u.email || null,
-          playerName: u.name || u.username || u.email || 'Player'
+          playerName: u.display_name || u.username || _shortActorId(r.actor_id)
         };
       });
       return res.json({ ok: true, requests: requests });
     }
     const r = await query(
-      `SELECT m.*, COALESCE(u.name,u.username,u.email) AS player_name, u.email, u.username
+      `SELECT m.*
        FROM club_memberships m
-       LEFT JOIN users u ON u.id::text = m.actor_id::text
        WHERE m.club_id=$1 AND m.status='pending'
        ORDER BY m.joined_at DESC`,
       [clubId]
     );
+    const rows = r.rows || [];
+    const fallbackUsersById = await _lookupUserIdentities(null, rows.map(function(row) {
+      return row.actor_id || row.player_id;
+    }));
     res.json({
       ok: true,
-      requests: (r.rows || []).map(function(row){
+      requests: rows.map(function(row){
+        var pid = row.actor_id || row.player_id;
+        var u = fallbackUsersById[String(pid)] || {};
         return Object.assign({}, row, {
-          playerId: row.actor_id || row.player_id,
-          playerName: row.player_name || row.username || row.email || 'Player',
+          playerId: pid,
+          display_name: u.display_name || null,
+          username: u.username || null,
+          email: u.email || null,
+          playerName: u.display_name || u.username || _shortActorId(pid),
           membershipId: row.id
         });
       })
@@ -3547,13 +3620,7 @@ app.get('/api/club/pending-requests', auth, async (req, res) => {
       if (error) throw error;
       const rows = data || [];
       const actorIds = rows.map(function(r){ return r.actor_id; }).filter(Boolean);
-      var usersById = Object.create(null);
-      if (actorIds.length) {
-        const { data: users } = await sb.from('users')
-          .select('id,name,email,username')
-          .in('id', actorIds);
-        (users || []).forEach(function(u){ usersById[String(u.id)] = u; });
-      }
+      var usersById = await _lookupUserIdentities(sb, actorIds);
       const requests = rows.map(function(r){
         var u = usersById[String(r.actor_id)] || {};
         return {
@@ -3566,28 +3633,37 @@ app.get('/api/club/pending-requests', auth, async (req, res) => {
           status: r.status,
           role: r.role,
           joined_at: r.joined_at,
-          name: u.name || u.username || null,
-          username: u.username || u.name || null,
+          name: u.display_name || u.username || null,
+          display_name: u.display_name || null,
+          username: u.username || null,
           email: u.email || null,
-          playerName: u.name || u.username || u.email || 'Player'
+          playerName: u.display_name || u.username || _shortActorId(r.actor_id)
         };
       });
       return res.json({ ok: true, requests: requests });
     }
     const r = await query(
-      `SELECT m.*, COALESCE(u.name,u.username,u.email) AS player_name, u.email, u.username
+      `SELECT m.*
        FROM club_memberships m
-       LEFT JOIN users u ON u.id::text = m.actor_id::text
        WHERE m.club_id=$1 AND m.status='pending'
        ORDER BY m.joined_at DESC`,
       [String(clubId)]
     );
+    const rows = r.rows || [];
+    const fallbackUsersById = await _lookupUserIdentities(null, rows.map(function(row) {
+      return row.actor_id || row.player_id;
+    }));
     res.json({
       ok: true,
-      requests: (r.rows || []).map(function(row){
+      requests: rows.map(function(row){
+        var pid = row.actor_id || row.player_id;
+        var u = fallbackUsersById[String(pid)] || {};
         return Object.assign({}, row, {
-          playerId: row.actor_id || row.player_id,
-          playerName: row.player_name || row.username || row.email || 'Player',
+          playerId: pid,
+          display_name: u.display_name || null,
+          username: u.username || null,
+          email: u.email || null,
+          playerName: u.display_name || u.username || _shortActorId(pid),
           membershipId: row.id
         });
       })
@@ -13053,66 +13129,31 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       }
     }
 
-    // Roster source of truth: club_memberships (active/approved players).
-    // club_members is balance-only and must not be the only membership gate —
-    // a failed users lookup used to 400 the whole handler when actor "16"
-    // was mixed into a uuid .in() list, leaving the UI on one local demo player.
+    // Approved Host Players come only from canonical club_members for this club.
+    // club_memberships remains the join-request/auth source and cannot create a
+    // dashboard roster row by itself.
     var memberMap = {};
-    var membershipCount = 0;
     var playerMemberCount = 0;
-    var skippedHostIds = {};
     try {
-      var memQ = sb.from('club_memberships').select('actor_id,role,status')
+      let plq = sb.from('club_members').select('player_id,balance_start,status')
         .eq('club_id', clubId);
-      const { data: memRows, error: memErr } = await memQ;
-      if (memErr) throw memErr;
-      membershipCount = (memRows||[]).length;
-      (memRows||[]).forEach(function(r) {
-        if (!r || r.actor_id == null) return;
+      if (playerId) plq = plq.eq('player_id', playerId);
+      const { data: plRows, error: mErr } = await plq;
+      if (mErr) throw mErr;
+      (plRows||[]).forEach(function(r) {
+        if (!r || r.player_id == null) return;
         var st = String(r.status||'').toLowerCase();
-        var role = String(r.role||'player').toLowerCase();
         if (st !== 'active' && st !== 'approved') return;
-        if (role === 'host' || role === 'admin' || role === 'owner' || role === 'full_admin') {
-          skippedHostIds[String(r.actor_id)] = true;
-          return;
-        }
-        memberMap[String(r.actor_id)] = {
-          balance_start: null,
-          role: r.role || 'player',
+        memberMap[String(r.player_id)] = {
+          balance_start: r.balance_start != null ? parseFloat(r.balance_start) : null,
+          role: 'player',
           status: r.status
         };
       });
       playerMemberCount = Object.keys(memberMap).length;
-    } catch(_e) {
-      console.warn('[host/dashboard] club_memberships fetch error:', _e.message);
-    }
-
-    // Starting balances from club_members (canonical balance table).
-    try {
-      let plq = sb.from('club_members').select('player_id,balance_start,status')
-        .eq('club_id', clubId);
-      const { data: plRows, error: mErr } = await plq;
-      if (mErr) throw mErr;
-      (plRows||[]).forEach(function(r) {
-        if (r.player_id == null) return;
-        var pid = String(r.player_id);
-        var start = r.balance_start != null ? parseFloat(r.balance_start) : null;
-        if (skippedHostIds[pid]) return;
-        if (memberMap[pid]) {
-          memberMap[pid].balance_start = start;
-          return;
-        }
-        // Approved club_members row without a membership still belongs on the roster.
-        if (String(r.status||'').toLowerCase() === 'approved') {
-          memberMap[pid] = { balance_start: start, role: 'player', status: r.status };
-        }
-      });
-      playerMemberCount = Object.keys(memberMap).length;
     } catch(_e) { console.warn('[host/dashboard] club_members fetch error:', _e.message); }
 
-    // Username lookup. users.id is uuid — never pass Railway numeric actor ids.
-    var nameById = {};
-    var displayNameById = {};
+    // Identity is resolved only for IDs present in this club's roster/tickets.
     var playerIds = [];
     var seenPid = {};
     Object.keys(memberMap).forEach(function(pid) {
@@ -13124,44 +13165,25 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       seenPid[pid] = true;
       playerIds.push(pid);
     });
-    var uuidPlayerIds = playerIds.filter(function(pid){ return !!_uuidOrNull(String(pid)); });
-    var usersResolved = 0;
-    if (uuidPlayerIds.length) {
-      try {
-        const { data: userRows, error: uErr } = await sb.from('users')
-          .select('id,username,display_name')
-          .in('id', uuidPlayerIds);
-        if (uErr) {
-          console.warn('[host/dashboard] users lookup failed:', uErr.message,
-            'asked='+uuidPlayerIds.length);
-        } else {
-          (userRows||[]).forEach(function(u) {
-            if (!u || u.id == null) return;
-            var id = String(u.id);
-            nameById[id] = u.username || u.display_name || '';
-            displayNameById[id] = u.display_name || u.username || '';
-            usersResolved++;
-          });
-        }
-      } catch(_ue) {
-        console.warn('[host/dashboard] users lookup threw:', _ue && _ue.message);
-      }
-    }
+    var usersById = await _lookupUserIdentities(sb, playerIds);
+    var usersResolved = Object.keys(usersById).length;
     console.log('[host/dashboard] roster club='+(clubId||'(none)')
-      + ' memberships='+membershipCount
       + ' playerMembers='+playerMemberCount
-      + ' uuidLookups='+uuidPlayerIds.length
+      + ' identityLookups='+playerIds.length
       + ' usersResolved='+usersResolved);
 
     function _uuidLike(s) {
       return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
     }
     function _playerLabel(pid, ticketUsername) {
-      var fromUsers = nameById[String(pid)] || '';
-      if (fromUsers) return fromUsers;
+      var identity = usersById[String(pid)] || {};
+      if (identity.username) return identity.username;
       var tu = ticketUsername || '';
       if (tu && tu !== String(pid) && !_uuidLike(tu)) return tu;
-      return displayNameById[String(pid)] || '';
+      return '';
+    }
+    function _shortPlayerId(pid) {
+      return _shortActorId(pid);
     }
 
     function rnd(v) { return Math.round((isNaN(v)?0:v)*100)/100; }
@@ -13176,11 +13198,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       var key = String(pid || 'unknown');
       if (!byPlayer[key]) {
         var meta = memberMap[key] || {};
-        var uname = username || nameById[key] || displayNameById[key] || key;
+        var identity = usersById[key] || {};
+        var uname = identity.username || username || '';
+        var displayName = identity.display_name || uname || _shortPlayerId(key);
         byPlayer[key] = {
           playerId:          key,
           username:          uname,
-          playerName:        displayNameById[key] || uname,
+          playerName:        displayName,
+          displayName:       displayName,
+          status:            meta.status || 'approved',
           startingBalance:   meta.balance_start != null ? rnd(meta.balance_start) : null,
           availableBalance:  null,
           openRisk:          0,
@@ -13190,12 +13216,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
         };
       } else if (username && byPlayer[key].username === key) {
         byPlayer[key].username = username;
-        byPlayer[key].playerName = username;
+        if (!byPlayer[key].playerName) byPlayer[key].playerName = username;
       }
       return byPlayer[key];
     }
 
-    Object.keys(memberMap).forEach(function(pid) { getOrCreatePlayer(pid, nameById[pid]); });
+    Object.keys(memberMap).forEach(function(pid) {
+      var identity = usersById[pid] || {};
+      getOrCreatePlayer(pid, identity.username);
+    });
 
     (tickets||[]).forEach(function(t) {
       var s      = (t.status||'').toLowerCase();
@@ -13203,8 +13232,13 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       var profit = parseFloat(t.potential_profit)||0;
       var pid    = t.player_id != null ? String(t.player_id) : 'unknown';
       var uname  = _playerLabel(pid, t.player_username);
-      var p      = getOrCreatePlayer(pid, uname);
-      if (uname) { p.username = uname; p.playerName = displayNameById[pid] || uname; }
+      var p      = memberMap[pid] ? getOrCreatePlayer(pid, uname) : null;
+      if (p && uname) {
+        var identity = usersById[pid] || {};
+        p.username = uname;
+        p.playerName = identity.display_name || uname;
+        p.displayName = p.playerName;
+      }
       var enriched = _enrichHostTicket(Object.assign({}, t, { player_username: uname || t.player_username }), legsByTicket[t.id] || []);
 
       // Include void/canceled in gradedTickets so Host Bets can show history.
@@ -13216,15 +13250,15 @@ app.get('/api/host/dashboard', requireCanonicalClubId, requirePermissionScoped('
       }
       if (s==='active'||s==='open') {
         handle+=risk; activeRisk+=risk; hostAtRisk+=profit; activeBetCount++;
-        p.openRisk += risk; p.activeBetCount++;
+        if (p) { p.openRisk += risk; p.activeBetCount++; }
         active.push(enriched);
       } else if (s==='won') {
         handle+=risk; settledLoss+=profit; gradedCount++;
-        p.settledGains += profit;
+        if (p) p.settledGains += profit;
         graded.push(enriched);
       } else if (s==='lost') {
         handle+=risk; settledGain+=risk; gradedCount++;
-        p.settledLosses += risk;
+        if (p) p.settledLosses += risk;
         graded.push(enriched);
       } else if (s==='push'||s==='pushed') {
         handle+=risk; gradedCount++;
@@ -15372,6 +15406,15 @@ app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), as
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   try {
+    const { data: memberRows, error: memberErr } = await sb.from('club_members')
+      .select('player_id')
+      .eq('club_id', clubId)
+      .eq('player_id', playerId)
+      .limit(1);
+    if (memberErr) throw memberErr;
+    if (!memberRows || !memberRows.length)
+      return res.status(404).json({ ok:false, error:'member_not_found' });
+
     const row = Object.assign({ club_id:clubId, player_id:playerId }, limits);
     await sb.from('player_limits').upsert(row, { onConflict:'club_id,player_id' });
     _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/club/player-limits',
