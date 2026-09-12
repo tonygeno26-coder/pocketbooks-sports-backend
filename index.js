@@ -7469,6 +7469,7 @@ if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
 
 // ── RISK LIMITS ENGINE ───────────────────────────────────────────────────────────────────────
 const RISK_CODE_STATUS = {
+  risk_limits_unavailable:  503,
   player_suspended:         403,
   stake_below_min:          422,
   stake_above_max:          422,
@@ -7497,10 +7498,14 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
   const nowMs = Date.now();
   let pl = {}, cs = {};
   try {
-    const { data:plData } = await sb.from('player_limits').select('*')
+    const { data:plData, error:plError } = await sb.from('player_limits').select('*')
       .eq('club_id',clubId).eq('player_id',playerId).limit(1);
+    if (plError) throw plError;
     if (plData&&plData[0]) pl = plData[0];
-  } catch(_e){}
+  } catch(_e){
+    console.warn('[bets/place] player_limits read failed closed:', _e.message);
+    return { ok:false, code:'risk_limits_unavailable' };
+  }
   try {
     const { data:csData } = await sb.from('club_risk_settings').select('*')
       .eq('club_id',clubId).limit(1);
@@ -12218,6 +12223,105 @@ function _requireMemberAdmin(actor) {
   return null;
 }
 
+const PLAYER_LIMIT_FIELDS = ['max_single_bet', 'max_payout', 'max_open_risk'];
+
+function _parsePlayerLimitValue(value, field) {
+  if (value == null || value === '') return { present:false };
+  if (typeof value === 'boolean' || (typeof value !== 'number' && typeof value !== 'string')) {
+    return { error:'invalid_player_limit', field };
+  }
+  const normalized = typeof value === 'string' ? value.trim() : value;
+  if (normalized === '') return { present:false };
+  const number = Number(normalized);
+  if (!Number.isFinite(number) || number < 0) {
+    return { error:'invalid_player_limit', field };
+  }
+  return { present:true, value:number };
+}
+
+function _validatedPlayerLimitPatch(input) {
+  const source = input || {};
+  const aliases = {
+    max_single_bet: source.max_single_bet != null ? source.max_single_bet
+      : (source.max_bet != null ? source.max_bet : source.maxBet),
+    max_payout: source.max_payout != null ? source.max_payout : source.maxPayout,
+    max_open_risk: source.max_open_risk != null ? source.max_open_risk : source.maxOpenRisk
+  };
+  const values = {};
+  for (let i = 0; i < PLAYER_LIMIT_FIELDS.length; i++) {
+    const field = PLAYER_LIMIT_FIELDS[i];
+    const parsed = _parsePlayerLimitValue(aliases[field], field);
+    if (parsed.error) return parsed;
+    if (parsed.present) values[field] = parsed.value;
+  }
+  return { values };
+}
+
+async function _playerLimitDefaults(sb, clubId) {
+  const { data, error } = await sb.from('club_risk_settings')
+    .select('max_stake,max_payout').eq('club_id', String(clubId)).limit(1);
+  if (error) throw error;
+  const row = data && data[0] ? data[0] : {};
+  return {
+    max_single_bet: row.max_stake != null && Number.isFinite(Number(row.max_stake))
+      ? Number(row.max_stake) : null,
+    max_payout: row.max_payout != null && Number.isFinite(Number(row.max_payout))
+      ? Number(row.max_payout) : null,
+    max_open_risk: null
+  };
+}
+
+async function _loadScopedPlayerLimitContext(sb, clubId, playerId, allowPending) {
+  const clubKey = String(clubId);
+  const playerKey = String(playerId);
+  const { data:canonicalRows, error:canonicalError } = await sb.from('club_members')
+    .select('player_id,status').eq('club_id', clubKey).eq('player_id', playerKey).limit(1);
+  if (canonicalError) throw canonicalError;
+  const canonical = canonicalRows && canonicalRows[0] ? canonicalRows[0] : null;
+  const canonicalStatus = canonical && String(canonical.status || '').toLowerCase();
+  if (canonical && (canonicalStatus === 'active' || canonicalStatus === 'approved')) {
+    return { canonical:true, membership:canonical };
+  }
+  if (!allowPending) return null;
+  const membership = await _membershipLoadUncached(playerKey, clubKey);
+  if (!membership || String(membership.status || '').toLowerCase() !== 'pending') return null;
+  return { canonical:false, membership };
+}
+
+async function _readPlayerLimits(sb, clubId, playerId) {
+  const { data, error } = await sb.from('player_limits').select('*')
+    .eq('club_id', String(clubId)).eq('player_id', String(playerId)).limit(1);
+  if (error) throw error;
+  return data && data[0] ? data[0] : null;
+}
+
+function _publicPlayerLimits(row) {
+  const out = {};
+  PLAYER_LIMIT_FIELDS.forEach(function(field) {
+    const value = row && row[field] != null ? Number(row[field]) : null;
+    out[field] = Number.isFinite(value) ? value : null;
+  });
+  return out;
+}
+
+async function _persistAndVerifyPlayerLimits(sb, clubId, playerId, values) {
+  const row = Object.assign({
+    club_id:String(clubId),
+    player_id:String(playerId),
+    updated_at:new Date().toISOString()
+  }, values);
+  const { error } = await sb.from('player_limits')
+    .upsert(row, { onConflict:'club_id,player_id' });
+  if (error) throw error;
+  const persisted = await _readPlayerLimits(sb, clubId, playerId);
+  if (!persisted) throw new Error('player_limits_verification_failed');
+  const mismatch = Object.keys(values).some(function(field) {
+    return Number(persisted[field]) !== Number(values[field]);
+  });
+  if (mismatch) throw new Error('player_limits_verification_failed');
+  return persisted;
+}
+
 // GET /api/club/members
 app.get('/api/club/members', requirePermissionScoped('view_settlement_history'), async (req, res) => {
   if (req._clubId) req.query = Object.assign({}, req.query, { clubId: req._clubId });
@@ -12256,7 +12360,7 @@ app.post('/api/club/members/invite', requirePermissionScoped('settle_player'), a
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
-// POST /api/club/members/approve — approve pending join + set player_limits / starting balance
+// POST /api/club/members/approve — limits first, then membership approval.
 app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor || {};
@@ -12270,53 +12374,60 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
 
   const startRaw = body.balanceStart != null ? body.balanceStart
     : (body.starting_balance != null ? body.starting_balance : body.credit_limit);
-  const startBal = parseFloat(startRaw);
-  const maxBet = parseFloat(body.max_bet != null ? body.max_bet : body.maxBet);
-  const maxDaily = parseFloat(body.max_daily_risk != null ? body.max_daily_risk : body.maxDailyRisk);
-  const maxPayout = parseFloat(body.max_payout != null ? body.max_payout : body.maxPayout);
-  const maxOpen = parseFloat(body.max_open_risk != null ? body.max_open_risk : body.maxOpenRisk);
+  const startBal = Number(startRaw);
+  if (startRaw == null || startRaw === '' || !Number.isFinite(startBal) || startBal < 0)
+    return res.status(422).json({ ok:false, error:'invalid_starting_balance' });
+  const validated = _validatedPlayerLimitPatch(body);
+  if (validated.error)
+    return res.status(422).json({ ok:false, error:validated.error, field:validated.field });
   const now = new Date().toISOString();
-  const limitsRow = {
-    club_id: String(clubId),
-    player_id: String(targetActorId),
-    max_bet: Number.isFinite(maxBet) ? maxBet : 100,
-    max_daily_risk: Number.isFinite(maxDaily) ? maxDaily : 500,
-    max_payout: Number.isFinite(maxPayout) ? maxPayout : 2000,
-    updated_at: now
-  };
-  if (Number.isFinite(maxOpen)) limitsRow.max_open_risk = maxOpen;
-  if (Number.isFinite(maxBet)) limitsRow.max_single_bet = maxBet;
 
   try {
     const sb = getSupabase();
-    if (sb) {
-      // Auth accepts approved|active; verify that the pending row actually moved.
-      await _membershipSetPendingStatus(targetActorId, clubId, 'approved', actor.actorId);
+    if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+    const context = await _loadScopedPlayerLimitContext(sb, clubId, targetActorId, true);
+    if (!context || context.canonical)
+      return res.status(409).json({ ok:false, error:'pending_membership_not_found' });
 
-      await sb.from('player_limits').upsert(limitsRow, { onConflict:'club_id,player_id' });
+    const defaults = await _playerLimitDefaults(sb, clubId);
+    const limitValues = Object.assign({}, validated.values);
+    if (limitValues.max_single_bet == null && defaults.max_single_bet != null)
+      limitValues.max_single_bet = defaults.max_single_bet;
+    if (limitValues.max_payout == null && defaults.max_payout != null)
+      limitValues.max_payout = defaults.max_payout;
 
-      if (Number.isFinite(startBal)) {
-        const memberRow = {
-          club_id: String(clubId),
-          player_id: String(targetActorId),
-          balance_start: startBal,
-          status: 'approved',
-          updated_at: now
-        };
-        const { error: cmErr } = await sb.from('club_members')
-          .upsert(memberRow, { onConflict:'club_id,player_id' });
-        if (cmErr) {
-          // Fallback: update-only if upsert conflict target differs
-          await sb.from('club_members')
-            .update({ balance_start: startBal, status:'approved', updated_at:now })
-            .eq('club_id', String(clubId)).eq('player_id', String(targetActorId));
-          const { data: existing } = await sb.from('club_members').select('player_id')
-            .eq('club_id', String(clubId)).eq('player_id', String(targetActorId)).limit(1);
-          if (!existing || !existing.length) {
-            await sb.from('club_members').insert(memberRow);
-          }
-        }
-      }
+    // No transaction/RPC exists for this cross-table operation. Persist and
+    // verify limits first so an approved actor can never have a failed save.
+    let persistedLimits = await _persistAndVerifyPlayerLimits(
+      sb, clubId, targetActorId, limitValues
+    );
+
+    // Stage canonical roster data as pending; a failed membership transition
+    // leaves no active dashboard player and the pre-saved limit row is harmless.
+    const stagedMember = {
+      club_id:String(clubId),
+      player_id:String(targetActorId),
+      balance_start:startBal,
+      status:'pending',
+      updated_at:now
+    };
+    const { error:stageError } = await sb.from('club_members')
+      .upsert(stagedMember, { onConflict:'club_id,player_id' });
+    if (stageError) throw stageError;
+
+    await _membershipSetPendingStatus(targetActorId, clubId, 'approved', actor.actorId);
+    const { error:activateError } = await sb.from('club_members')
+      .update({ status:'approved', updated_at:new Date().toISOString() })
+      .eq('club_id', String(clubId)).eq('player_id', String(targetActorId));
+    if (activateError) throw activateError;
+
+    const verifiedMembership = await _membershipLoadUncached(targetActorId, clubId);
+    const verifiedContext = await _loadScopedPlayerLimitContext(sb, clubId, targetActorId, false);
+    persistedLimits = await _readPlayerLimits(sb, clubId, targetActorId);
+    if (!verifiedMembership || !_membershipStatusActive(verifiedMembership.status)
+        || !verifiedContext || !persistedLimits) {
+      throw new Error('approval_verification_failed');
+    }
 
       // Best-effort in-app notification for the player
       try {
@@ -12330,16 +12441,15 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
           created_at: now
         });
       } catch(_n) { /* notifications table may not exist */ }
-    }
     _membershipInvalidate(targetActorId, clubId);
     _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', {
-      targetActorId, balanceStart: Number.isFinite(startBal) ? startBal : null,
-      max_bet: limitsRow.max_bet, max_daily_risk: limitsRow.max_daily_risk, max_payout: limitsRow.max_payout
+      targetActorId, balanceStart:startBal,
+      fields:PLAYER_LIMIT_FIELDS.filter(function(field){ return persistedLimits[field] != null; })
     });
     res.json({
       ok:true, targetActorId, status:'approved',
-      balanceStart: Number.isFinite(startBal) ? startBal : null,
-      limits: limitsRow
+      balanceStart:startBal,
+      limits:_publicPlayerLimits(persistedLimits)
     });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -15396,30 +15506,85 @@ app.post('/api/club/risk-settings', requirePermissionScoped('view_host_dashboard
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
+app.get('/api/club/player-limits', requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  if (req._clubId) req.query = Object.assign({}, req.query, { clubId:req._clubId });
+  const actor = req._actor || {};
+  const deny = _requireMemberAdmin(actor);
+  if (deny) return res.status(deny.status||403).json({ ok:false, error:deny.error });
+  const { clubId, playerId } = req.query || {};
+  if (!clubId || !playerId) return res.status(400).json({ ok:false, error:'missing_fields' });
+  const sb = getSupabase();
+  if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
+  try {
+    const context = await _loadScopedPlayerLimitContext(sb, clubId, playerId, true);
+    if (!context) return res.status(404).json({ ok:false, error:'member_not_found' });
+    const stored = await _readPlayerLimits(sb, clubId, playerId);
+    const defaults = await _playerLimitDefaults(sb, clubId);
+    const values = _publicPlayerLimits(stored);
+    const effective = {};
+    PLAYER_LIMIT_FIELDS.forEach(function(field) {
+      effective[field] = values[field] != null ? values[field] : defaults[field];
+    });
+    res.json({
+      ok:true,
+      clubId:String(clubId),
+      playerId:String(playerId),
+      membershipStatus:String(context.membership.status || ''),
+      values,
+      defaults,
+      effective,
+      source:stored ? 'player_override' : 'club_default'
+    });
+  } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
 app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), async (req, res) => {
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if (ROLE_RANK[actor.role]<ROLE_RANK.full_admin)
     return res.status(403).json({ ok:false, error:'insufficient_role' });
-  const { clubId, playerId, ...limits } = req.body||{};
+  const { clubId, playerId } = req.body||{};
   if (!clubId||!playerId) return res.status(400).json({ ok:false, error:'missing fields' });
+  const validated = _validatedPlayerLimitPatch(req.body);
+  if (validated.error)
+    return res.status(422).json({ ok:false, error:validated.error, field:validated.field });
+  if (!Object.keys(validated.values).length)
+    return res.status(422).json({ ok:false, error:'missing_player_limit_field' });
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   try {
-    const { data: memberRows, error: memberErr } = await sb.from('club_members')
-      .select('player_id')
+    const { data:memberRows, error:memberError } = await sb.from('club_members')
+      .select('player_id,status')
       .eq('club_id', clubId)
       .eq('player_id', playerId)
       .limit(1);
-    if (memberErr) throw memberErr;
-    if (!memberRows || !memberRows.length)
+    if (memberError) throw memberError;
+    const member = memberRows && memberRows[0];
+    if (!member || !['active','approved'].includes(String(member.status || '').toLowerCase()))
       return res.status(404).json({ ok:false, error:'member_not_found' });
 
-    const row = Object.assign({ club_id:clubId, player_id:playerId }, limits);
-    await sb.from('player_limits').upsert(row, { onConflict:'club_id,player_id' });
+    const row = Object.assign({
+      club_id:String(clubId),
+      player_id:String(playerId),
+      updated_at:new Date().toISOString()
+    }, validated.values);
+    const { error:saveError } = await sb.from('player_limits')
+      .upsert(row, { onConflict:'club_id,player_id' });
+    if (saveError) throw saveError;
+    const persisted = await _readPlayerLimits(sb, clubId, playerId);
+    if (!persisted) throw new Error('player_limits_verification_failed');
+    const mismatch = Object.keys(validated.values).some(function(field) {
+      return Number(persisted[field]) !== Number(validated.values[field]);
+    });
+    if (mismatch) throw new Error('player_limits_verification_failed');
     _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/club/player-limits',
-      { playerId, fields:Object.keys(limits) });
-    res.json({ ok:true, clubId, playerId, limits:row });
+      { playerId, fields:PLAYER_LIMIT_FIELDS });
+    res.json({
+      ok:true,
+      clubId:String(clubId),
+      playerId:String(playerId),
+      limits:_publicPlayerLimits(persisted)
+    });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
 
