@@ -71,14 +71,32 @@ function _envFlag(name, defaultValue) {
   return String(raw).toLowerCase() === 'true';
 }
 
-// Settlement money path is fail-closed. A missing env var must not arm settlement.
-// Explicit GRADING_SETTLEMENT_ENABLED=true is required to write grade_ticket_tx.
-// Live betting does not follow the settlement default.
+// First explicitly set env wins. Used to rename flags without breaking Railway.
+function _envFlagFirst(names, defaultValue) {
+  for (let i = 0; i < names.length; i++) {
+    const raw = process.env[names[i]];
+    if (raw != null && raw !== '') return String(raw).toLowerCase() === 'true';
+  }
+  return !!defaultValue;
+}
+
+// ── Ticket grading (authoritative betting bankroll via grade_ticket_tx) ─────
+// Independent of host↔player settlement. Fail-closed: missing env = OFF.
+// Legacy GRADING_SETTLEMENT_* names still accepted as aliases (historical
+// misnomer — those flags gated grade_ticket_tx, not host settlement ledger).
 const _LIVE_BETTING_DEFAULT_ON = process.env.NODE_ENV === 'production';
-const GRADING_SETTLEMENT_ENABLED = _envFlag('GRADING_SETTLEMENT_ENABLED', false);
+const TICKET_GRADING_ENABLED = _envFlagFirst(
+  ['TICKET_GRADING_ENABLED', 'GRADING_SETTLEMENT_ENABLED'], false);
+const WORKER_TICKET_GRADING_ENABLED = _envFlagFirst(
+  ['WORKER_TICKET_GRADING_ENABLED', 'WORKER_GRADE_SETTLEMENT_ENABLED'], false);
+const MANUAL_TICKET_GRADING_ENABLED = _envFlagFirst(
+  ['MANUAL_TICKET_GRADING_ENABLED', 'MANUAL_GRADE_SETTLEMENT_ENABLED'], false);
 const GRADE_RUN_DRY_RUN_ENABLED = _envFlag('GRADE_RUN_DRY_RUN_ENABLED', true);
-const WORKER_GRADE_SETTLEMENT_ENABLED = _envFlag('WORKER_GRADE_SETTLEMENT_ENABLED', false);
-const MANUAL_GRADE_SETTLEMENT_ENABLED = _envFlag('MANUAL_GRADE_SETTLEMENT_ENABLED', false);
+
+// ── Host↔player settlement ledger (off-platform amounts owed) ───────────────
+// Completely separate from ticket grading / bankroll. Fail-closed.
+const HOST_SETTLEMENT_RECORDING_ENABLED = _envFlag('HOST_SETTLEMENT_RECORDING_ENABLED', false);
+
 const BROWSER_TICKET_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_TICKET_MIRROR_WRITES_ENABLED', false);
 const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRITES_ENABLED', false);
 // Live betting: on in production unless explicitly disabled.
@@ -86,7 +104,7 @@ const BROWSER_LEDGER_MIRROR_WRITES_ENABLED = _envFlag('BROWSER_LEDGER_MIRROR_WRI
 const LIVE_BETTING_ENABLED = _envFlag('LIVE_BETTING_ENABLED', _LIVE_BETTING_DEFAULT_ON);
 // Player beta: ordinary accounts cannot create clubs. Leave unset / false in production.
 const PUBLIC_CLUB_CREATION_ENABLED = _envFlag('PUBLIC_CLUB_CREATION_ENABLED', false);
-const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'grade_ticket_tx_missing';
+const GRADING_DISABLED_REASON = process.env.GRADING_DISABLED_REASON || 'ticket_grading_disabled';
 const _BROWSER_TERMINAL_STATUSES = new Set(['won','lost','push','pushed','void','voided','refunded','settled','canceled','cancelled']);
 const LIVE_PLACEMENT_REJECTION_CODES = new Set([
   'live_betting_disabled',
@@ -109,14 +127,27 @@ const _liveDiagnostics = {
 
 function _gradingContainmentStatus() {
   return {
-    settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+    ticketGradingEnabled:TICKET_GRADING_ENABLED,
+    workerTicketGradingEnabled:WORKER_TICKET_GRADING_ENABLED,
+    manualTicketGradingEnabled:MANUAL_TICKET_GRADING_ENABLED,
     gradeRunDryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED,
-    workerSettlementEnabled:WORKER_GRADE_SETTLEMENT_ENABLED,
-    manualSettlementEnabled:MANUAL_GRADE_SETTLEMENT_ENABLED,
+    hostSettlementRecordingEnabled:HOST_SETTLEMENT_RECORDING_ENABLED,
+    // Legacy field names (mean ticket grading, NOT host settlement):
+    settlementEnabled:TICKET_GRADING_ENABLED,
+    workerSettlementEnabled:WORKER_TICKET_GRADING_ENABLED,
+    manualSettlementEnabled:MANUAL_TICKET_GRADING_ENABLED,
     browserTicketMirrorWritesEnabled:BROWSER_TICKET_MIRROR_WRITES_ENABLED,
     browserLedgerMirrorWritesEnabled:BROWSER_LEDGER_MIRROR_WRITES_ENABLED,
-    reason:GRADING_SETTLEMENT_ENABLED?null:GRADING_DISABLED_REASON
+    reason:TICKET_GRADING_ENABLED?null:GRADING_DISABLED_REASON
   };
+}
+
+function _hostSettlementRecordingBlocked(res) {
+  return res.status(503).json({
+    ok:false,
+    error:'host_settlement_recording_disabled',
+    hostSettlementRecordingEnabled:false
+  });
 }
 
 function _mirrorNoopPayload(reason, extra) {
@@ -525,8 +556,8 @@ async function _runGradeCore(fakeReq, sb) {
     skipReasons[key] = (skipReasons[key] || 0) + 1;
   }
   console.log('GRADE_CORE_START daysBack='+daysBack+' clubId='+(clubId||'ALL')+
-    ' playerId='+(playerId||'ALL')+' settlement='+!!GRADING_SETTLEMENT_ENABLED+
-    ' workerSettlement='+!!WORKER_GRADE_SETTLEMENT_ENABLED);
+    ' playerId='+(playerId||'ALL')+' ticketGrading='+!!TICKET_GRADING_ENABLED+
+    ' workerTicketGrading='+!!WORKER_TICKET_GRADING_ENABLED);
   let tq = sb.from('tickets').select('id,type,status,risk_amount,potential_profit,estimated_payout,graded_at,player_id,club_id').in('status',['active','open']);
   if (playerId) tq = tq.eq('player_id',playerId);
   if (clubId)   tq = tq.eq('club_id',clubId);
@@ -636,10 +667,10 @@ async function _runGradeCore(fakeReq, sb) {
         overrideProfit = Math.round((risk*(decProd-1))*100)/100;
         profit = overrideProfit;
       }
-      if (!GRADING_SETTLEMENT_ENABLED || !WORKER_GRADE_SETTLEMENT_ENABLED) {
+      if (!TICKET_GRADING_ENABLED || !WORKER_TICKET_GRADING_ENABLED) {
         console.warn('GRADE_CORE_SKIP ticketId='+ticket.id+
-          ' outcome='+outcome.outcome+' reason=settlement_blocked '+GRADING_DISABLED_REASON);
-        bumpSkip('settlement_blocked');
+          ' outcome='+outcome.outcome+' reason=ticket_grading_blocked '+GRADING_DISABLED_REASON);
+        bumpSkip('ticket_grading_blocked');
         continue;
       }
       const gr = await _callMoneyRpc('grade_ticket_tx',{
@@ -2837,9 +2868,14 @@ app.get('/api/health', async (req, res) => {
     resultStatus:_lastResultSuccessAt?'healthy':(_mlbGradePollerStarted?'starting':'unknown'),
     queueStatus:'not_implemented',
     liveBettingEnabled: !!LIVE_BETTING_ENABLED,
-    settlementEnabled: !!GRADING_SETTLEMENT_ENABLED,
-    workerSettlementEnabled: !!WORKER_GRADE_SETTLEMENT_ENABLED,
-    manualSettlementEnabled: !!MANUAL_GRADE_SETTLEMENT_ENABLED,
+    ticketGradingEnabled: !!TICKET_GRADING_ENABLED,
+    workerTicketGradingEnabled: !!WORKER_TICKET_GRADING_ENABLED,
+    manualTicketGradingEnabled: !!MANUAL_TICKET_GRADING_ENABLED,
+    hostSettlementRecordingEnabled: !!HOST_SETTLEMENT_RECORDING_ENABLED,
+    // Legacy aliases: historically meant ticket grading (grade_ticket_tx), not host settlement.
+    settlementEnabled: !!TICKET_GRADING_ENABLED,
+    workerSettlementEnabled: !!WORKER_TICKET_GRADING_ENABLED,
+    manualSettlementEnabled: !!MANUAL_TICKET_GRADING_ENABLED,
     gradeRunDryRunEnabled: !!GRADE_RUN_DRY_RUN_ENABLED,
     lastOddsSuccessAt:lastOdds, lastResultSuccessAt:_lastResultSuccessAt,
     lastGradePollAt:_lastGradePollAt, lastGradeRunAt:_lastGradeRunAt,
@@ -8790,7 +8826,7 @@ app.post('/api/mirror/ticket', async (req, res) => {
   if (!BROWSER_TICKET_MIRROR_WRITES_ENABLED)
     return res.json(_mirrorNoopPayload('browser_ticket_mirror_writes_disabled',
       { endpoint:'/api/mirror/ticket' }));
-  if (!GRADING_SETTLEMENT_ENABLED && _BROWSER_TERMINAL_STATUSES.has(browserStatus))
+  if (!TICKET_GRADING_ENABLED && _BROWSER_TERMINAL_STATUSES.has(browserStatus))
     return res.json(_mirrorNoopPayload('browser_terminal_status_mirror_blocked',
       { endpoint:'/api/mirror/ticket', status:browserStatus }));
   res.json({ queued: true }); // respond immediately
@@ -11979,8 +12015,8 @@ app.post('/api/grade/manual', requireCanonicalClubId, requirePermissionScoped('r
     return res.status(400).json({ ok:false, error:'missing_required_field' });
   if (!['won','lost','push'].includes(result))
     return res.status(400).json({ ok:false, error:'invalid_result:'+result });
-  if (!GRADING_SETTLEMENT_ENABLED || !MANUAL_GRADE_SETTLEMENT_ENABLED)
-    return res.status(503).json({ ok:false, error:'grading_settlement_disabled',
+  if (!TICKET_GRADING_ENABLED || !MANUAL_TICKET_GRADING_ENABLED)
+    return res.status(503).json({ ok:false, error:'ticket_grading_disabled',
       reason:GRADING_DISABLED_REASON, containment:_gradingContainmentStatus() });
   try {
     const { data:tData } = await sb.from('tickets')
@@ -12127,11 +12163,13 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
         const payout = combined==='won'?Math.round((risk+profit)*100)/100:combined==='push'?risk:0;
         const delta  = combined==='won'?profit:combined==='push'?0:-risk;
 
-        if (!GRADING_SETTLEMENT_ENABLED) {
+        if (!TICKET_GRADING_ENABLED) {
           if (!GRADE_RUN_DRY_RUN_ENABLED)
-            throw new Error('grading_settlement_disabled:'+GRADING_DISABLED_REASON);
+            throw new Error('ticket_grading_disabled:'+GRADING_DISABLED_REASON);
           row.statusAfter=ticket.status; row.result=combined; row.payoutDelta=delta;
-          row.dryRun=true; row.settlementDisabled=true; row.reason='dry_run:'+GRADING_DISABLED_REASON;
+          row.dryRun=true; row.ticketGradingDisabled=true;
+          row.settlementDisabled=true; // legacy alias of ticketGradingDisabled
+          row.reason='dry_run:'+GRADING_DISABLED_REASON;
           row.wouldPayout=payout; row.wouldCanonicalLedgerId='LE_GR_'+ticket.id+'_'+combined;
           if (overrideProfit!=null) { row.pushReduced=true; row.overrideProfit=overrideProfit; }
           skipped++;
@@ -12215,8 +12253,10 @@ app.post('/api/grade/run', requireCanonicalClubId, requirePermissionScoped('grad
     }
 
     res.json({ ok:true,
-      mode:GRADING_SETTLEMENT_ENABLED?'settlement':'dry_run',
-      settlementDisabled:!GRADING_SETTLEMENT_ENABLED,
+      mode:TICKET_GRADING_ENABLED?'grade':'dry_run',
+      ticketGradingDisabled:!TICKET_GRADING_ENABLED,
+      settlementDisabled:!TICKET_GRADING_ENABLED, // legacy alias
+      hostSettlementRecordingEnabled:!!HOST_SETTLEMENT_RECORDING_ENABLED,
       containment:_gradingContainmentStatus(),
       checked:tickets.length, graded, skipped, errors, results });
   } catch(e) {
@@ -13887,6 +13927,7 @@ app.post('/api/host/player-credit', requireCanonicalClubId, requirePermissionSco
 
 // POST /api/host/settle-player — execute settlement, write ledger + audit
 app.post('/api/host/settle-player', requireCanonicalClubId, requirePermissionScoped('settle_player'), requireIdempotency({required:true, money:true}), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -14036,6 +14077,7 @@ function _getISOWeek(date) {
 
 // POST /api/host/weekly-rollover
 app.post('/api/host/weekly-rollover', requirePermissionScoped('weekly_rollover'), requireIdempotency({required:true, money:true, requirePlayer:false}), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   const sb = getSupabase();
   if (!sb) return res.status(503).json({ ok:false, error:'supabase_not_configured' });
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
@@ -15705,6 +15747,7 @@ app.get('/api/host/settlements/:periodId/snapshots', requirePermissionScoped('vi
 
 // POST /api/host/settlements/payment
 app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager)
@@ -15761,6 +15804,7 @@ app.post('/api/host/settlements/payment', requirePermissionScoped('settle_player
 
 // POST /api/host/settlements/payment-confirm
 app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.settlement_manager)
@@ -15845,6 +15889,7 @@ app.post('/api/host/settlements/payment-confirm', requirePermissionScoped('settl
 
 // POST /api/host/settlements/payment-void
 app.post('/api/host/settlements/payment-void', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
@@ -15939,6 +15984,7 @@ app.get('/api/host/settlements/:periodId/payments', requirePermissionScoped('vie
 
 // POST /api/host/settlements/close-week
 app.post('/api/host/settlements/close-week', requireCanonicalClubId, requirePermissionScoped('settlement_manager'), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor   = req._actor||{};
   const actorRank = ROLE_RANK[actor.role]||0;
@@ -16054,6 +16100,7 @@ app.post('/api/host/settlements/close-week', requireCanonicalClubId, requirePerm
 
 // POST /api/host/settlements/reopen-week
 app.post('/api/host/settlements/reopen-week', requirePermissionScoped('settle_player'), async (req, res) => {
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED) return _hostSettlementRecordingBlocked(res);
   if (req._clubId) req.body = Object.assign({}, req.body, { clubId: req._clubId });
   const actor = req._actor||{};
   if ((ROLE_RANK[actor.role]||0) < ROLE_RANK.full_admin)
@@ -16310,7 +16357,9 @@ app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
   const containment = _gradingContainmentStatus();
   if (!sb) return res.json({ enabled:false, reason:'supabase_not_configured',
-    containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+    containment, ticketGradingEnabled:TICKET_GRADING_ENABLED,
+    hostSettlementRecordingEnabled:HOST_SETTLEMENT_RECORDING_ENABLED,
+    settlementEnabled:TICKET_GRADING_ENABLED, // legacy alias of ticket grading
     dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   try {
     const { data: recent } = await sb.from('audit_events')
@@ -16324,7 +16373,9 @@ app.get('/api/grade/status', async (req, res) => {
       recentGrades: recent||[], activeTicketCount: active ? active.length : 0,
       lastResultSuccessAt:_lastResultSuccessAt, lastGradePollAt:_lastGradePollAt,
       gradePollerStarted:_mlbGradePollerStarted,
-      containment, settlementEnabled:GRADING_SETTLEMENT_ENABLED,
+      containment, ticketGradingEnabled:TICKET_GRADING_ENABLED,
+      hostSettlementRecordingEnabled:HOST_SETTLEMENT_RECORDING_ENABLED,
+      settlementEnabled:TICKET_GRADING_ENABLED, // legacy alias of ticket grading
       dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   } catch(e) { res.status(500).json({ enabled:true, error:e.message }); }
 });
@@ -18269,11 +18320,13 @@ app.listen(PORT, '0.0.0.0', () => {
   }
   console.log('║  SUPABASE_URL='+(process.env.SUPABASE_URL?'set':'MISSING'));
   console.log('║  SESSION_SECRET='+(process.env.SESSION_SECRET && process.env.SESSION_SECRET !== 'dev-insecure-secret-change-in-prod' ? 'set':'MISSING/default'));
-  if (!GRADING_SETTLEMENT_ENABLED)
-    console.warn('[grading] SETTLEMENT DISABLED reason='+GRADING_DISABLED_REASON+
+  if (!TICKET_GRADING_ENABLED)
+    console.warn('[grading] TICKET GRADING DISABLED reason='+GRADING_DISABLED_REASON+
       ' dryRun='+GRADE_RUN_DRY_RUN_ENABLED+
-      ' workerSettlement='+WORKER_GRADE_SETTLEMENT_ENABLED+
-      ' manualSettlement='+MANUAL_GRADE_SETTLEMENT_ENABLED);
+      ' workerTicketGrading='+WORKER_TICKET_GRADING_ENABLED+
+      ' manualTicketGrading='+MANUAL_TICKET_GRADING_ENABLED);
+  if (!HOST_SETTLEMENT_RECORDING_ENABLED)
+    console.warn('[settlement] HOST SETTLEMENT RECORDING DISABLED (independent of ticket grading)');
   if (!BROWSER_TICKET_MIRROR_WRITES_ENABLED || !BROWSER_LEDGER_MIRROR_WRITES_ENABLED)
     console.warn('[mirror] browser writes containment ticketWrites='+BROWSER_TICKET_MIRROR_WRITES_ENABLED+
       ' ledgerWrites='+BROWSER_LEDGER_MIRROR_WRITES_ENABLED);
