@@ -120,7 +120,7 @@ describe('Host player-limit audit persistence', () => {
     const auditAt = limits.indexOf('persistRequiredAuthAudit');
     const upsertAt = limits.indexOf("from('player_limits')");
     expect(auditAt).toBeGreaterThan(-1);
-    expect(limits).toContain("eventType:'player_limits_update_requested'");
+    expect(limits).toContain("eventType:'player_settings_update_requested'");
     expect(limits).toContain('targetPlayerId:playerId');
     expect(auditAt).toBeLessThan(upsertAt);
   });

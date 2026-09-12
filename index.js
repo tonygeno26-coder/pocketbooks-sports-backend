@@ -13,6 +13,7 @@ const playerBeta = require('./lib/player-beta');
 const idempotencyEngine = require('./lib/idempotency-engine');
 const parlayCorrelation = require('./lib/parlay-correlation');
 const authAudit = require('./lib/auth-audit');
+const playerSettings = require('./lib/player-settings');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -7183,6 +7184,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
     commenceTime:         commenceTime,
     isLive:               state === 'live',   // server-authoritative; never trust client leg.isLive
+    canonicalSportId:     playerSettings.canonicalSportFromSnapshot(snap),
     // Prefer the snapshot's Owls key so ticket_legs grade against the same
     // identity we looked up (not the lobby's short "mlb|..." key).
     canonicalGameKey:     snap.canonical_game_key || preferredKey || rawKey
@@ -7324,6 +7326,7 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
       accepted_at:            new Date(nowMs).toISOString(),
       dev_fallback:           vr.devFallback||false,
       server_is_live:         vr.isLive||false,   // server-derived; used by RPC, not client leg.isLive
+      canonicalSportId:       vr.canonicalSportId || null,
       canonicalGameKey:       vr.canonicalGameKey || legs[i].canonicalGameKey
     }));
   }
@@ -7492,6 +7495,8 @@ const RISK_CODE_STATUS = {
   round_robins_disabled:    422,
   too_many_parlay_legs:     422,
   sport_blocked:            422,
+  player_sport_disabled:    422,
+  player_sport_identity_unavailable:503,
   sport_not_allowed:        422,
   market_blocked:           422,
   live_betting_disabled:    422,
@@ -7529,6 +7534,11 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
   const pay = parseFloat(potentialPayout)||0;
   const type= (betType||'').toLowerCase();
   const legsArr = legs||[];
+
+  // Player access is derived only from server-matched snapshots. A restricted
+  // account fails closed when a leg cannot be mapped to the canonical registry.
+  const playerSportGate = playerSettings.checkPlayerSportAccess(pl.blocked_sports, legsArr);
+  if (!playerSportGate.ok) return playerSportGate;
 
   // Player suspended
   if (pl.suspended_until && nowMs < new Date(pl.suspended_until).getTime())
@@ -7593,8 +7603,6 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
     const market = (leg.market||'moneyline').toLowerCase();
     if (cs.blocked_sports && cs.blocked_sports.includes(sport))
       return { ok:false, code:'sport_blocked', sport, legIndex:i, source:'club_settings' };
-    if (pl.blocked_sports && pl.blocked_sports.includes(sport))
-      return { ok:false, code:'sport_blocked', sport, legIndex:i, source:'player_limit' };
     if (cs.blocked_markets && cs.blocked_markets.includes(market))
       return { ok:false, code:'market_blocked', market, legIndex:i, source:'club_settings' };
     if (pl.blocked_markets && pl.blocked_markets.includes(market))
@@ -12317,6 +12325,26 @@ function _publicPlayerLimits(row) {
   return out;
 }
 
+function _publicHostPlayerSettings(limitRow, memberRow) {
+  return {
+    limits:_publicPlayerLimits(limitRow),
+    disabledSports:Array.isArray(limitRow && limitRow.blocked_sports)
+      ? limitRow.blocked_sports.map(playerSettings.canonicalSportId).filter(Boolean)
+      : [],
+    hostNotes:typeof (memberRow && memberRow.notes) === 'string' ? memberRow.notes : '',
+    hostNotesMaxLength:playerSettings.HOST_NOTES_MAX_LENGTH,
+    canonicalSports:playerSettings.CANONICAL_SPORT_IDS.slice()
+  };
+}
+
+async function _readHostPlayerSettings(sb, clubId, playerId) {
+  const limits = await _readPlayerLimits(sb, clubId, playerId);
+  const { data, error } = await sb.from('club_members').select('player_id,status,notes')
+    .eq('club_id', String(clubId)).eq('player_id', String(playerId)).limit(1);
+  if (error) throw error;
+  return { limits, member:data && data[0] ? data[0] : null };
+}
+
 async function _persistAndVerifyPlayerLimits(sb, clubId, playerId, values) {
   const row = Object.assign({
     club_id:String(clubId),
@@ -12329,6 +12357,9 @@ async function _persistAndVerifyPlayerLimits(sb, clubId, playerId, values) {
   const persisted = await _readPlayerLimits(sb, clubId, playerId);
   if (!persisted) throw new Error('player_limits_verification_failed');
   const mismatch = Object.keys(values).some(function(field) {
+    if (Array.isArray(values[field])) {
+      return JSON.stringify(persisted[field] || []) !== JSON.stringify(values[field]);
+    }
     return Number(persisted[field]) !== Number(values[field]);
   });
   if (mismatch) throw new Error('player_limits_verification_failed');
@@ -12393,6 +12424,12 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
   const validated = _validatedPlayerLimitPatch(body);
   if (validated.error)
     return res.status(422).json({ ok:false, error:validated.error, field:validated.field });
+  const disabledSports = playerSettings.validateDisabledSports(body.disabledSports);
+  if (disabledSports.error)
+    return res.status(422).json({ ok:false, error:disabledSports.error, sport:disabledSports.sport });
+  const hostNotes = playerSettings.validateHostNotes(body.hostNotes);
+  if (hostNotes.error)
+    return res.status(422).json({ ok:false, error:hostNotes.error, maxLength:hostNotes.maxLength });
   const now = new Date().toISOString();
 
   try {
@@ -12423,13 +12460,18 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
         requested_status:'approved',
         balance_start:startBal,
         fields:PLAYER_LIMIT_FIELDS.filter(function(field){ return limitValues[field] != null; })
+          .concat(['disabled_sports','host_notes']),
+        disabled_sports:disabledSports.value,
+        host_notes_changed:true,
+        host_notes_length:hostNotes.value.length
       }
     });
 
     // No transaction/RPC exists for this cross-table operation. Persist and
     // verify limits first so an approved actor can never have a failed save.
     let persistedLimits = await _persistAndVerifyPlayerLimits(
-      sb, clubId, targetActorId, limitValues
+      sb, clubId, targetActorId,
+      Object.assign({}, limitValues, { blocked_sports:disabledSports.value })
     );
 
     // Stage canonical roster data as pending; a failed membership transition
@@ -12438,6 +12480,7 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
       club_id:String(clubId),
       player_id:String(targetActorId),
       balance_start:startBal,
+      notes:hostNotes.value,
       status:'pending',
       updated_at:now
     };
@@ -12453,9 +12496,12 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
 
     const verifiedMembership = await _membershipLoadUncached(targetActorId, clubId);
     const verifiedContext = await _loadScopedPlayerLimitContext(sb, clubId, targetActorId, false);
-    persistedLimits = await _readPlayerLimits(sb, clubId, targetActorId);
+    const persistedSettings = await _readHostPlayerSettings(sb, clubId, targetActorId);
+    persistedLimits = persistedSettings.limits;
     if (!verifiedMembership || !_membershipStatusActive(verifiedMembership.status)
-        || !verifiedContext || !persistedLimits) {
+        || !verifiedContext || !persistedLimits || !persistedSettings.member
+        || String(persistedSettings.member.notes || '') !== hostNotes.value
+        || JSON.stringify(persistedLimits.blocked_sports || []) !== JSON.stringify(disabledSports.value)) {
       throw new Error('approval_verification_failed');
     }
 
@@ -12475,11 +12521,16 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
     _writeAuthAudit('member_approved', actor.actorId, clubId, '/club/members/approve', {
       target_player_id:String(targetActorId), balanceStart:startBal,
       fields:PLAYER_LIMIT_FIELDS.filter(function(field){ return persistedLimits[field] != null; })
+        .concat(['disabled_sports','host_notes']),
+      disabled_sports:disabledSports.value,
+      host_notes_changed:true,
+      host_notes_length:hostNotes.value.length
     });
     res.json({
       ok:true, targetActorId, status:'approved',
       balanceStart:startBal,
-      limits:_publicPlayerLimits(persistedLimits)
+      limits:_publicPlayerLimits(persistedLimits),
+      settings:_publicHostPlayerSettings(persistedLimits, persistedSettings.member)
     });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
@@ -15413,6 +15464,12 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
     } catch(_e) { console.warn('[player/summary] club_members balance fetch error:', _e.message); }
     if (startingBalance === null) console.warn('[player/summary] no club_members row for player='+playerId+' club='+clubId+' — balance shown as null');
 
+    // Player-safe access only. Host notes are deliberately never selected here.
+    const playerLimitRow = await _readPlayerLimits(sb, clubId, playerId);
+    const disabledSports = Array.isArray(playerLimitRow && playerLimitRow.blocked_sports)
+      ? playerLimitRow.blocked_sports.map(playerSettings.canonicalSportId).filter(Boolean)
+      : [];
+
     // Ticket-derived components (breakdown + fallback)
     var openRisk=0, settledGains=0, settledLosses=0;
     var active=[], settled=[], canceled=[];
@@ -15498,6 +15555,10 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
         openRisk: rnd(wRisk),
         ticketCount: wCount
       },
+      bettingAccess:{
+        disabledSports,
+        canonicalSports:playerSettings.CANONICAL_SPORT_IDS.slice()
+      },
       warnings
     });
   } catch(e) {
@@ -15549,6 +15610,7 @@ app.get('/api/club/player-limits', requirePermissionScoped('view_host_dashboard'
     const context = await _loadScopedPlayerLimitContext(sb, clubId, playerId, true);
     if (!context) return res.status(404).json({ ok:false, error:'member_not_found' });
     const stored = await _readPlayerLimits(sb, clubId, playerId);
+    const hostSettings = await _readHostPlayerSettings(sb, clubId, playerId);
     const defaults = await _playerLimitDefaults(sb, clubId);
     const values = _publicPlayerLimits(stored);
     const effective = {};
@@ -15563,6 +15625,7 @@ app.get('/api/club/player-limits', requirePermissionScoped('view_host_dashboard'
       values,
       defaults,
       effective,
+      settings:_publicHostPlayerSettings(stored, hostSettings.member),
       source:stored ? 'player_override' : 'club_default'
     });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
@@ -15578,6 +15641,12 @@ app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), as
   const validated = _validatedPlayerLimitPatch(req.body);
   if (validated.error)
     return res.status(422).json({ ok:false, error:validated.error, field:validated.field });
+  const disabledSports = playerSettings.validateDisabledSports(req.body.disabledSports);
+  if (disabledSports.error)
+    return res.status(422).json({ ok:false, error:disabledSports.error, sport:disabledSports.sport });
+  const hostNotes = playerSettings.validateHostNotes(req.body.hostNotes);
+  if (hostNotes.error)
+    return res.status(422).json({ ok:false, error:hostNotes.error, maxLength:hostNotes.maxLength });
   if (!Object.keys(validated.values).length)
     return res.status(422).json({ ok:false, error:'missing_player_limit_field' });
   const sb = getSupabase();
@@ -15596,35 +15665,51 @@ app.post('/api/club/player-limits', requirePermissionScoped('settle_player'), as
     // Required audit precedes the upsert. If audit_events is unavailable or
     // rejects the production actor_id shape, no limit mutation begins.
     await authAudit.persistRequiredAuthAudit(sb, {
-      eventType:'player_limits_update_requested',
+      eventType:'player_settings_update_requested',
       actorId:actor.actorId,
       clubId,
       endpoint:'/club/player-limits',
       targetPlayerId:playerId,
-      metadata:{ fields:Object.keys(validated.values) }
+      metadata:{
+        fields:Object.keys(validated.values).concat(['disabled_sports','host_notes']),
+        disabled_sports:disabledSports.value,
+        host_notes_changed:true,
+        host_notes_length:hostNotes.value.length
+      }
     });
 
     const row = Object.assign({
       club_id:String(clubId),
       player_id:String(playerId),
       updated_at:new Date().toISOString()
-    }, validated.values);
+    }, validated.values, { blocked_sports:disabledSports.value });
     const { error:saveError } = await sb.from('player_limits')
       .upsert(row, { onConflict:'club_id,player_id' });
     if (saveError) throw saveError;
+    const { error:notesError } = await sb.from('club_members')
+      .update({ notes:hostNotes.value, updated_at:new Date().toISOString() })
+      .eq('club_id', String(clubId)).eq('player_id', String(playerId));
+    if (notesError) throw notesError;
     const persisted = await _readPlayerLimits(sb, clubId, playerId);
     if (!persisted) throw new Error('player_limits_verification_failed');
     const mismatch = Object.keys(validated.values).some(function(field) {
       return Number(persisted[field]) !== Number(validated.values[field]);
     });
     if (mismatch) throw new Error('player_limits_verification_failed');
-    _writeAuthAudit('player_limits_updated', actor.actorId, clubId, '/club/player-limits',
-      { target_player_id:String(playerId), fields:PLAYER_LIMIT_FIELDS });
+    const verified = await _readHostPlayerSettings(sb, clubId, playerId);
+    if (!verified.member || String(verified.member.notes || '') !== hostNotes.value
+        || JSON.stringify(persisted.blocked_sports || []) !== JSON.stringify(disabledSports.value))
+      throw new Error('player_settings_verification_failed');
+    _writeAuthAudit('player_settings_updated', actor.actorId, clubId, '/club/player-limits',
+      { target_player_id:String(playerId), fields:PLAYER_LIMIT_FIELDS.concat(['disabled_sports','host_notes']),
+        disabled_sports:disabledSports.value, host_notes_changed:true,
+        host_notes_length:hostNotes.value.length });
     res.json({
       ok:true,
       clubId:String(clubId),
       playerId:String(playerId),
-      limits:_publicPlayerLimits(persisted)
+      limits:_publicPlayerLimits(persisted),
+      settings:_publicHostPlayerSettings(persisted, verified.member)
     });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
 });
