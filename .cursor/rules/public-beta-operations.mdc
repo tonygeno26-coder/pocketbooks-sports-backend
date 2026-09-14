@@ -1,0 +1,77 @@
+---
+description: Public beta operations — observe, triage, fix real issues; no speculative features; owner-gated merges
+alwaysApply: true
+---
+
+# Public Beta Operations Mode
+
+PocketBooks has passed the public betting beta gate. Quiet production with few commits is SUCCESS.
+
+## Authoritative baseline
+
+P0:0 · P1:0 · P2:1 · PUBLIC BETTING BETA: READY · OWLS/ESPN: HEALTHY · GRADING COVERAGE: PASS · SETTLEMENT: OFF · SETTLEMENT WRITES: 0 · CORE BETTING: HEALTHY · HOST BETA OPS: LIVE · FEEDBACK/REPORT ISSUE: LIVE
+
+## Operating mode
+
+Default: **OBSERVE → TRIAGE → REPRODUCE → FIX ACTUAL ISSUES**. Do not invent work.
+
+Prioritize evidence from: tester reports, production errors, failed bets/grading, auth/join failures, feed failures, Host Beta Ops, reproducible UX problems.
+
+## Severity
+
+- **P0** — security, cross-user/club exposure, financial integrity, incorrect bankroll, systemic bad grading → STOP and report
+- **P1** — core beta unusable/materially wrong → reproduce; smallest fix
+- **P2** — significant but beta-safe → backlog unless repeated
+- **P3** — cosmetic → backlog only
+
+## Tester feedback
+
+Inspect → reproduce → verify production → root cause → classify P0–P3.
+
+Distinguish: BUG / FEED-PROVIDER / USER CONFUSION / UX / FEATURE REQUEST / EXPECTED BEHAVIOR. Not every complaint is a bug.
+
+## Fix policy (with autonomous-workflow)
+
+Confirmed **P1/P2** code bugs: focused branch → build → test → QA → commit → push. **DO NOT MERGE** — owner gate.
+
+**P3**: do not auto-implement.
+
+Compatible with `autonomous-workflow.mdc`: still build/test/commit/push feature branches; never auto-merge to main.
+
+## Financial safety
+
+Never autonomously modify bankroll, ledger, ticket economics, grading results, settlement, Diamonds, or financial history. Never manually grade a real production ticket without explicit owner auth. **SETTLEMENT OFF. SGP OFF.**
+
+## TP2
+
+Ticket `T_19f2f6374133ae740004f306`: do not touch. When it naturally grades: **READ-ONLY** reconciliation (result, bankroll math, Recent/Results/Host Bets, no double grade, settlement writes = 0).
+
+## Production monitoring
+
+Watch meaningful 500/502, auth, grading, feed outages, stale/dupe markets, feedback failures, cross-club auth. No commits for harmless log noise.
+
+## Known non-blocking P2
+
+Odds API scores fallback exhausted — do not renew; scores disabled; Owls+ESPN cover grading. Escalate only if coverage changes.
+
+## Feature freeze (owner direction required)
+
+Do not autonomously start: settlement, Diamonds, SGP, new sports, new betting types, major redesigns, large host features.
+
+## After each meaningful beta issue
+
+```
+STATUS: BETA ISSUE TRIAGE
+REPORT: ...
+REPRODUCED: YES/NO
+CLASSIFICATION: BUG / PROVIDER / UX / CONFUSION / FEATURE REQUEST / EXPECTED
+SEVERITY: P0/P1/P2/P3
+ROOT CAUSE: ...
+USER IMPACT: ...
+FINANCIAL IMPACT: NONE / ...
+FIX REQUIRED: YES/NO
+BRANCH: ...
+SHA: ...
+SAFE MERGE CANDIDATE: YES/NO
+OWNER ACTION: ...
+```
