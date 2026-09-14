@@ -3800,10 +3800,16 @@ function _maskOddsKey(key) {
 // ════════════════════════════════════════════════════════════════════════════
 
 const ODDS_PROVIDER      = process.env.ODDS_PROVIDER || 'the_odds_api';
+// Secondary /scores polling against The Odds API. Default OFF: Owls + ESPN
+// cover grading for enabled US majors; exhausted Odds credits only emit noise.
+// Keep ODDS_API_KEY for odds/props fallback — do not remove provider integration.
+// Opt-in: ODDS_API_SCORES_ENABLED=true
+const ODDS_API_SCORES_ENABLED = _envFlag('ODDS_API_SCORES_ENABLED', false);
 const OWLS_KEY           = process.env.OWLS_INSIGHT_API_KEY || '';
 const OWLS_BASE_URL      = (process.env.OWLS_INSIGHT_BASE_URL || 'https://api.owlsinsight.com').replace(/\/$/, '');
 console.log('[odds-provider] env ODDS_PROVIDER='+process.env.ODDS_PROVIDER+
   ' resolved='+ODDS_PROVIDER+
+  ' oddsApiScoresEnabled='+ODDS_API_SCORES_ENABLED+
   ' hasOwlsKey='+(!!OWLS_KEY)+
   ' hasOwlsBase='+(!!process.env.OWLS_INSIGHT_BASE_URL));
 const OWLS_BOOKS         = process.env.OWLS_INSIGHT_BOOKS || 'pinnacle,fanduel,draftkings';
@@ -11555,8 +11561,17 @@ async function _fetchEspnSportScores(sport, daysBack, extraYmds) {
 
 function _fetchOddsApiScores(sport, daysBack) {
   const sportKey = _oddsApiSportKey(sport);
+  if (!ODDS_API_SCORES_ENABLED) {
+    console.log('RESULT_ODDS_SKIP sport='+sportKey+' reason=scores_disabled');
+    return Promise.resolve([]);
+  }
   if (!ODDS_KEY) {
     console.warn('RESULT_ODDS_SKIP sport='+sportKey+' reason=no_odds_key');
+    return Promise.resolve([]);
+  }
+  if (typeof _oddsApiQuotaBlocked === 'function' && _oddsApiQuotaBlocked()) {
+    console.warn('RESULT_ODDS_SKIP sport='+sportKey+' reason=quota_backoff remainingMs='+
+      Math.max(0, (_oddsApiQuotaBlockedUntil || 0) - Date.now()));
     return Promise.resolve([]);
   }
   const url = 'https://api.the-odds-api.com/v4/sports/'+sportKey+
@@ -11571,6 +11586,11 @@ function _fetchOddsApiScores(sport, daysBack) {
             const code = parsed && (parsed.error_code || parsed.error) || ('http_'+res.statusCode);
             const msg = (parsed && (parsed.message || parsed.error)) || 'odds_scores_not_array';
             console.warn('RESULT_ODDS_FAIL sport='+sportKey+' code='+code+' message='+String(msg).slice(0,200));
+            if (String(code) === 'OUT_OF_USAGE_CREDITS' || /usage quota/i.test(String(msg))) {
+              _oddsApiQuotaBlockedUntil = Date.now() + _ODDS_API_QUOTA_BACKOFF_MS;
+              console.error('RESULT_ODDS_QUOTA_BACKOFF sport='+sportKey+
+                ' backoffMs='+_ODDS_API_QUOTA_BACKOFF_MS);
+            }
             resolve([]);
             return;
           }
@@ -11950,8 +11970,10 @@ function _sgGradeLeg(leg, game) {
 
 async function _sgFetchCompletedGames(daysBack) {
   daysBack = daysBack || 3;
+  if (!ODDS_API_SCORES_ENABLED) return [];
   const oddsKey = process.env.ODDS_API_KEY;
   if (!oddsKey) return [];
+  if (typeof _oddsApiQuotaBlocked === 'function' && _oddsApiQuotaBlocked()) return [];
   return new Promise(function(resolve) {
     const https = require('https');
     const url = `https://api.the-odds-api.com/v4/sports/baseball_mlb/scores/?apiKey=${oddsKey}&daysFrom=${daysBack}`;
@@ -16590,7 +16612,11 @@ function _survivorIsHost(actor, pool) {
 
 function _fetchNflScores(daysFrom) {
   return new Promise(function(resolve) {
+    if (!ODDS_API_SCORES_ENABLED) return resolve({ error:'odds_api_scores_disabled', games:[] });
     if (!ODDS_KEY) return resolve({ error:'ODDS_API_KEY not configured', games:[] });
+    if (typeof _oddsApiQuotaBlocked === 'function' && _oddsApiQuotaBlocked()) {
+      return resolve({ error:'odds_api_quota_backoff', games:[] });
+    }
     const url = 'https://api.the-odds-api.com/v4/sports/americanfootball_nfl/scores/?apiKey='+ODDS_KEY+'&daysFrom='+(daysFrom||7);
     const req2 = require('https').get(url, function(r) {
       let d = '';

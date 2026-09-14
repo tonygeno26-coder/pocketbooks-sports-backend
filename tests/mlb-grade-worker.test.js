@@ -214,6 +214,17 @@ test('GRD-7b: ESPN still merges when Odds API already has other finals', functio
     'grade core must request ESPN dates for still-active past legs');
 });
 
+test('Odds API scores polling is opt-in (default OFF) with quota backoff', function() {
+  assert(indexSource.includes("ODDS_API_SCORES_ENABLED', false)"),
+    'ODDS_API_SCORES_ENABLED must default false');
+  assert(indexSource.includes("reason=scores_disabled"),
+    'scores fetch must skip when disabled');
+  assert(indexSource.includes('RESULT_ODDS_QUOTA_BACKOFF'),
+    'scores path must back off on OUT_OF_USAGE_CREDITS');
+  assert(indexSource.includes("reason=quota_backoff"),
+    'scores fetch must honor shared Odds API quota backoff');
+});
+
 test('poller stamps lastGradeRunAt even when nothing grades', function() {
   assert(indexSource.includes('let _lastGradeRunAt = null'), 'missing lastGradeRunAt');
   assert(indexSource.includes('_lastGradeRunAt = new Date().toISOString()'),
