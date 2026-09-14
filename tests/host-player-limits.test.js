@@ -54,8 +54,11 @@ describe('Host player limit management', () => {
 
   test('approval stages canonical roster pending before activation', () => {
     expect(approval).toContain("status:'pending'");
-    expect(approval).toContain(".update({ status:'approved'");
+    expect(approval).toContain(".update({ status:'approved', approved_at:");
     expect(approval).toContain('balance_start:startBal');
+    expect(approval).not.toMatch(/club_members[\s\S]*updated_at/);
+    expect(approval).not.toContain('updated_at:now');
+    expect(approval).not.toContain('updated_at:new Date()');
   });
 
   test('GET resolves stored, effective, and club-default values', () => {

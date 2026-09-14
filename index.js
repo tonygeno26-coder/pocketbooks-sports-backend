@@ -12421,14 +12421,12 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
       sb, clubId, targetActorId, limitValues
     );
 
-    // Stage canonical roster data as pending; a failed membership transition
-    // leaves no active dashboard player and the pre-saved limit row is harmless.
+    // Stage canonical roster as pending (roster table has no row timestamp column).
     const stagedMember = {
       club_id:String(clubId),
       player_id:String(targetActorId),
       balance_start:startBal,
-      status:'pending',
-      updated_at:now
+      status:'pending'
     };
     const { error:stageError } = await sb.from('club_members')
       .upsert(stagedMember, { onConflict:'club_id,player_id' });
@@ -12436,7 +12434,7 @@ app.post('/api/club/members/approve', requirePermissionScoped('settle_player'), 
 
     await _membershipSetPendingStatus(targetActorId, clubId, 'approved', actor.actorId);
     const { error:activateError } = await sb.from('club_members')
-      .update({ status:'approved', updated_at:new Date().toISOString() })
+      .update({ status:'approved', approved_at:new Date().toISOString() })
       .eq('club_id', String(clubId)).eq('player_id', String(targetActorId));
     if (activateError) throw activateError;
 

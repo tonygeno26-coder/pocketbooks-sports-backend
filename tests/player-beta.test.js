@@ -149,13 +149,25 @@ test('member approval and denial verify pending status transition', function() {
   );
   assert(approveRoute.indexOf("_membershipSetPendingStatus(targetActorId, clubId, 'approved'") !== -1,
     'approval route must use verified membership transition');
+  assert(approveRoute.indexOf("from('club_members')") !== -1,
+    'approval must stage/activate canonical club_members roster');
+  assert(approveRoute.indexOf('updated_at') === -1,
+    'approval must not write nonexistent club_members.updated_at');
+  assert(approveRoute.indexOf(".update({ status:'approved', approved_at:") !== -1,
+    'approval must activate club_members with approved_at, not updated_at');
+  assert(approveRoute.indexOf("status:'pending'") !== -1
+      && approveRoute.indexOf('balance_start:startBal') !== -1
+      && approveRoute.indexOf('updated_at:now') === -1,
+    'staging upsert must use real club_members columns only');
 
   const denyRoute = indexSrc.slice(
     indexSrc.indexOf("app.post('/api/club/members/deny'"),
-    indexSrc.indexOf("app.post('/api/club/members/role'")
+    indexSrc.indexOf("app.post('/api/club/members/update-role'")
   );
   assert(denyRoute.indexOf("_membershipSetPendingStatus(targetActorId, clubId, 'rejected'") !== -1,
     'denial route must use verified membership transition');
+  assert(denyRoute.indexOf("from('club_members')") === -1,
+    'deny only transitions club_memberships; does not mutate club_members');
 });
 
 test('pending request listing matches production membership schema', function() {
