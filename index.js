@@ -16299,7 +16299,8 @@ app.get('/api/host/settlement-reconciliation', requireCanonicalClubId, requirePe
   }
 });
 
-// GET /api/grade/status — returns last-graded timestamp + recent results
+// GET /api/grade/status — public operational summary only.
+// Never expose ticket/player identifiers or grade payloads from audit_events.
 app.get('/api/grade/status', async (req, res) => {
   const sb = getSupabase();
   const containment = _gradingContainmentStatus();
@@ -16310,14 +16311,14 @@ app.get('/api/grade/status', async (req, res) => {
     dryRunEnabled:GRADE_RUN_DRY_RUN_ENABLED });
   try {
     const { data: recent } = await sb.from('audit_events')
-      .select('id,event_type,ticket_id,payload,created_at')
+      .select('created_at')
       .eq('event_type','ticket_graded_server')
-      .order('created_at',{ ascending:false }).limit(10);
-    const { data: active } = await sb.from('tickets')
-      .select('id',{ count:'exact' }).in('status',['active','open']);
+      .order('created_at',{ ascending:false }).limit(1);
+    const { count: activeCount } = await sb.from('tickets')
+      .select('id',{ count:'exact', head:true }).in('status',['active','open']);
     res.json({ enabled:true, lastGradedAt: _lastGradedAt || (recent&&recent[0] ? recent[0].created_at : null),
       lastGradeRunAt:_lastGradeRunAt,
-      recentGrades: recent||[], activeTicketCount: active ? active.length : 0,
+      activeTicketCount: Number.isFinite(activeCount) ? activeCount : 0,
       lastResultSuccessAt:_lastResultSuccessAt, lastGradePollAt:_lastGradePollAt,
       gradePollerStarted:_mlbGradePollerStarted,
       containment, ticketGradingEnabled:TICKET_GRADING_ENABLED,
