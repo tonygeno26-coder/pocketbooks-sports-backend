@@ -17700,7 +17700,8 @@ app.post('/api/feedback', async (req, res) => {
       return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
     }
 
-    // Concurrent burst: keep oldest RATE_LIMIT rows; roll back extras with 429.
+    // Concurrent burst: insert-then-confirm. Keep oldest RATE_LIMIT rows;
+    // roll back extras with 429. Fail closed if post-check cannot confirm.
     try {
       const since2 = feedback.rateLimitWindowStartIso(Date.now());
       const { data: afterRows, error: afterErr } = await sb.from('feedback_reports')
@@ -17709,12 +17710,20 @@ app.post('/api/feedback', async (req, res) => {
         .gte('created_at', since2)
         .order('created_at', { ascending: true })
         .limit(feedback.RATE_LIMIT + 16);
-      if (!afterErr && afterRows && afterRows.length > feedback.RATE_LIMIT) {
+      if (afterErr) {
+        console.warn('[feedback] concurrent rate check failed (rollback):', afterErr.message);
+        await sb.from('feedback_reports').delete().eq('id', reportId);
+        return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+      }
+      if (afterRows && afterRows.length > feedback.RATE_LIMIT) {
         const keep = feedback.acceptInsertedUnderLimit(
           afterRows, reportId, feedback.RATE_LIMIT
         );
         if (!keep) {
-          await sb.from('feedback_reports').delete().eq('id', reportId);
+          const { error: delErr } = await sb.from('feedback_reports').delete().eq('id', reportId);
+          if (delErr) {
+            console.warn('[feedback] concurrent rollback delete failed:', delErr.message);
+          }
           const decision2 = feedback.evaluateActorRateLimit(
             afterRows.filter(function (r) { return String(r.id) !== reportId; }),
             Date.now()
@@ -17734,8 +17743,14 @@ app.post('/api/feedback', async (req, res) => {
         }
       }
     } catch (burstEx) {
-      // Insert already succeeded; do not fail the request on post-check errors.
-      console.warn('[feedback] concurrent rate check skipped:', burstEx && burstEx.message);
+      console.warn('[feedback] concurrent rate check exception (rollback):',
+        burstEx && burstEx.message);
+      try {
+        await sb.from('feedback_reports').delete().eq('id', reportId);
+      } catch (rbEx) {
+        console.warn('[feedback] concurrent rollback failed:', rbEx && rbEx.message);
+      }
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
     }
 
     const remaining = Math.max(0, feedback.RATE_LIMIT - (preCount + 1));
