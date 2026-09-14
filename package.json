@@ -5,7 +5,9 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js",
-    "test": "jest --runInBand --testTimeout=15000",
+    "test": "node scripts/run-tests.js unit",
+    "test:unit": "node scripts/run-tests.js unit",
+    "test:harness": "node scripts/run-tests.js harness",
     "test:watch": "jest --watch",
     "smoke:place-bet-contract": "node scripts/place-bet-contract-harness.js",
     "sync:ncaaf-logos": "node scripts/sync-ncaaf-team-logos.js",
@@ -31,6 +33,10 @@
   },
   "jest": {
     "testEnvironment": "node",
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/\\.worktrees/"
+    ],
     "testMatch": [
       "**/tests/**/*.test.js"
     ]
