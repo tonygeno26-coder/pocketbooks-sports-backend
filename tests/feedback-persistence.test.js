@@ -52,13 +52,21 @@ test('route exists and is POST-only create', function () {
   assert.ok(!route.includes('place_bet_tx') && !route.includes('grade_ticket_tx') && !route.includes('cancel_bet_tx'));
 });
 
-test('rate limit configured for /api/feedback', function () {
-  assert.ok(source.includes("'/api/feedback'"), 'rate path');
+test('feedback rate limit is persistent actor quota (not process Map)', function () {
   const cfgStart = source.indexOf('const RATE_LIMIT_CONFIG');
   const cfgEnd = source.indexOf('};', cfgStart);
   const cfg = source.slice(cfgStart, cfgEnd + 2);
-  assert.ok(cfg.includes("'/api/feedback'"), 'feedback in RATE_LIMIT_CONFIG');
-  assert.ok(/keyBy:\s*'actor'/.test(cfg.match(/'\/api\/feedback'[^}]+}/)[0]), 'keyed by actor');
+  assert.ok(!cfg.includes("'/api/feedback'"), 'must not use process-local RATE_LIMIT_CONFIG for feedback');
+  const start = source.indexOf("app.post('/api/feedback'");
+  const end = source.indexOf('\napp.', start + 10);
+  const route = source.slice(start, end > start ? end : start + 4500);
+  assert.ok(route.includes('evaluateActorRateLimit') || route.includes('rateLimitWindowStartIso'), 'DB-backed check');
+  assert.ok(route.includes("eq('player_id', identity.playerId)"), 'keyed by server player_id');
+  assert.ok(route.includes("status(429)") || route.includes('rate_limited'), 'returns 429');
+  assert.ok(route.includes('Retry-After'), 'Retry-After header');
+  assert.ok(route.includes('fail-open') || route.includes('failOpen'), 'fail-open on limiter errors');
+  assert.ok(route.includes('acceptInsertedUnderLimit') || route.includes('concurrent'), 'concurrent burst guard');
+  assert.ok(feedback.RATE_LIMIT === 8 && feedback.RATE_WINDOW_MS === 900000, '8 / 15m');
 });
 
 test('unauthenticated identity denied', function () {

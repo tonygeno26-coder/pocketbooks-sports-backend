@@ -49,8 +49,9 @@ const RATE_LIMIT_CONFIG = {
   '/api/auth/login':         { maxReqs:20,  windowMs:900000, keyBy:'ip' },
   '/api/club/join-request':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
   '/api/club/request-join':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
-  '/api/clubs/request':      { maxReqs:10,  windowMs:60000, keyBy:'actor' },
-  '/api/feedback':           { maxReqs:8,   windowMs:900000, keyBy:'actor' }
+  '/api/clubs/request':      { maxReqs:10,  windowMs:60000, keyBy:'actor' }
+  // /api/feedback: NOT here — process-local Map is unreliable on Railway
+  // multi-instance/restart. Enforced in-route via feedback_reports count.
 };
 
 function _getRlConfig(path) {
@@ -17606,6 +17607,8 @@ app.get('/api/notifications', auth, async (req, res) => {
 // POST /api/feedback — authenticated create-only. No listing/enumeration.
 // Identity is server-derived from the session token. ticket_id is a reference
 // string only (ownership checked); no ledger/bankroll/settlement side effects.
+// Rate limit: 8 / 15m per authenticated actor, keyed by server actorId only,
+// counted from feedback_reports (shared across instances; survives restarts).
 app.post('/api/feedback', async (req, res) => {
   try {
     const actor = requireActor(req);
@@ -17625,6 +17628,43 @@ app.post('/api/feedback', async (req, res) => {
     const sb = getSupabase();
     if (!sb) {
       return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+
+    // Persistent actor quota (fail-open if limiter query unavailable — feedback
+    // is low-risk; never couples to auth/betting/bankroll paths).
+    const nowMs = Date.now();
+    const rlKey = feedback.rateLimitActorKey(identity.playerId);
+    let preCount = 0;
+    try {
+      const since = feedback.rateLimitWindowStartIso(nowMs);
+      const { data: recentRows, error: rlErr } = await sb.from('feedback_reports')
+        .select('id,created_at')
+        .eq('player_id', identity.playerId)
+        .gte('created_at', since)
+        .order('created_at', { ascending: true })
+        .limit(feedback.RATE_LIMIT + 8);
+      if (rlErr) {
+        console.warn('[feedback] rate-limit check failed (fail-open):', rlErr.message);
+      } else {
+        const decision = feedback.evaluateActorRateLimit(recentRows || [], nowMs);
+        preCount = decision.count;
+        res.setHeader('X-RateLimit-Limit', String(decision.limit));
+        res.setHeader('X-RateLimit-Remaining', String(Math.max(0, decision.remaining)));
+        if (!decision.allowed) {
+          console.log('[feedback] 429 key=' + rlKey
+            + ' count=' + decision.count
+            + ' retryAfter=' + decision.retryAfterSec + 's');
+          res.setHeader('Retry-After', String(decision.retryAfterSec));
+          return res.status(429).json({
+            ok: false,
+            error: 'rate_limited',
+            retryAfterSec: decision.retryAfterSec,
+            limitKey: rlKey
+          });
+        }
+      }
+    } catch (rlEx) {
+      console.warn('[feedback] rate-limit check exception (fail-open):', rlEx && rlEx.message);
     }
 
     if (validated.ticketId) {
@@ -17649,7 +17689,7 @@ app.post('/api/feedback', async (req, res) => {
     const row = feedback.buildInsertRow(identity, validated);
     const { data: inserted, error: insErr } = await sb.from('feedback_reports')
       .insert(row)
-      .select('id')
+      .select('id,created_at')
       .maybeSingle();
     if (insErr) {
       console.warn('[feedback] insert failed:', insErr.message);
@@ -17659,6 +17699,48 @@ app.post('/api/feedback', async (req, res) => {
     if (!reportId) {
       return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
     }
+
+    // Concurrent burst: keep oldest RATE_LIMIT rows; roll back extras with 429.
+    try {
+      const since2 = feedback.rateLimitWindowStartIso(Date.now());
+      const { data: afterRows, error: afterErr } = await sb.from('feedback_reports')
+        .select('id,created_at')
+        .eq('player_id', identity.playerId)
+        .gte('created_at', since2)
+        .order('created_at', { ascending: true })
+        .limit(feedback.RATE_LIMIT + 16);
+      if (!afterErr && afterRows && afterRows.length > feedback.RATE_LIMIT) {
+        const keep = feedback.acceptInsertedUnderLimit(
+          afterRows, reportId, feedback.RATE_LIMIT
+        );
+        if (!keep) {
+          await sb.from('feedback_reports').delete().eq('id', reportId);
+          const decision2 = feedback.evaluateActorRateLimit(
+            afterRows.filter(function (r) { return String(r.id) !== reportId; }),
+            Date.now()
+          );
+          const retryAfterSec = decision2.retryAfterSec || 1;
+          console.log('[feedback] 429 concurrent key=' + rlKey
+            + ' retryAfter=' + retryAfterSec + 's');
+          res.setHeader('X-RateLimit-Limit', String(feedback.RATE_LIMIT));
+          res.setHeader('X-RateLimit-Remaining', '0');
+          res.setHeader('Retry-After', String(retryAfterSec));
+          return res.status(429).json({
+            ok: false,
+            error: 'rate_limited',
+            retryAfterSec: retryAfterSec,
+            limitKey: rlKey
+          });
+        }
+      }
+    } catch (burstEx) {
+      // Insert already succeeded; do not fail the request on post-check errors.
+      console.warn('[feedback] concurrent rate check skipped:', burstEx && burstEx.message);
+    }
+
+    const remaining = Math.max(0, feedback.RATE_LIMIT - (preCount + 1));
+    res.setHeader('X-RateLimit-Limit', String(feedback.RATE_LIMIT));
+    res.setHeader('X-RateLimit-Remaining', String(remaining));
     console.log('[feedback] created id=' + reportId
       + ' club=' + identity.clubId
       + ' player=' + identity.playerId
