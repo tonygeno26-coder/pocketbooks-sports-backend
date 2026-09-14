@@ -12741,6 +12741,33 @@ app.post('/api/auth/token', requireCanonicalClubId, async (req, res) => {
   const { actorId, clubId, role: requestedRole } = req.body || {};
   if (!actorId) return res.status(400).json({ ok:false, error:'missing_actorId' });
   if (!clubId)  return res.status(400).json({ ok:false, error:'missing_clubId'  });
+  if (IS_PRODUCTION) {
+    const requester = requireActor(req);
+    if (requester.error) {
+      return res.status(requester.status || 401).json({ ok:false, error:requester.error });
+    }
+    // Legacy login tokens are signed with JWT_SECRET. requireActor can tag an
+    // unverifiable legacy-shaped JWT for later DB membership lookup, which is
+    // not sufficient authentication for minting a new session.
+    if (requester.legacyToken) {
+      const authHeader = String(req.headers.authorization || '');
+      const loginToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      try {
+        const verifiedLogin = jwt.verify(loginToken, JWT_SECRET);
+        if (!verifiedLogin || String(verifiedLogin.id || '') !== String(requester.actorId || '')) {
+          return res.status(401).json({ ok:false, error:'invalid_login_token' });
+        }
+      } catch (_loginVerifyError) {
+        return res.status(401).json({ ok:false, error:'invalid_login_token' });
+      }
+    }
+    if (requester.platformRole !== 'platform_admin'
+        && String(requester.actorId || '') !== String(actorId)) {
+      _writeAuthAudit('token_subject_mismatch', requester.actorId, clubId, '/auth/token',
+        { requestedActorId:String(actorId) });
+      return res.status(403).json({ ok:false, error:'token_subject_mismatch' });
+    }
+  }
   // Phase G: DB is source of truth for role
   const resolved = await _resolveTokenRole(actorId, clubId, requestedRole);
   if (!resolved.ok) {
