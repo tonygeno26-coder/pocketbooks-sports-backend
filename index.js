@@ -17768,6 +17768,161 @@ app.post('/api/feedback', async (req, res) => {
   }
 });
 
+// GET /api/host/feedback — host-only club-scoped inbox. No public listing.
+// Returns required triage fields only. Ticket context is READ-ONLY when present.
+// No regrade / settle / balance / ticket mutation.
+app.get('/api/host/feedback', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  try {
+    const clubId = req._clubId || (req.query && req.query.clubId) || null;
+    if (!clubId) return res.status(400).json({ ok: false, error: 'missing_clubId' });
+
+    const filters = feedback.parseHostFeedbackQuery(req.query || {});
+    if (!filters.ok) {
+      return res.status(filters.http || 400).json({ ok: false, error: filters.error });
+    }
+
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+
+    // Hard club pin — never list cross-club feedback.
+    let q = sb.from('feedback_reports')
+      .select('id,player_id,category,message,ticket_id,page,status,created_at')
+      .eq('club_id', clubId)
+      .order('created_at', { ascending: false })
+      .limit(filters.limit);
+    if (filters.status) q = q.eq('status', filters.status);
+    if (filters.category) q = q.eq('category', filters.category);
+    if (filters.betIssuesOnly) q = q.not('ticket_id', 'is', null);
+
+    const { data: rows, error } = await q;
+    if (error) {
+      console.warn('[host/feedback] list failed:', error.message);
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+    const list = rows || [];
+
+    // Counts for overview: same club, independent of status/category filters
+    // (still respect betIssuesOnly? No — overview needs full club counts).
+    let counts = feedback.summarizeHostFeedbackCounts(list);
+    try {
+      const { data: countRows, error: cErr } = await sb.from('feedback_reports')
+        .select('id,status,ticket_id')
+        .eq('club_id', clubId)
+        .limit(500);
+      if (!cErr && countRows) counts = feedback.summarizeHostFeedbackCounts(countRows);
+    } catch (_ce) { /* keep filtered counts */ }
+
+    const playerIds = [];
+    const seenPid = {};
+    const ticketIds = [];
+    const seenTid = {};
+    list.forEach(function (r) {
+      const pid = r && r.player_id != null ? String(r.player_id) : '';
+      if (pid && !seenPid[pid]) { seenPid[pid] = true; playerIds.push(pid); }
+      const tid = r && r.ticket_id ? String(r.ticket_id) : '';
+      if (tid && !seenTid[tid]) { seenTid[tid] = true; ticketIds.push(tid); }
+    });
+
+    var usersById = {};
+    try { usersById = await _lookupUserIdentities(sb, playerIds); }
+    catch (_ue) { usersById = {}; }
+
+    // Authorized ticket lookup: club-scoped only. Missing tickets → null context.
+    var ticketById = {};
+    if (ticketIds.length) {
+      try {
+        const { data: tix, error: tErr } = await sb.from('tickets')
+          .select('id,status,type,odds,risk_amount,potential_profit,player_id,player_username,placed_at,club_id')
+          .eq('club_id', clubId)
+          .in('id', ticketIds);
+        if (tErr) {
+          console.warn('[host/feedback] ticket context failed:', tErr.message);
+        } else {
+          (tix || []).forEach(function (t) {
+            if (!t || t.id == null) return;
+            if (String(t.club_id) !== String(clubId)) return;
+            ticketById[String(t.id)] = feedback.toHostTicketContext(t);
+          });
+        }
+      } catch (_te) {
+        console.warn('[host/feedback] ticket context exception:', _te && _te.message);
+      }
+    }
+
+    var items = list.map(function (r) {
+      var identity = usersById[String(r.player_id)] || {};
+      var label = identity.username || identity.display_name || null;
+      var tid = r.ticket_id ? String(r.ticket_id) : null;
+      return feedback.toHostFeedbackItem(r, {
+        playerLabel: label,
+        ticket: tid ? (ticketById[tid] || null) : null
+      });
+    });
+
+    if (filters.search) {
+      items = items.filter(function (it) {
+        return feedback.matchesHostFeedbackSearch(it, filters.search);
+      });
+    }
+
+    console.log('[host/feedback] list club=' + clubId
+      + ' items=' + items.length
+      + ' status=' + (filters.status || 'all')
+      + (filters.betIssuesOnly ? ' betIssues=1' : ''));
+    return res.json({ ok: true, items: items, counts: counts });
+  } catch (e) {
+    console.warn('[host/feedback] unexpected:', e && e.message);
+    return res.status(500).json({ ok: false, error: 'feedback_failed' });
+  }
+});
+
+// PATCH /api/host/feedback/:id — host status triage only (new|reviewed|resolved).
+// No delete, no message edit, no financial side effects. Cross-club DENY.
+app.patch('/api/host/feedback/:id', requireCanonicalClubId, requirePermissionScoped('view_host_dashboard'), async (req, res) => {
+  try {
+    const clubId = req._clubId || (req.body && req.body.clubId) || (req.query && req.query.clubId) || null;
+    if (!clubId) return res.status(400).json({ ok: false, error: 'missing_clubId' });
+
+    const reportId = String((req.params && req.params.id) || '').trim();
+    if (!reportId) return res.status(400).json({ ok: false, error: 'missing_id' });
+
+    const validated = feedback.validateStatusPatch(req.body || {});
+    if (!validated.ok) {
+      return res.status(validated.http || 400).json({ ok: false, error: validated.error });
+    }
+
+    const sb = getSupabase();
+    if (!sb) return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+
+    // Fail closed: update only when id AND club_id match (cross-club → 404, no leak).
+    const { data: updated, error } = await sb.from('feedback_reports')
+      .update({ status: validated.status })
+      .eq('id', reportId)
+      .eq('club_id', clubId)
+      .select('id,player_id,category,message,ticket_id,page,status,created_at')
+      .maybeSingle();
+
+    if (error) {
+      console.warn('[host/feedback] status update failed:', error.message);
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+    if (!updated) {
+      return res.status(404).json({ ok: false, error: 'not_found' });
+    }
+
+    console.log('[host/feedback] status id=' + reportId
+      + ' club=' + clubId
+      + ' status=' + validated.status);
+    return res.json({
+      ok: true,
+      item: feedback.toHostFeedbackItem(updated)
+    });
+  } catch (e) {
+    console.warn('[host/feedback] status unexpected:', e && e.message);
+    return res.status(500).json({ ok: false, error: 'feedback_failed' });
+  }
+});
+
 app.post('/api/notifications/read', auth, async (req, res) => {
   try {
     var actor = req._actor || requireActor(req) || {};
