@@ -11,6 +11,10 @@ PocketBooks has passed the public betting beta gate. Quiet production with few c
 
 P0:0 · P1:0 · P2:1 · PUBLIC BETTING BETA: READY · OWLS/ESPN: HEALTHY · GRADING COVERAGE: PASS · SETTLEMENT: OFF · SETTLEMENT WRITES: 0 · CORE BETTING: HEALTHY · HOST BETA OPS: LIVE · FEEDBACK/REPORT ISSUE: LIVE
 
+## Host Beta Ops data rule
+
+**REAL OR EMPTY / ERROR only.** No localhost fixtures, demo testers/requests/feedback, or visual-gate fake counts. API failure → Unable to load + Retry. Zero means zero.
+
 ## Operating mode
 
 Default: **OBSERVE → TRIAGE → REPRODUCE → FIX ACTUAL ISSUES**. Do not invent work.
