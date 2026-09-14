@@ -14,6 +14,7 @@ const idempotencyEngine = require('./lib/idempotency-engine');
 const parlayCorrelation = require('./lib/parlay-correlation');
 const authAudit = require('./lib/auth-audit');
 const propsFoundation = require('./lib/props-foundation');
+const feedback = require('./lib/feedback');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -48,7 +49,8 @@ const RATE_LIMIT_CONFIG = {
   '/api/auth/login':         { maxReqs:20,  windowMs:900000, keyBy:'ip' },
   '/api/club/join-request':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
   '/api/club/request-join':  { maxReqs:10,  windowMs:60000, keyBy:'actor' },
-  '/api/clubs/request':      { maxReqs:10,  windowMs:60000, keyBy:'actor' }
+  '/api/clubs/request':      { maxReqs:10,  windowMs:60000, keyBy:'actor' },
+  '/api/feedback':           { maxReqs:8,   windowMs:900000, keyBy:'actor' }
 };
 
 function _getRlConfig(path) {
@@ -17599,6 +17601,74 @@ app.get('/api/notifications', auth, async (req, res) => {
     var unread = list.filter(function(n){ return !n.read; }).length;
     res.json({ ok:true, notifications: list, unread: unread });
   } catch(e) { res.status(500).json({ ok:false, error:e.message }); }
+});
+
+// POST /api/feedback — authenticated create-only. No listing/enumeration.
+// Identity is server-derived from the session token. ticket_id is a reference
+// string only (ownership checked); no ledger/bankroll/settlement side effects.
+app.post('/api/feedback', async (req, res) => {
+  try {
+    const actor = requireActor(req);
+    if (actor && actor.error) {
+      return res.status(actor.status || 401).json({ ok: false, error: actor.error });
+    }
+    const identity = feedback.deriveIdentity(actor, req.body || {});
+    if (!identity.ok) {
+      return res.status(identity.http || 403).json({ ok: false, error: identity.error });
+    }
+
+    const validated = feedback.validateCreatePayload(req.body || {});
+    if (!validated.ok) {
+      return res.status(validated.http || 400).json({ ok: false, error: validated.error });
+    }
+
+    const sb = getSupabase();
+    if (!sb) {
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+
+    if (validated.ticketId) {
+      const { data: tixRows, error: tixErr } = await sb.from('tickets')
+        .select('id,player_id,club_id')
+        .eq('id', validated.ticketId)
+        .limit(1);
+      if (tixErr) {
+        console.warn('[feedback] ticket lookup failed:', tixErr.message);
+        return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+      }
+      const gate = feedback.ticketReferenceAllowed(
+        tixRows && tixRows[0],
+        identity.playerId,
+        identity.clubId
+      );
+      if (!gate.ok) {
+        return res.status(403).json({ ok: false, error: 'ticket_not_allowed' });
+      }
+    }
+
+    const row = feedback.buildInsertRow(identity, validated);
+    const { data: inserted, error: insErr } = await sb.from('feedback_reports')
+      .insert(row)
+      .select('id')
+      .maybeSingle();
+    if (insErr) {
+      console.warn('[feedback] insert failed:', insErr.message);
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+    const reportId = inserted && inserted.id ? String(inserted.id) : null;
+    if (!reportId) {
+      return res.status(503).json({ ok: false, error: 'feedback_unavailable' });
+    }
+    console.log('[feedback] created id=' + reportId
+      + ' club=' + identity.clubId
+      + ' player=' + identity.playerId
+      + ' category=' + validated.category
+      + (validated.ticketId ? ' ticket=' + validated.ticketId : ''));
+    return res.json({ ok: true, id: reportId });
+  } catch (e) {
+    console.warn('[feedback] unexpected:', e && e.message);
+    return res.status(500).json({ ok: false, error: 'feedback_failed' });
+  }
 });
 
 app.post('/api/notifications/read', auth, async (req, res) => {
