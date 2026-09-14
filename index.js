@@ -6393,9 +6393,35 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
   return null;
 }
 
+function _dedupeSnapshotUpsertRows(rows) {
+  // Postgres rejects ON CONFLICT DO UPDATE when a single INSERT batch
+  // contains duplicate conflict-target rows. Keep last write wins.
+  const byKey = new Map();
+  let dropped = 0;
+  for (let i = 0; i < (rows || []).length; i++) {
+    const r = rows[i];
+    if (!r) continue;
+    const key = String(r.canonical_game_key || '') + '\0'
+      + String(r.market_key || '') + '\0'
+      + String(r.selection_key || '');
+    if (byKey.has(key)) dropped++;
+    byKey.set(key, r);
+  }
+  return { rows: Array.from(byKey.values()), dropped: dropped };
+}
+
 async function _upsertSnapshotRowsChunked(sb, rows) {
   if (!rows || !rows.length) {
     console.log('SNAPSHOT_UPSERT_SKIP reason=empty_batch');
+    return { ok:true, rowsUpserted:0 };
+  }
+  const deduped = _dedupeSnapshotUpsertRows(rows);
+  rows = deduped.rows;
+  if (deduped.dropped) {
+    console.warn('SNAPSHOT_UPSERT_DEDUPED dropped='+deduped.dropped+' kept='+rows.length);
+  }
+  if (!rows.length) {
+    console.log('SNAPSHOT_UPSERT_SKIP reason=empty_after_dedupe');
     return { ok:true, rowsUpserted:0 };
   }
   let rowsUpserted = 0;
