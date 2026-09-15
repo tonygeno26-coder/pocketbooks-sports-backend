@@ -257,16 +257,92 @@ test('unknown / longest-pass inventory known but not bettable; combos blocked', 
 });
 
 // ── Empty sport capability ─────────────────────────────────────────────────
-test('empty sport capability truth — no fake props', function() {
-  assertEq(pf.sportPropsCapability('nhl', 0).hasProps, false);
-  assertEq(pf.sportPropsCapability('nhl', 0).propsStatus, 'empty');
-  assertEq(pf.sportPropsCapability('nhl', 0).propsCapable, true);
-  assertEq(pf.sportPropsCapability('soccer', 0).propsStatus, 'unsupported');
+test('three-state propsStatus: cold=unknown, warm empty=unavailable, warm live=available', function() {
+  var cold = pf.sportPropsCapability('nfl', 0, { cacheKnown: false });
+  assertEq(cold.hasProps, null);
+  assertEq(cold.propsStatus, 'unknown');
+  assertEq(cold.propsCapable, true);
+
+  var warmEmpty = pf.sportPropsCapability('nhl', 0, { cacheKnown: true });
+  assertEq(warmEmpty.hasProps, false);
+  assertEq(warmEmpty.propsStatus, 'unavailable');
+  assertEq(warmEmpty.propsCapable, true);
+
+  var warmLive = pf.sportPropsCapability('nfl', 100, { cacheKnown: true });
+  assertEq(warmLive.hasProps, true);
+  assertEq(warmLive.propsStatus, 'available');
+
+  assertEq(pf.sportPropsCapability('soccer', 0).propsStatus, 'unavailable');
   assertEq(pf.sportPropsCapability('mma', 0).hasProps, false);
-  assertEq(pf.sportPropsCapability('boxing', 0).propsStatus, 'unsupported');
-  assertEq(pf.sportPropsCapability('ncaab', 0).propsStatus, 'empty');
-  assertEq(pf.sportPropsCapability('nfl', 100).hasProps, true);
-  assertEq(pf.sportPropsCapability('nfl', 100).propsStatus, 'live');
+  assertEq(pf.sportPropsCapability('boxing', 0, { cacheKnown: false }).propsStatus, 'unavailable');
+  // Default (no opts) must treat missing cacheKnown as cold/unknown for capable sports
+  // so /api/sports never lies hasProps=false before a fetch.
+  var defaultCold = pf.sportPropsCapability('ncaab', 0);
+  assertEq(defaultCold.propsStatus, 'unknown');
+  assertEq(defaultCold.hasProps, null);
+});
+
+test('cold cache must not report hasProps=false for capable sports', function() {
+  ['nfl', 'mlb', 'nba', 'wnba', 'ncaaf', 'nhl', 'ncaab'].forEach(function(s) {
+    var cap = pf.sportPropsCapability(s, 0, { cacheKnown: false });
+    assert(cap.hasProps !== false, s + ' cold hasProps must not be false');
+    assertEq(cap.propsStatus, 'unknown');
+  });
+});
+
+test('deterministic event resolution: numeric id alone empty; eventId hits; unique home/away recovers; ambiguous denied', function() {
+  var inventory = [
+    { gameId: 'nfl:Detroit Lions@Buffalo Bills-20260918', home: 'Buffalo Bills', away: 'Detroit Lions', playerName: 'A', propType: 'Passing Yards', line: 250.5, side: 'over', odds: -110 },
+    { gameId: 'nfl:Washington Commanders@Dallas Cowboys-20260920', home: 'Dallas Cowboys', away: 'Washington Commanders', playerName: 'B', propType: 'Passing Yards', line: 220.5, side: 'over', odds: -110 },
+    { gameId: 'nfl:Detroit Lions@Buffalo Bills-20260911', home: 'Buffalo Bills', away: 'Detroit Lions', playerName: 'C', propType: 'Rushing Yards', line: 60.5, side: 'over', odds: -110 }
+  ];
+
+  var numericOnly = pf.resolvePropsForGameScope(inventory, { gameId: '1636268302' });
+  assertEq(numericOnly.props.length, 0);
+  assertEq(numericOnly.filterMode, 'gameId');
+
+  var byEvent = pf.resolvePropsForGameScope(inventory, {
+    gameId: '1636268302',
+    hints: { eventId: 'nfl:Detroit Lions@Buffalo Bills-20260918' }
+  });
+  assertEq(byEvent.props.length, 1);
+  assertEq(byEvent.filterMode, 'gameId');
+  assertEq(byEvent.props[0].playerName, 'A');
+
+  var uniqueTeams = pf.resolvePropsForGameScope(inventory, {
+    gameId: '1636268302',
+    home: 'Dallas Cowboys',
+    away: 'Washington Commanders'
+  });
+  assertEq(uniqueTeams.props.length, 1);
+  assertEq(uniqueTeams.filterMode, 'teams');
+  assertEq(uniqueTeams.props[0].playerName, 'B');
+
+  var ambiguous = pf.resolvePropsForGameScope(inventory, {
+    home: 'Buffalo Bills',
+    away: 'Detroit Lions'
+  });
+  assertEq(ambiguous.props.length, 0);
+  assertEq(ambiguous.filterMode, 'ambiguous_denied');
+  assertEq(ambiguous.deniedReason, 'ambiguous_home_away');
+});
+
+test('backend restart simulation: empty cache → unknown; after warm → available', function() {
+  // Simulate process restart: no cacheKnown.
+  var afterRestart = pf.sportPropsCapability('nfl', 0, { cacheKnown: false });
+  assertEq(afterRestart.propsStatus, 'unknown');
+  assert(afterRestart.hasProps !== false);
+
+  // After on-demand /api/props warms cache with inventory:
+  var afterWarm = pf.sportPropsCapability('nfl', 383, { cacheKnown: true });
+  assertEq(afterWarm.propsStatus, 'available');
+  assertEq(afterWarm.hasProps, true);
+  assertEq(afterWarm.propsCount, 383);
+
+  // Warm with zero remains unavailable (not unknown).
+  var warmZero = pf.sportPropsCapability('nhl', 0, { cacheKnown: true });
+  assertEq(warmZero.propsStatus, 'unavailable');
+  assertEq(warmZero.hasProps, false);
 });
 
 // ── Player identity ────────────────────────────────────────────────────────

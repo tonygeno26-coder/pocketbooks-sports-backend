@@ -10150,15 +10150,7 @@ function _collectPropsForSport(sportShort) {
 }
 
 function _filterPropsByGameId(props, gameId) {
-  if (!gameId) return props;
-  var gid = String(gameId);
-  return (props || []).filter(function(p) {
-    if (!p) return false;
-    if (String(p.gameId || '') === gid) return true;
-    if (String(p.providerGameId || '') === gid) return true;
-    if (String(p.canonicalGameKey || '') === gid) return true;
-    return false;
-  });
+  return propsFoundation.filterPropsByExactGameId(props, gameId);
 }
 
 function _normalizeTeamNameForPropsMatch(name) {
@@ -10174,51 +10166,86 @@ function _propsTeamNameMatches(query, candidate) {
   return c === q || c.indexOf(q) >= 0 || q.indexOf(c) >= 0;
 }
 
-/**
- * Parse teams from prop gameId forms like:
- *   mlb:Boston Red Sox@Baltimore Orioles-20260903
- *   Boston Red Sox@Baltimore Orioles-20260903
- * Returns { away, home } or null.
- */
 function _parseTeamsFromPropGameId(gameId) {
-  var s = String(gameId || '').trim();
-  if (!s || s.indexOf('@') < 0) return null;
-  var body = s;
-  var colon = body.indexOf(':');
-  if (colon >= 0) body = body.slice(colon + 1);
-  var at = body.indexOf('@');
-  if (at < 0) return null;
-  var away = body.slice(0, at).trim();
-  var homePart = body.slice(at + 1).trim();
-  var dateSuffix = homePart.match(/^(.*)-(\d{8})$/);
-  var home = (dateSuffix ? dateSuffix[1] : homePart).trim();
-  if (!home || !away) return null;
-  return { home: home, away: away };
+  return propsFoundation.parseTeamsFromPropGameId(gameId);
 }
 
 function _propHomeAwayTeams(p) {
-  var home = p && p.home;
-  var away = p && p.away;
-  if (home && away) return { home: home, away: away };
-  var parsed = _parseTeamsFromPropGameId(
-    (p && (p.gameId || p.providerGameId || p.canonicalGameKey)) || ''
-  );
-  if (!parsed) return { home: home || '', away: away || '' };
-  return {
-    home: home || parsed.home,
-    away: away || parsed.away
-  };
+  return propsFoundation.propHomeAwayTeams(p);
 }
 
 function _filterPropsByTeams(props, home, away) {
-  var h = home != null && String(home).trim() !== '' ? String(home) : '';
-  var a = away != null && String(away).trim() !== '' ? String(away) : '';
-  if (!h && !a) return props || [];
-  return (props || []).filter(function(p) {
-    if (!p) return false;
-    var teams = _propHomeAwayTeams(p);
-    return _propsTeamNameMatches(h, teams.home)
-      && _propsTeamNameMatches(a, teams.away);
+  var unique = propsFoundation.filterPropsByTeamsUnique(props, home, away);
+  if (unique.status === 'unique') return unique.props;
+  if (unique.status === 'ambiguous') return [];
+  // status none with no home/away constraint returns full list from foundation;
+  // when teams were requested but matched nothing, props is [].
+  return unique.props;
+}
+
+/**
+ * Enrich props game scope from odds board cache (numeric id → eventId/home/away).
+ * Deterministic exact id match only; unique home/away as secondary hint source.
+ */
+function _lookupPropsGameHintsFromOddsCache(sportShort, gameId, home, away) {
+  var hints = {};
+  var games = [];
+  try {
+    games = _owlsCacheFlatGamesForSport(sportShort, String(sportShort || '').toUpperCase()) || [];
+  } catch (_e) {
+    games = [];
+  }
+  var gid = gameId != null ? String(gameId) : '';
+  var hit = null;
+  if (gid) {
+    for (var i = 0; i < games.length; i++) {
+      var g = games[i];
+      if (!g) continue;
+      if (String(g.id || '') === gid
+        || String(g.providerGameId || '') === gid
+        || String(g.eventId || '') === gid
+        || String(g.canonicalGameKey || '') === gid) {
+        hit = g;
+        break;
+      }
+    }
+  }
+  if (!hit && (home || away)) {
+    var matches = [];
+    for (var j = 0; j < games.length; j++) {
+      var gg = games[j];
+      if (!gg) continue;
+      if (_propsTeamNameMatches(home, gg.home) && _propsTeamNameMatches(away, gg.away)) {
+        matches.push(gg);
+      }
+    }
+    if (matches.length === 1) hit = matches[0];
+  }
+  if (!hit) return hints;
+  if (hit.eventId) hints.eventId = hit.eventId;
+  if (hit.providerGameId) hints.providerGameId = hit.providerGameId;
+  if (hit.canonicalGameKey) hints.canonicalGameKey = hit.canonicalGameKey;
+  if (hit.id) hints.gameId = hit.id;
+  if (hit.home) hints.home = hit.home;
+  if (hit.away) hints.away = hit.away;
+  return hints;
+}
+
+function _resolveScopedProps(baseList, sportShort, gameId, homeTeam, awayTeam, extraHints) {
+  if (!gameId && !homeTeam && !awayTeam && !(extraHints && (extraHints.eventId || extraHints.canonicalGameKey))) {
+    return { props: baseList || [], filterMode: null, deniedReason: null };
+  }
+  var hints = _lookupPropsGameHintsFromOddsCache(sportShort, gameId, homeTeam, awayTeam);
+  if (extraHints) {
+    if (extraHints.eventId) hints.eventId = extraHints.eventId;
+    if (extraHints.canonicalGameKey) hints.canonicalGameKey = extraHints.canonicalGameKey;
+    if (extraHints.providerGameId) hints.providerGameId = extraHints.providerGameId;
+  }
+  return propsFoundation.resolvePropsForGameScope(baseList, {
+    gameId: gameId,
+    home: homeTeam,
+    away: awayTeam,
+    hints: hints
   });
 }
 
@@ -10230,6 +10257,9 @@ app.get('/api/props/:sport', async function(req, res) {
   var gameId = req.query.gameId ? String(req.query.gameId) : null;
   var homeTeam = req.query.home ? String(req.query.home) : null;
   var awayTeam = req.query.away ? String(req.query.away) : null;
+  var canonicalGameKey = req.query.canonicalGameKey
+    ? String(req.query.canonicalGameKey)
+    : null;
   var view = String(req.query.view || req.query.structure || 'flat').toLowerCase();
   var wantInventory = view === 'inventory' || view === 'tree' || view === 'grouped';
   if (wantInventory && !gameId && !homeTeam && !awayTeam) {
@@ -10283,21 +10313,17 @@ app.get('/api/props/:sport', async function(req, res) {
       }
     };
   }
-  // Prefer gameId when present; fall back to home/away whenever teams are
-  // provided (including when gameId is absent or matches nothing).
+  // Prefer provider-native id; fall back to unique home/away; ambiguous fail closed.
   var baseList = wantInventory ? inventoryProps : fullProps;
-  var outProps = baseList;
-  var filterMode = null;
-  if (gameId) {
-    outProps = _filterPropsByGameId(baseList, gameId);
-    filterMode = 'gameId';
-  }
-  if ((homeTeam || awayTeam) && (!gameId || outProps.length === 0)) {
-    outProps = _filterPropsByTeams(baseList, homeTeam, awayTeam);
-    filterMode = 'teams';
-  }
+  var scoped = _resolveScopedProps(baseList, sport, gameId, homeTeam, awayTeam, {
+    canonicalGameKey: canonicalGameKey
+  });
+  var outProps = scoped.props;
+  var filterMode = scoped.filterMode;
 
-  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length);
+  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length, {
+    cacheKnown: true
+  });
   var hasExplicitLimit = req.query.limit != null && String(req.query.limit).trim() !== '';
   var page = wantInventory || hasExplicitLimit
     ? propsFoundation.paginateProps(outProps, {
@@ -10352,6 +10378,7 @@ app.get('/api/props/:sport', async function(req, res) {
     data.filtered = true;
   }
   if (filterMode) data.filterMode = filterMode;
+  if (scoped.deniedReason) data.deniedReason = scoped.deniedReason;
   res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
@@ -10408,10 +10435,8 @@ app.get('/api/props/:sport/inventory', async function(req, res) {
     }
   }
   var outProps = inventoryProps;
-  if (gameId) outProps = _filterPropsByGameId(outProps, gameId);
-  if ((homeTeam || awayTeam) && (!gameId || outProps.length === 0)) {
-    outProps = _filterPropsByTeams(outProps, homeTeam, awayTeam);
-  }
+  var scoped = _resolveScopedProps(inventoryProps, sport, gameId, homeTeam, awayTeam);
+  outProps = scoped.props;
   // Prefer game-scoped inventory to avoid entire-league dumps.
   if (!gameId && !homeTeam && !awayTeam) {
     return res.status(400).json({
@@ -10425,7 +10450,9 @@ app.get('/api/props/:sport/inventory', async function(req, res) {
     limit: req.query.limit || 800
   });
   var tree = propsFoundation.buildPropsInventoryTree(page.items);
-  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length);
+  var capability = propsFoundation.sportPropsCapability(sport, inventoryProps.length, {
+    cacheKnown: true
+  });
   var data = {
     ok: true,
     sport: sport,
@@ -10446,11 +10473,14 @@ app.get('/api/props/:sport/inventory', async function(req, res) {
   };
   if (gameId) { data.gameId = gameId; data.filtered = true; }
   if (homeTeam || awayTeam) { data.home = homeTeam; data.away = awayTeam; data.filtered = true; }
+  if (scoped.filterMode) data.filterMode = scoped.filterMode;
+  if (scoped.deniedReason) data.deniedReason = scoped.deniedReason;
   data.payloadBytes = propsFoundation.measurePayloadBytes(data);
   res.setHeader('X-Cache', cacheHit ? 'HIT' : 'MISS');
   res.setHeader('X-Provider', 'owls_insight');
   res.setHeader('X-Props-Source', source);
   res.setHeader('X-Props-View', 'inventory');
+  if (scoped.filterMode) res.setHeader('X-Props-Filter', scoped.filterMode);
   res.json(data);
 });
 
@@ -10937,12 +10967,16 @@ app.get('/api/sports', (req, res) => {
     const c    = counts[key] || { games:0, markets:0, live:0, upcoming:0, final:0 };
     const owlsKey = OWLS_SPORT_MAP[key] || OWLS_SPORT_MAP[_CACHE_SPORT_KEY_BY_SHORT[key]||''] || null;
     const propsCache = _PROPS_RESPONSE_CACHE[key];
+    const cacheKnown = !!propsCache;
     const propsCount = propsCache && propsCache.data
       ? (propsCache.data.inventoryCount != null
           ? propsCache.data.inventoryCount
           : (propsCache.data.props || []).length)
       : 0;
-    const propsCap = propsFoundation.sportPropsCapability(key, propsCount);
+    // Cold cache → propsStatus unknown + hasProps null (NOT false). Cache is never truth.
+    const propsCap = propsFoundation.sportPropsCapability(key, propsCount, {
+      cacheKnown: cacheKnown
+    });
     return {
       key:               key,
       label:             meta.label,
@@ -10952,7 +10986,7 @@ app.get('/api/sports', (req, res) => {
       logoUrl:           meta.logoUrl || null,
       enabled:           !!enabledSet[key],
       hasGames:          c.games > 0,
-      hasProps:          !!propsCap.hasProps,
+      hasProps:          propsCap.hasProps,
       propsStatus:       propsCap.propsStatus,
       propsCount:        propsCap.propsCount,
       propsCapable:      !!propsCap.propsCapable,
