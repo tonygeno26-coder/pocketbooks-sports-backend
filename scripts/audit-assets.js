@@ -187,6 +187,35 @@ function loadFeVerifiedTennis() {
   return map;
 }
 
+/**
+ * Optional ESPN source-audit overlay (from Phase-2 full catalog probe).
+ * Maps Owls name → { status, espnId?, reason? }.
+ */
+function loadTennisSourceOverlay() {
+  var i = process.argv.indexOf('--tennis-source');
+  var candidates = [];
+  if (i >= 0 && process.argv[i + 1]) candidates.push(process.argv[i + 1]);
+  if (process.env.PBS_TENNIS_SOURCE_AUDIT) candidates.push(process.env.PBS_TENNIS_SOURCE_AUDIT);
+  candidates.push(
+    path.join(__dirname, '..', '..', 'pocketbooks-sports', '.tmp-asset-audit', 'tennis_source_audit_full.json'),
+    path.join(process.env.PBS_FE_ROOT || '', '.tmp-asset-audit', 'tennis_source_audit_full.json')
+  );
+  for (var c = 0; c < candidates.length; c++) {
+    try {
+      if (!candidates[c] || !fs.existsSync(candidates[c])) continue;
+      var raw = JSON.parse(fs.readFileSync(candidates[c], 'utf8'));
+      var by = Object.create(null);
+      (raw.results || []).forEach(function (r) {
+        if (!r || !r.name) return;
+        by[r.name] = r;
+        by[queue.normKey(r.name)] = r;
+      });
+      return { path: candidates[c], by: by, byStatus: raw.byStatus || null };
+    } catch (_e) {}
+  }
+  return { path: null, by: Object.create(null), byStatus: null };
+}
+
 function tennisHeadshotUrl(id) {
   return 'https://a.espncdn.com/i/headshots/tennis/players/full/' + id + '.png';
 }
@@ -197,6 +226,8 @@ async function main() {
   var catalog = extractCatalog(markets);
   var index = loadRemoteSoccerIndex();
   var tennisVerified = loadFeVerifiedTennis();
+  var tennisSource = loadTennisSourceOverlay();
+  if (tennisSource.path) console.log('Tennis source overlay:', tennisSource.path);
 
   // Soccer resolve
   var soccerResolved = [];
@@ -233,24 +264,73 @@ async function main() {
     });
   }
 
-  // Tennis resolve via FE verified map + production photo API sample for unknowns
+  // Tennis resolve via FE verified map + optional ESPN source overlay for miss taxonomy
   var tennisResolved = [];
   var tennisMissing = [];
   var tennisBroken = [];
+  var tennisQuality = {
+    verifiedPhoto: 0,
+    doublesPair: 0,
+    espnIdNoHeadshot: 0,
+    notInEspn: 0,
+    noExactMatch: 0,
+    ambiguous: 0,
+    unmappedNoOverlay: 0
+  };
   for (var ti = 0; ti < catalog.tennis.length; ti++) {
     var tName = catalog.tennis[ti];
     if (tName.indexOf(' / ') >= 0) {
-      // Doubles pair string — no single headshot; count as unsourced pair identity
       tennisMissing.push({ name: tName, reason: 'D', status: 'doubles_pair' });
+      tennisQuality.doublesPair++;
       continue;
     }
     var id = tennisVerified[tName] || tennisVerified[queue.normKey(tName)];
-    if (!id) {
-      tennisMissing.push({ name: tName, reason: 'C', status: 'unmapped' });
+    if (id) {
+      var url = tennisHeadshotUrl(id);
+      tennisResolved.push({ name: tName, url: url, espnId: id });
       continue;
     }
-    var url = tennisHeadshotUrl(id);
-    tennisResolved.push({ name: tName, url: url, espnId: id });
+    var srcHit = tennisSource.by[tName] || tennisSource.by[queue.normKey(tName)];
+    if (srcHit && srcHit.status === 'verified' && srcHit.espnId && srcHit.photoUrl) {
+      // Source-proven photo not yet in FE map — still count as resolvable once filled;
+      // until then treat as Class C (mapping missing), not Class D.
+      tennisMissing.push({
+        name: tName,
+        reason: 'C',
+        status: 'source_verified_unmapped',
+        espnId: srcHit.espnId,
+        url: srcHit.photoUrl
+      });
+      tennisQuality.verifiedPhoto++;
+      continue;
+    }
+    if (srcHit && srcHit.status === 'no_headshot') {
+      tennisMissing.push({
+        name: tName,
+        reason: queue.classifyTennisMiss(tName, { espnId: srcHit.espnId, headshot404: true }),
+        status: 'espn_id_no_headshot',
+        espnId: srcHit.espnId || null
+      });
+      tennisQuality.espnIdNoHeadshot++;
+      continue;
+    }
+    if (srcHit && srcHit.status === 'not_in_espn') {
+      tennisMissing.push({ name: tName, reason: 'D', status: 'not_in_espn' });
+      tennisQuality.notInEspn++;
+      continue;
+    }
+    if (srcHit && srcHit.status === 'no_exact') {
+      tennisMissing.push({ name: tName, reason: 'C', status: 'no_exact' });
+      tennisQuality.noExactMatch++;
+      continue;
+    }
+    if (srcHit && srcHit.status === 'ambiguous') {
+      tennisMissing.push({ name: tName, reason: 'F', status: 'ambiguous', espnIds: srcHit.espnIds });
+      tennisQuality.ambiguous++;
+      continue;
+    }
+    tennisMissing.push({ name: tName, reason: 'C', status: 'unmapped' });
+    tennisQuality.unmappedNoOverlay++;
   }
 
   if (!SKIP_HTTP) {
@@ -298,6 +378,9 @@ async function main() {
       missingNames: tennisMissing.map(function (x) { return x.name; }),
       missingClassified: tennisMissing,
       brokenNames: tennisBroken,
+      quality: tennisQuality,
+      sourceOverlay: tennisSource.path || null,
+      sourceByStatus: tennisSource.byStatus || null,
       verifiedMapSize: Object.keys(tennisVerified).filter(function (k) { return !/^[a-z0-9 ]+$/.test(k) || tennisVerified[k] !== tennisVerified[queue.normKey(k)]; }).length
     }
   };
@@ -336,6 +419,9 @@ async function main() {
   console.log('  missing: ' + report.soccer.missing + '  broken: ' + report.soccer.broken + '  ambiguous: ' + report.soccer.ambiguous);
   console.log('TENNIS: ' + tennisOk + ' / ' + tennisTotal + ' resolved (' + report.tennis.coveragePct + '%)');
   console.log('  missing: ' + report.tennis.missing + '  broken: ' + report.tennis.broken);
+  if (report.tennis.quality) {
+    console.log('  quality:', JSON.stringify(report.tennis.quality));
+  }
   console.log('Unresolved queue items:', q.items.length);
   console.log('Wrote', OUT);
   console.log('==========================================\n');

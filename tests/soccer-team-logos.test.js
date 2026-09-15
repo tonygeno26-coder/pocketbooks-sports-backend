@@ -161,4 +161,26 @@ describe('soccer-team-logos resolve', () => {
     const duis = resolveTeamLogo('Duisburg', idx);
     expect(duis.row.provider_team_id).toBe('3308');
   });
+
+  test('phase-2 board seeds + aliases resolve Owls names', () => {
+    const { buildResolverIndex: build } = require('../lib/soccer-team-logos');
+    const idx = build([
+      row(8354, 'Asteras Tripoli', ['Asteras Trip']),
+      row(5807, 'Union St.-Gilloise', ['Union SG']),
+      row(596, 'Dinamo Moscow', ['DMO']),
+      row(2566, 'Excelsior', ['EXC']),
+      row(90, 'Deportivo', ['DEP']),
+      row(3472, 'C.D. Nacional', ['Nacional'])
+    ]);
+    expect(resolveTeamLogo('Asteras Tripolis', idx).row.provider_team_id).toBe('8354');
+    expect(resolveTeamLogo('Saint Gilloise', idx).row.provider_team_id).toBe('5807');
+    expect(resolveTeamLogo('Dynamo Moscow', idx).row.provider_team_id).toBe('596');
+    expect(resolveTeamLogo('Excelsior Rotterdam', idx).row.provider_team_id).toBe('2566');
+    expect(resolveTeamLogo('Dep La Coruna', idx).row.provider_team_id).toBe('90');
+    expect(resolveTeamLogo('Nacional da Madeira', idx).row.provider_team_id).toBe('3472');
+    expect(resolveTeamLogo('Aucas', idx).row.provider_team_id).toBe('6017');
+    expect(resolveTeamLogo('LDU Quito', idx).row.provider_team_id).toBe('4816');
+    expect(resolveTeamLogo('The Strongest', idx).row.provider_team_id).toBe('2687');
+    expect(resolveTeamLogo('Indy Eleven', idx).row.provider_team_id).toBe('17360');
+  });
 });
