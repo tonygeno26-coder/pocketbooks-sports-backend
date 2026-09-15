@@ -18402,7 +18402,7 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
   var parts = String(playerName || '').trim().split(/\s+/).filter(Boolean);
   var firstLast = parts.length >= 2 ? (parts[0] + ' ' + parts[parts.length - 1]) : String(playerName || '').trim();
   var queries = s === 'tennis'
-    ? [firstLast, String(playerName || '').trim(), firstLast + ' tennis']
+    ? [String(playerName || '').trim(), firstLast, firstLast + ' tennis']
     : s === 'mma'
       ? [String(playerName || '').trim(), firstLast, String(playerName || '').trim() + ' ufc', firstLast + ' mma']
       : [String(playerName || '').trim(), String(playerName || '').trim() + ' ' + s];
@@ -18410,8 +18410,6 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
   for (var qi = 0; qi < queries.length; qi++) {
     var q = queries[qi];
     if (!q) continue;
-    // Prefer site.web.api — site.api is often Akamai-blocked. For MMA also try
-    // the athlete+sport query shape requested for fighter photo sync.
     var urls = [];
     if (s === 'mma') {
       urls.push('https://site.web.api.espn.com/apis/common/v3/search?query=' +
@@ -18421,8 +18419,6 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
     }
     urls.push('https://site.web.api.espn.com/apis/common/v3/search?query=' +
       encodeURIComponent(q) + '&type=player&limit=5');
-    // ESPN returns empty items when `sport=` is set for tennis/MMA on some hosts.
-    // Query by name + type=player, then filter the result's sport field.
     urls.push('https://site.api.espn.com/apis/common/v3/search?query=' +
       encodeURIComponent(q) + '&type=player&limit=5');
 
@@ -18437,18 +18433,24 @@ async function _espnSearchPlayerPhoto(playerName, sport) {
         var itemSport = String(it.sport || '').toLowerCase();
         if (itemSport && itemSport !== searchSport && itemSport !== s) continue;
         var dn = _photoNormName(it.displayName || it.name || '');
+        // Fail closed: exact normalized identity only (no substring soft-match).
+        // Wrong headshot is worse than missing.
         if (want && dn && dn === want) exactHits.push(it);
-        else if (s !== 'mma' && want && dn && (dn.indexOf(want) >= 0 || want.indexOf(dn) >= 0)) {
-          // Non-MMA: keep legacy soft match for tennis/team sports
-          exactHits.push(it);
-        }
       }
-      if (s === 'mma' && exactHits.length !== 1) continue;
+      if (exactHits.length !== 1) continue;
       if (exactHits[0]) chosen = exactHits[0];
     }
     if (!chosen) continue;
     var espnId = String(chosen.id);
-    var photoUrl = _espnHeadshotUrl(s, espnId);
+    var photoUrl = null;
+    // Prefer ESPN core athlete headshot href when present (many long-tail IDs 404 on CDN).
+    if (s === 'tennis') {
+      var core = await _httpsJson('https://sports.core.api.espn.com/v2/sports/tennis/athletes/' + espnId, 8000);
+      var coreStr = core ? JSON.stringify(core) : '';
+      var m = coreStr.match(/https:\/\/a\.espncdn\.com\/i\/headshots\/tennis\/players\/full\/\d+\.png/);
+      if (m) photoUrl = m[0];
+    }
+    if (!photoUrl) photoUrl = _espnHeadshotUrl(s, espnId);
     var verified = await _verifyImageUrl(photoUrl);
     if (!verified) continue;
     return { espnId: espnId, photoUrl: photoUrl, verified: true, displayName: chosen.displayName || playerName };

@@ -11,7 +11,9 @@
     "sync:ncaaf-logos": "node scripts/sync-ncaaf-team-logos.js",
     "audit:ncaaf-logos": "node scripts/audit-ncaaf-team-logos.js",
     "sync:soccer-logos": "node scripts/sync-soccer-team-logos.js",
-    "audit:soccer-logos": "node scripts/audit-soccer-team-logos.js"
+    "audit:soccer-logos": "node scripts/audit-soccer-team-logos.js",
+    "audit:assets": "node scripts/audit-assets.js",
+    "audit:tennis-photos": "node scripts/audit-assets.js -- --sport=tennis"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",

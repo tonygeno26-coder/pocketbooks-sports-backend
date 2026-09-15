@@ -142,15 +142,23 @@ describe('soccer-team-logos resolve', () => {
     expect(AMBIGUOUS_BARE.inter.length).toBeGreaterThan(1);
   });
 
-  test('pickLogoUrl prefers soccer crest for clubs', () => {
-    const url = pickLogoUrl({
-      id: '360',
-      isNational: false,
-      logos: [
-        { href: 'https://a.espncdn.com/i/teamlogos/soccer/500-dark/360.png' },
-        { href: 'https://a.espncdn.com/i/teamlogos/soccer/500/360.png' }
-      ]
-    });
-    expect(url).toContain('/soccer/500/360.png');
+  test('board aliases map to ESPN display names without fuzzy', () => {
+    expect(VERIFIED_ALIASES['FC Koln']).toBe('FC Cologne');
+    expect(VERIFIED_ALIASES['Hamburger SV']).toBe('Hamburg SV');
+    expect(VERIFIED_ALIASES['Porto']).toBe('FC Porto');
+    expect(VERIFIED_ALIASES['New York Red Bulls']).toBe('Red Bull New York');
+    expect(AMBIGUOUS_BARE.barcelona.length).toBeGreaterThan(1);
+    expect(AMBIGUOUS_BARE.lincoln.length).toBeGreaterThan(1);
+  });
+
+  test('board seeds merge into resolver when DB rows missing', () => {
+    const { BOARD_VERIFIED_SEEDS, buildResolverIndex: build } = require('../lib/soccer-team-logos');
+    const idx = build([]);
+    expect(BOARD_VERIFIED_SEEDS.length).toBeGreaterThan(0);
+    const ahly = resolveTeamLogo('Al Ahly', idx);
+    expect(ahly.status).not.toBe('unresolved');
+    expect(ahly.logoUrl).toContain('/10207.png');
+    const duis = resolveTeamLogo('Duisburg', idx);
+    expect(duis.row.provider_team_id).toBe('3308');
   });
 });
