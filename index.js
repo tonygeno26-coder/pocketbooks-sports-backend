@@ -15,6 +15,7 @@ const parlayCorrelation = require('./lib/parlay-correlation');
 const authAudit = require('./lib/auth-audit');
 const propsFoundation = require('./lib/props-foundation');
 const feedback = require('./lib/feedback');
+const oddsChangePolicyLib = require('./lib/odds-change-policy');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -116,6 +117,8 @@ const LIVE_PLACEMENT_REJECTION_CODES = new Set([
   'line_changed',
   'odds_stale',
   'market_unavailable',
+  'market_suspended',
+  'market_changed',
   'live_stake_above_max',
   'live_payout_above_max',
   'live_sport_disabled',
@@ -7173,7 +7176,13 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
   if (state === 'canceled')
     return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
   if (state === 'suspended')
-    return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
+    return {
+      ok:false,
+      code:'market_suspended',
+      leg:leg.pick,
+      reason:'suspended',
+      userMessage:'Market temporarily unavailable'
+    };
 
   // Live / in-progress: server-authoritative (never trust client leg.isLive).
   // isFinal already rejected above. When LIVE_BETTING_ENABLED, allow live bets;
@@ -7195,13 +7204,41 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     }
   }
 
-  // RISK-9: Zero-tolerance exact-match odds.
-  // No drift window, no accept_better, no accept_any_with_confirm.
-  // submitted odds must equal server snapshot odds exactly (integer comparison).
   const rawSubmittedOdds = leg.odds;
   const rawServerOdds    = snap.odds_american;
   const submittedOdds = Number(rawSubmittedOdds);
   const serverOdds    = Number(rawServerOdds);
+  const serverLineRaw = snap.point_line!=null ? snap.point_line : snap.pointLine;
+  const serverLine = Number(serverLineRaw);
+  const requiresLine = _marketRequiresPointLineExact(ident.marketType || market, market);
+  const submittedLine = requiresLine ? _extractSubmittedPointLine(leg) : NaN;
+
+  // LINE vs PRICE: identity first. Flex-matched different points are a different
+  // wager — never treat as mere odds_changed, even under Accept All.
+  if (requiresLine) {
+    if (!Number.isFinite(submittedLine) || !Number.isFinite(serverLine) ||
+        Math.abs(submittedLine - serverLine) > 0.000001) {
+      return oddsChangePolicyLib.buildLineChangedPayload({
+        leg: leg.pick,
+        submittedPointLine: Number.isFinite(submittedLine) ? submittedLine : null,
+        serverPointLine: Number.isFinite(serverLine) ? serverLine : null,
+        submittedOdds: Number.isFinite(submittedOdds) ? submittedOdds : null,
+        serverOdds: Number.isFinite(serverOdds) ? serverOdds : null,
+        reason: matchStrategy === 'canonical_line_flex'
+          ? 'market_identity_line_mismatch'
+          : 'exact_line_required'
+      });
+    }
+  } else if (matchStrategy === 'canonical_line_flex') {
+    // Non-point markets should never resolve via line-flex.
+    return {
+      ok:false,
+      code:'market_changed',
+      leg:leg.pick,
+      reason:'unresolvable_market_identity',
+      userMessage:'Market temporarily unavailable'
+    };
+  }
 
   if (rawSubmittedOdds == null || rawSubmittedOdds === '' ||
       rawServerOdds == null || rawServerOdds === '' ||
@@ -7210,32 +7247,27 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     return { ok:false, code:'invalid_snapshot_odds', leg:leg.pick };
   }
 
-  if (submittedOdds !== serverOdds) {
-    return {
-      ok:          false,
-      code:        'odds_changed',
-      leg:         leg.pick,
-      submittedOdds,
-      serverOdds,
-      reason:      'exact_match_required'
-    };
+  // Server-authoritative reprice: keep exact American comparison, then apply
+  // player odds-change policy (ask / accept_better / accept_all).
+  const policyDecision = oddsChangePolicyLib.resolveOddsChangeAction(
+    oddsChangePolicy, submittedOdds, serverOdds);
+  if (policyDecision.action === 'reject') {
+    return { ok:false, code:'invalid_snapshot_odds', leg:leg.pick };
   }
-
-  if (_marketRequiresPointLineExact(ident.marketType || market, market)) {
-    const submittedLine = _extractSubmittedPointLine(leg);
-    const serverLineRaw = snap.point_line!=null ? snap.point_line : snap.pointLine;
-    const serverLine = Number(serverLineRaw);
-    if (!Number.isFinite(submittedLine) || !Number.isFinite(serverLine) ||
-        Math.abs(submittedLine - serverLine) > 0.000001) {
-      return {
-        ok:false,
-        code:'line_changed',
-        leg:leg.pick,
-        submittedPointLine:Number.isFinite(submittedLine) ? submittedLine : null,
-        serverPointLine:Number.isFinite(serverLine) ? serverLine : null,
-        reason:'exact_line_required'
-      };
-    }
+  if (policyDecision.action === 'confirm') {
+    // Preserve exact_match_required for Ask Me so contract harnesses stay green;
+    // Accept Better worse-path uses confirmation_required.
+    const confirmReason = oddsChangePolicyLib.normalizeOddsChangePolicy(oddsChangePolicy) === 'ask'
+      ? 'exact_match_required'
+      : 'confirmation_required';
+    return oddsChangePolicyLib.buildOddsChangedPayload({
+      leg: leg.pick,
+      submittedOdds: submittedOdds,
+      serverOdds: serverOdds,
+      comparison: policyDecision.comparison,
+      policy: policyDecision.policy,
+      reason: confirmReason
+    });
   }
 
   return {
@@ -7243,12 +7275,17 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
     snapshotId:           snap.snapshot_id,
     acceptedOddsAmerican: serverOdds,
     acceptedOddsDecimal:  parseFloat(snap.odds_decimal),
-    acceptedPointLine:    snap.point_line!=null?parseFloat(snap.point_line):null,
+    acceptedPointLine:    Number.isFinite(serverLine) ? serverLine
+      : (snap.point_line!=null?parseFloat(snap.point_line):null),
     commenceTime:         commenceTime,
     isLive:               state === 'live',   // server-authoritative; never trust client leg.isLive
     // Prefer the snapshot's Owls key so ticket_legs grade against the same
     // identity we looked up (not the lobby's short "mlb|..." key).
-    canonicalGameKey:     snap.canonical_game_key || preferredKey || rawKey
+    canonicalGameKey:     snap.canonical_game_key || preferredKey || rawKey,
+    submittedOddsAmerican: submittedOdds,
+    oddsRepriced:         policyDecision.comparison !== 'same',
+    oddsComparison:       policyDecision.comparison,
+    oddsChangePolicy:     policyDecision.policy
   };
 }
 
@@ -7394,15 +7431,27 @@ function _classifyMarket(snap, nowMs) {
   return 'active';
 }
 
-// Recalculate payout server-side from snapshots (Phase L: fail-closed)
+// Recalculate payout server-side from snapshots (Phase L: fail-closed).
+// Odds-change confirmations are collected across ALL legs so parlays can
+// present every current price in one review (not sequential leg-by-leg).
 async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePolicy) {
   let product = 1;
   const enrichedLegs = [];
+  const confirmLegs = [];
+  let hardFail = null;
+
   for (let i=0; i<legs.length; i++) {
     const vr = await _verifyLegOddsSnapshot(sb, legs[i], nowMs, oddsChangePolicy);
-    // vr is never null now (fail-closed returns error objects)
-    if (!vr.ok) return Object.assign(vr, { legIndex:i });
-    // Dev fallback: log clearly, product uses submitted odds
+    if (!vr.ok) {
+      const code = vr.code;
+      if (code === 'odds_changed' || code === 'line_changed') {
+        confirmLegs.push(Object.assign({}, vr, { legIndex:i }));
+        continue;
+      }
+      // Hard fails (suspended / unavailable / stale / etc.) stop immediately.
+      hardFail = Object.assign(vr, { legIndex:i });
+      break;
+    }
     const usedDecimal = vr.acceptedOddsDecimal ||
       (vr.acceptedOddsAmerican > 0
         ? vr.acceptedOddsAmerican/100+1
@@ -7415,10 +7464,47 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
       odds_snapshot_id:       vr.snapshotId||null,
       accepted_at:            new Date(nowMs).toISOString(),
       dev_fallback:           vr.devFallback||false,
-      server_is_live:         vr.isLive||false,   // server-derived; used by RPC, not client leg.isLive
-      canonicalGameKey:       vr.canonicalGameKey || legs[i].canonicalGameKey
+      server_is_live:         vr.isLive||false,
+      canonicalGameKey:       vr.canonicalGameKey || legs[i].canonicalGameKey,
+      submitted_odds_american: vr.submittedOddsAmerican != null
+        ? vr.submittedOddsAmerican
+        : (Number.isFinite(Number(legs[i].odds)) ? Number(legs[i].odds) : null),
+      odds_repriced:          !!vr.oddsRepriced,
+      odds_comparison:        vr.oddsComparison || 'same'
     }));
   }
+
+  if (hardFail) return hardFail;
+
+  if (confirmLegs.length) {
+    // Prefer line_changed over odds_changed when both appear — different wager.
+    const lineHits = confirmLegs.filter(function(c){ return c.code === 'line_changed'; });
+    const primary = lineHits[0] || confirmLegs[0];
+    const updatedLegs = confirmLegs.map(function(c) {
+      return {
+        legIndex: c.legIndex,
+        pick: c.leg,
+        code: c.code,
+        submittedOdds: c.submittedOdds,
+        serverOdds: c.serverOdds,
+        submittedPointLine: c.submittedPointLine,
+        serverPointLine: c.serverPointLine,
+        comparison: c.comparison || null,
+        liveOdds: c.serverOdds
+      };
+    });
+    return Object.assign({}, primary, {
+      ok: false,
+      legs: updatedLegs,
+      confirmLegs: confirmLegs,
+      requiresConfirmation: true,
+      userMessage: primary.userMessage ||
+        (primary.code === 'line_changed'
+          ? 'Line changed — please review and confirm.'
+          : 'Odds changed — please review and confirm.')
+    });
+  }
+
   const payout = Math.round(stake*product*100)/100;
   const profit = Math.round((payout-stake)*100)/100;
   return { ok:true, payout, profit, legs:enrichedLegs };
@@ -14608,13 +14694,19 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
 
     // 3. Phase K: snapshot-based odds verification + server payout recalculation
     const nowMs = Date.now();
-    // Load club oddsChangePolicy
-    let oddsChangePolicy = 'reject';
+    // Resolve odds-change policy: player preference (body) overrides club default.
+    // Club `reject` / empty maps to Ask Me. Never trust client oddsAccepted.
+    let oddsChangePolicy = 'ask';
     try {
       const { data:csData } = await sb.from('club_risk_settings').select('odds_change_policy')
         .eq('club_id',clubId).limit(1);
-      if (csData&&csData[0]) oddsChangePolicy = csData[0].odds_change_policy||'reject';
+      if (csData&&csData[0]&&csData[0].odds_change_policy) {
+        oddsChangePolicy = oddsChangePolicyLib.normalizeOddsChangePolicy(csData[0].odds_change_policy);
+      }
     } catch(_e){}
+    if (req.body && req.body.oddsChangePolicy != null && req.body.oddsChangePolicy !== '') {
+      oddsChangePolicy = oddsChangePolicyLib.normalizeOddsChangePolicy(req.body.oddsChangePolicy);
+    }
 
     let serverPayout = null;
     let serverProfit = null;
@@ -14628,10 +14720,13 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         : (payoutResult.code==='odds_changed'
           ||payoutResult.code==='line_changed'
           ||payoutResult.code==='market_unavailable'
+          ||payoutResult.code==='market_suspended'
+          ||payoutResult.code==='market_changed'
           ||payoutResult.code==='market_closed'
           ||payoutResult.code==='odds_stale')?409 : 422;
       console.log('[bets/place] snapshot validation failed:', payoutResult.code,
-        payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')');
+        payoutResult.reason||'-', payoutResult.leg, '('+httpStatus+')',
+        'policy='+oddsChangePolicy);
       _recordLivePlacementRejection(payoutResult.code, _liveRejectionContextFromLegs(legsArr, payoutResult, {
         phase:'initial_snapshot',
         clubId,
@@ -14644,8 +14739,12 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
           payoutResult.userMessage =
             payoutResult.reason === 'game_final'    ? 'game is final' :
             payoutResult.reason === 'game_canceled' ? 'Market unavailable: game canceled.' :
-            payoutResult.reason === 'suspended'     ? 'Market unavailable: temporarily suspended.' :
+            payoutResult.reason === 'suspended'     ? 'Market temporarily unavailable' :
                                                       'Market unavailable.';
+        } else if (payoutResult.code === 'market_suspended') {
+          payoutResult.userMessage = 'Market temporarily unavailable';
+        } else if (payoutResult.code === 'market_changed') {
+          payoutResult.userMessage = 'Market temporarily unavailable';
         } else if (payoutResult.code === 'live_betting_disabled') {
           payoutResult.userMessage = 'live betting disabled';
         } else if (payoutResult.code === 'odds_changed') {
@@ -14663,14 +14762,36 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         line_changed:'odds_change_rejections',
         odds_stale:'stale_line_attempts',
         market_unavailable:'stale_line_attempts',
+        market_suspended:'stale_line_attempts',
+        market_changed:'stale_line_attempts',
         market_closed:'stale_line_attempts',
         odds_service_unavailable:null }[payoutResult.code];
       if (_snapRaType) emitRiskAlert(_snapRaType, clubId, playerId,
         { code:payoutResult.code, reason:payoutResult.reason, leg:payoutResult.leg });
-      const _updatedLegs = (payoutResult.code === 'odds_changed' && payoutResult.legs)
-        ? payoutResult.legs.map(function(l){ return { pick:l.pick, odds:l.liveOdds||l.odds, market:l.market, gameId:l.gameId }; })
+      const _updatedLegs = (payoutResult.legs && Array.isArray(payoutResult.legs))
+        ? payoutResult.legs.map(function(l){
+            return {
+              pick:l.pick,
+              odds:l.liveOdds!=null?l.liveOdds:(l.serverOdds!=null?l.serverOdds:l.odds),
+              market:l.market,
+              gameId:l.gameId,
+              legIndex:l.legIndex,
+              code:l.code,
+              submittedOdds:l.submittedOdds,
+              serverOdds:l.serverOdds,
+              submittedPointLine:l.submittedPointLine,
+              serverPointLine:l.serverPointLine,
+              comparison:l.comparison
+            };
+          })
         : undefined;
-      return res.status(httpStatus).json(Object.assign({ ok:false }, payoutResult,
+      return res.status(httpStatus).json(Object.assign({
+        ok:false,
+        oddsChangePolicy: oddsChangePolicy,
+        requiresConfirmation: !!(payoutResult.requiresConfirmation
+          || payoutResult.code === 'odds_changed'
+          || payoutResult.code === 'line_changed')
+      }, payoutResult,
         _updatedLegs ? { updatedLegs: _updatedLegs } : {}));
     }
     if (payoutResult && payoutResult.ok) {
@@ -14762,6 +14883,8 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         : (finalPayoutResult.code==='odds_changed'
           ||finalPayoutResult.code==='line_changed'
           ||finalPayoutResult.code==='market_unavailable'
+          ||finalPayoutResult.code==='market_suspended'
+          ||finalPayoutResult.code==='market_changed'
           ||finalPayoutResult.code==='market_closed'
           ||finalPayoutResult.code==='odds_stale')?409 : 422;
       console.log('[bets/place] final snapshot recheck failed:', finalPayoutResult.code,
@@ -14771,7 +14894,14 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         clubId,
         playerId
       }));
-      return res.status(httpStatus).json(Object.assign({ ok:false, finalRecheck:true }, finalPayoutResult));
+      return res.status(httpStatus).json(Object.assign({
+        ok:false,
+        finalRecheck:true,
+        oddsChangePolicy: oddsChangePolicy,
+        requiresConfirmation: !!(finalPayoutResult.requiresConfirmation
+          || finalPayoutResult.code === 'odds_changed'
+          || finalPayoutResult.code === 'line_changed')
+      }, finalPayoutResult));
     }
     if (finalPayoutResult && finalPayoutResult.ok) {
       legsArr = finalPayoutResult.legs;

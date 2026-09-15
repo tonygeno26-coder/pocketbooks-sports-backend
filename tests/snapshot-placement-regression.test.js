@@ -72,7 +72,7 @@ function verifySnapshot(snap, leg, nowMs) {
   }
   if (state === 'final') return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_final' };
   if (state === 'canceled') return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'game_canceled' };
-  if (state === 'suspended') return { ok:false, code:'market_unavailable', leg:leg.pick, reason:'suspended' };
+  if (state === 'suspended') return { ok:false, code:'market_suspended', leg:leg.pick, reason:'suspended' };
 
   const commenceTime = snap.commence_time || snap.commenceTime;
   const commenceMs = commenceTime ? new Date(commenceTime).getTime() : NaN;
@@ -98,6 +98,8 @@ function verifySnapshot(snap, leg, nowMs) {
     return { ok:false, code:'invalid_snapshot_odds', leg:leg.pick };
   }
 
+  // Mirror production: Ask Me (default) requires confirmation on any price move.
+  // Tests that need Accept Better / Accept All cover lib/odds-change-policy.js.
   if (submittedOdds !== serverOdds) {
     return {
       ok:false,
@@ -105,7 +107,8 @@ function verifySnapshot(snap, leg, nowMs) {
       leg:leg.pick,
       submittedOdds,
       serverOdds,
-      reason:'exact_match_required'
+      reason:'exact_match_required',
+      requiresConfirmation:true
     };
   }
 
@@ -260,7 +263,7 @@ assertRejectNoHab('live snapshot stale after 10 seconds', snap({
 assertRejectNoHab('pregame snapshot remains fresh before 120 seconds then rejects after', snap({
   fetched_at:new Date(NOW_MS - PREGAME_SNAPSHOT_TTL_MS - 1).toISOString()
 }), 'odds_stale');
-assertRejectNoHab('suspended snapshot rejects', snap({ market_status:'suspended' }), 'market_unavailable', 'suspended');
+assertRejectNoHab('suspended snapshot rejects', snap({ market_status:'suspended' }), 'market_suspended', 'suspended');
 assertRejectNoHab('final snapshot rejects', snap({ event_status:'final' }), 'market_unavailable', 'game_final');
 assertRejectNoHab('canceled snapshot rejects', snap({ event_status:'canceled' }), 'market_unavailable', 'game_canceled');
 assertRejectNoHab('invalid odds snapshot rejects', snap({ odds_american:null }), 'invalid_snapshot_odds');
