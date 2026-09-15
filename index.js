@@ -7528,7 +7528,9 @@ if (ODDS_KEY || (ODDS_PROVIDER === 'owls_insight' && OWLS_KEY)) {
 // ── RISK LIMITS ENGINE ───────────────────────────────────────────────────────────────────────
 const RISK_CODE_STATUS = {
   risk_limits_unavailable:  503,
-  player_suspended:         403,
+  // 422 (not 403): FE hard-403 handlers treat 403 as session invalid / logout.
+  // Suspended players must stay signed in and see a clear betting denial.
+  player_suspended:         422,
   stake_below_min:          422,
   stake_above_max:          422,
   payout_above_max:         422,
