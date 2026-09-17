@@ -17,6 +17,7 @@ const propsFoundation = require('./lib/props-foundation');
 const feedback = require('./lib/feedback');
 const oddsChangePolicyLib = require('./lib/odds-change-policy');
 const confirmationQuoteLib = require('./lib/confirmation-quote');
+const activeBetConflict = require('./lib/active-bet-conflict');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -14952,7 +14953,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         message:'Risk checks temporarily unavailable. Please retry.' });
     }
 
-    // 3c. Conflict check: active legs on same game+market
+    // 3c. Conflict check: exact duplicate active wager only
+    //     Identity: canonicalGameKey|market|selection|line
+    //     Distinct markets on the same game are allowed. Opposite sides of
+    //     the same market are allowed here (not exact duplicates). Parlay
+    //     correlation / SGP remain separate gates.
     //     Bypass paths (testing / staging):
     //       - env BETS_BYPASS_CONFLICT=1            → globally disabled
     //       - req.body._bypassConflict === true     → per-request (must be
@@ -14975,13 +14980,22 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
       if (activeTix && activeTix.length) {
         const activeTicketIds = activeTix.map(function(t){ return t.id; });
         const { data: activeLegs } = await sb.from('ticket_legs')
-          .select('canonical_game_key,market').in('ticket_id', activeTicketIds);
+          .select('canonical_game_key,market,market_type,pick,side,line,accepted_point_line,canonical_selection_key')
+          .in('ticket_id', activeTicketIds);
         const activeLegsArr = activeLegs || [];
         for (var i=0; i<legsArr.length; i++) {
-          var newToken = legsArr[i].canonicalGameKey + '|' + (legsArr[i].market||'').toLowerCase();
           for (var j=0; j<activeLegsArr.length; j++) {
-            var exToken = activeLegsArr[j].canonical_game_key + '|' + (activeLegsArr[j].market||'').toLowerCase();
-            if (newToken === exToken) return res.status(409).json({ ok:false, error:'conflict_active_bet:'+legsArr[i].canonicalGameKey });
+            if (activeBetConflict.isExactActiveBetDuplicate(legsArr[i], activeLegsArr[j])) {
+              console.log('[bets/place] conflict_active_bet exact duplicate',
+                'player='+playerId, 'club='+clubId,
+                'token='+activeBetConflict.activeBetDuplicateToken(legsArr[i]));
+              return res.status(409).json({
+                ok:false,
+                error:'conflict_active_bet',
+                code:'conflict_active_bet',
+                userMessage:'You already have this wager active.'
+              });
+            }
           }
         }
       }
