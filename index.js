@@ -7851,7 +7851,9 @@ async function _checkRiskLimitsJs(sb, clubId, playerId, params) {
       return { ok:false, code:'market_blocked', market, legIndex:i, source:'club_settings' };
     if (pl.blocked_markets && pl.blocked_markets.includes(market))
       return { ok:false, code:'market_blocked', market, legIndex:i, source:'player_limit' };
-    if (pl.allowed_sports && !pl.allowed_sports.includes(sport))
+    // Empty/null/missing allowed_sports = no player-level sport restriction.
+    // Only a non-empty allowlist restricts to listed sports.
+    if (Array.isArray(pl.allowed_sports) && pl.allowed_sports.length > 0 && !pl.allowed_sports.includes(sport))
       return { ok:false, code:'sport_not_allowed', sport, legIndex:i };
     if (cs.allow_live_betting===false && leg.server_is_live)
       return { ok:false, code:'live_betting_disabled', legIndex:i };

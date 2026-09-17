@@ -625,6 +625,59 @@ test('I3: empty allowed_sports allows all sports', async function() {
   assert(r.ok, 'empty allowlist = all sports allowed');
 });
 
+test('I3b: null allowed_sports unrestricted', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [], allowed_sports: null }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const r = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline' }] });
+  assert(r.ok, 'null allowlist = unrestricted');
+});
+
+test('I3c: missing allowed_sports unrestricted', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const r = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline' }] });
+  assert(r.ok, 'missing allowlist = unrestricted');
+});
+
+test('I3d: allowed_sports ["mlb"] allows MLB', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [], allowed_sports: ['mlb'] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const r = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline' }] });
+  assert(r.ok, 'mlb in allowlist');
+});
+
+test('I3e: allowed_sports ["nfl"] denies MLB', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [], allowed_sports: ['nfl'] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const r = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline' }] });
+  assert(!r.ok, 'mlb not in allowlist');
+  assertEq(r.code, 'sport_not_allowed', 'code');
+});
+
+test('I3f: empty allowed_sports parlay ok', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [], allowed_sports: [] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const r = await checkRiskLimits(sb, 'c1', 'p1', { stake: 20, potentialPayout: 70, betType: 'Parlay',
+    legs: [{ sport: 'mlb', market: 'moneyline' }, { sport: 'nfl', market: 'moneyline' }] });
+  assert(r.ok, 'empty allowlist parlay ok');
+});
+
+test('I3g: empty allowed_sports live prematch ok', async function() {
+  const rows = [{ club_id: 'c1', player_id: 'p1', blocked_sports: [], blocked_markets: [], allowed_sports: [] }];
+  const sb = makeSupabaseHarness({ uuidMode: false, rows });
+  const rPrematch = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline', server_is_live: false }] });
+  assert(rPrematch.ok, 'prematch empty allowlist ok');
+  const rLive = await checkRiskLimits(sb, 'c1', 'p1', { stake: 10, potentialPayout: 20, betType: 'Single',
+    legs: [{ sport: 'mlb', market: 'moneyline', server_is_live: true }] });
+  // harness does not enforce club live gates — only player allowlist; empty = ok
+  assert(rLive.ok, 'live empty allowlist ok at player layer');
+});
+
 // ---------------------------------------------------------------------------
 // Section J — blocked_markets per-player
 // ---------------------------------------------------------------------------

@@ -105,4 +105,14 @@ describe('Host player limit management', () => {
     expect(src).toContain(stakeRule);
     expect(src.indexOf(stakeRule)).toBeLessThan(src.indexOf('// Bet type gates'));
   });
+
+  test('allowed_sports empty/null is unrestricted; only non-empty allowlist restricts', () => {
+    const riskStart = src.indexOf('async function _checkRiskLimitsJs');
+    const riskEnd = src.indexOf('// Player open risk', riskStart);
+    const riskBody = src.slice(riskStart, riskEnd);
+    expect(riskBody).toContain(
+      'Array.isArray(pl.allowed_sports) && pl.allowed_sports.length > 0 && !pl.allowed_sports.includes(sport)'
+    );
+    expect(riskBody).not.toMatch(/if\s*\(\s*pl\.allowed_sports\s*&&\s*!pl\.allowed_sports\.includes\(sport\)\s*\)/);
+  });
 });
