@@ -13,7 +13,9 @@
     "sync:soccer-logos": "node scripts/sync-soccer-team-logos.js",
     "audit:soccer-logos": "node scripts/audit-soccer-team-logos.js",
     "audit:assets": "node scripts/audit-assets.js",
-    "audit:tennis-photos": "node scripts/audit-assets.js -- --sport=tennis"
+    "audit:tennis-photos": "node scripts/audit-assets.js -- --sport=tennis",
+    "apply:asset-recovery": "node scripts/apply-asset-recovery-seed.js",
+    "apply:asset-recovery:dry": "node scripts/apply-asset-recovery-seed.js --dry-run"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
