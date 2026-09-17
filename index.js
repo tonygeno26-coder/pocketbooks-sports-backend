@@ -16,6 +16,7 @@ const authAudit = require('./lib/auth-audit');
 const propsFoundation = require('./lib/props-foundation');
 const feedback = require('./lib/feedback');
 const oddsChangePolicyLib = require('./lib/odds-change-policy');
+const confirmationQuoteLib = require('./lib/confirmation-quote');
 const { io: socketIoClient } = require('socket.io-client');
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -6921,7 +6922,7 @@ async function _logClosestSnapshotKeys(sb, cKey, marketForLookup, pickForLookup)
 // Phase L: fail-closed odds verification
 // Production: any error → odds_service_unavailable (never use client odds)
 // Dev+bypass: warn and fall back to client odds
-async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
+async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg) {
   nowMs = nowMs||Date.now();
   const rawKeyIn = leg.canonicalGameKey||'';
   const dateFromLeg = _isoDateFromValue(leg.scheduledStart || leg.commenceTime || leg.commence_time || '');
@@ -7249,6 +7250,40 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy) {
 
   // Server-authoritative reprice: keep exact American comparison, then apply
   // player odds-change policy (ask / accept_better / accept_all).
+  // When a verified confirmation quote covers this leg, the quoted price is
+  // the atomic commit point — do not re-open odds_changed solely because the
+  // provider ticked again after the player accepted.
+  if (quoteLeg) {
+    const quoted = confirmationQuoteLib.resolveQuotedPriceAction(
+      quoteLeg, submittedOdds, serverOdds, oddsChangePolicy);
+    if (quoted.action === 'reject') {
+      return { ok:false, code:'confirmation_quote_invalid', reason:quoted.reason, leg:leg.pick };
+    }
+    if (quoted.action === 'commit_quote' || quoted.action === 'continue_server') {
+      const acceptedAm = quoted.acceptedOdds;
+      const acceptedDec = quoted.action === 'continue_server' && Number.isFinite(parseFloat(snap.odds_decimal))
+        ? parseFloat(snap.odds_decimal)
+        : confirmationQuoteLib.americanToDecimal(acceptedAm);
+      return {
+        ok:true,
+        snapshotId:           snap.snapshot_id,
+        acceptedOddsAmerican: acceptedAm,
+        acceptedOddsDecimal:  acceptedDec,
+        acceptedPointLine:    Number.isFinite(serverLine) ? serverLine
+          : (snap.point_line!=null?parseFloat(snap.point_line):null),
+        commenceTime:         commenceTime,
+        isLive:               state === 'live',
+        canonicalGameKey:     snap.canonical_game_key || preferredKey || rawKey,
+        submittedOddsAmerican: submittedOdds,
+        oddsRepriced:         quoted.comparison !== 'same',
+        oddsComparison:       quoted.comparison || 'same',
+        oddsChangePolicy:     oddsChangePolicyLib.normalizeOddsChangePolicy(oddsChangePolicy),
+        confirmationQuoteCommitted: quoted.action === 'commit_quote',
+        fromConfirmationQuote: true
+      };
+    }
+  }
+
   const policyDecision = oddsChangePolicyLib.resolveOddsChangeAction(
     oddsChangePolicy, submittedOdds, serverOdds);
   if (policyDecision.action === 'reject') {
@@ -7434,18 +7469,26 @@ function _classifyMarket(snap, nowMs) {
 // Recalculate payout server-side from snapshots (Phase L: fail-closed).
 // Odds-change confirmations are collected across ALL legs so parlays can
 // present every current price in one review (not sequential leg-by-leg).
-async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePolicy) {
+// Optional quoteLegByIndex: verified confirmation-quote bindings — when
+// present, matching legs commit the quoted price (atomic finalization).
+async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePolicy, quoteLegByIndex) {
   let product = 1;
   const enrichedLegs = [];
   const confirmLegs = [];
   let hardFail = null;
 
   for (let i=0; i<legs.length; i++) {
-    const vr = await _verifyLegOddsSnapshot(sb, legs[i], nowMs, oddsChangePolicy);
+    const quoteLeg = quoteLegByIndex && quoteLegByIndex[i] ? quoteLegByIndex[i] : null;
+    const vr = await _verifyLegOddsSnapshot(sb, legs[i], nowMs, oddsChangePolicy, quoteLeg);
     if (!vr.ok) {
       const code = vr.code;
       if (code === 'odds_changed' || code === 'line_changed') {
-        confirmLegs.push(Object.assign({}, vr, { legIndex:i }));
+        confirmLegs.push(Object.assign({}, vr, {
+          legIndex:i,
+          market: legs[i].market || null,
+          canonicalGameKey: legs[i].canonicalGameKey || null,
+          gameId: legs[i].gameId || legs[i].providerGameId || null
+        }));
         continue;
       }
       // Hard fails (suspended / unavailable / stale / etc.) stop immediately.
@@ -7470,7 +7513,8 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
         ? vr.submittedOddsAmerican
         : (Number.isFinite(Number(legs[i].odds)) ? Number(legs[i].odds) : null),
       odds_repriced:          !!vr.oddsRepriced,
-      odds_comparison:        vr.oddsComparison || 'same'
+      odds_comparison:        vr.oddsComparison || 'same',
+      confirmation_quote_committed: !!vr.confirmationQuoteCommitted
     }));
   }
 
@@ -7490,7 +7534,10 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
         submittedPointLine: c.submittedPointLine,
         serverPointLine: c.serverPointLine,
         comparison: c.comparison || null,
-        liveOdds: c.serverOdds
+        liveOdds: c.serverOdds,
+        market: c.market || null,
+        canonicalGameKey: c.canonicalGameKey || null,
+        gameId: c.gameId || null
       };
     });
     return Object.assign({}, primary, {
@@ -7508,6 +7555,31 @@ async function _recalcPayoutFromSnapshots(sb, stake, legs, nowMs, oddsChangePoli
   const payout = Math.round(stake*product*100)/100;
   const profit = Math.round((payout-stake)*100)/100;
   return { ok:true, payout, profit, legs:enrichedLegs };
+}
+
+/** Attach a short-TTL confirmation quote to odds/line change reject bodies. */
+function _attachConfirmationQuote(rejectBody, ctx) {
+  if (!rejectBody || rejectBody.ok) return rejectBody;
+  if (rejectBody.code !== 'odds_changed' && rejectBody.code !== 'line_changed') return rejectBody;
+  try {
+    var rawLegs = confirmationQuoteLib.legsFromConfirmReject(rejectBody);
+    var enriched = confirmationQuoteLib.enrichLegsFromRequest(rawLegs, ctx.legs || []);
+    var minted = confirmationQuoteLib.mintConfirmationQuote({
+      secret: SESSION_SECRET,
+      clubId: ctx.clubId,
+      playerId: ctx.playerId,
+      stake: ctx.stake,
+      legs: enriched,
+      nowMs: ctx.nowMs || Date.now()
+    });
+    if (minted && minted.token) {
+      rejectBody.confirmationQuote = minted.token;
+      rejectBody.confirmationQuoteExpiresAt = minted.expiresAt;
+    }
+  } catch (cqErr) {
+    console.warn('[bets/place] confirmation quote mint failed:', cqErr && cqErr.message);
+  }
+  return rejectBody;
 }
 
 // Wire snapshot upsert into live cache poll
@@ -14711,10 +14783,43 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     let serverPayout = null;
     let serverProfit = null;
 
+    // Optional short-TTL confirmation quote from a prior odds_changed /
+    // line_changed response. Never trusts client oddsAccepted — only a
+    // server-minted HMAC quote can commit a previously revealed price.
+    let quoteLegByIndex = null;
+    let verifiedQuotePayload = null;
+    if (req.body && req.body.confirmationQuote) {
+      const qv = confirmationQuoteLib.verifyConfirmationQuote(req.body.confirmationQuote, {
+        secret: SESSION_SECRET,
+        clubId: clubId,
+        playerId: playerId,
+        stake: stakeAmt,
+        legs: legsArr,
+        nowMs: nowMs
+      });
+      if (!qv.ok) {
+        console.log('[bets/place] confirmation quote rejected:', qv.code, qv.reason || '-');
+        // Expired / consumed / invalid → fall through to normal snapshot path
+        // (fresh resolve). Do not place on a bad quote.
+        if (qv.code === 'confirmation_quote_expired' || qv.code === 'confirmation_quote_consumed') {
+          // Continue without quote — may re-emit odds_changed with a new quote.
+        } else {
+          // Tamper / scope mismatch: ignore quote, still re-resolve.
+        }
+      } else {
+        quoteLegByIndex = qv.legByIndex;
+        verifiedQuotePayload = qv.payload;
+        console.log('[bets/place] confirmation quote accepted jti=' +
+          (qv.payload && qv.payload.jti) + ' legs=' + Object.keys(qv.legByIndex).length);
+      }
+    }
+
     // Snapshot validation is unconditional — oddsAccepted is a UI-only signal
     // and must never bypass server authority over payout calculation.
     // A client sending { oddsAccepted: true, payout: 9999 } gets no special treatment.
-    const payoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, nowMs, oddsChangePolicy);
+    // A valid confirmationQuote may commit a previously server-quoted price.
+    const payoutResult = await _recalcPayoutFromSnapshots(
+      sb, stakeAmt, legsArr, nowMs, oddsChangePolicy, quoteLegByIndex);
     if (payoutResult && !payoutResult.ok) {
       const httpStatus = payoutResult.code==='odds_service_unavailable'?503
         : (payoutResult.code==='odds_changed'
@@ -14785,14 +14890,21 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
             };
           })
         : undefined;
-      return res.status(httpStatus).json(Object.assign({
+      const _rejectBody = _attachConfirmationQuote(Object.assign({
         ok:false,
         oddsChangePolicy: oddsChangePolicy,
         requiresConfirmation: !!(payoutResult.requiresConfirmation
           || payoutResult.code === 'odds_changed'
           || payoutResult.code === 'line_changed')
       }, payoutResult,
-        _updatedLegs ? { updatedLegs: _updatedLegs } : {}));
+        _updatedLegs ? { updatedLegs: _updatedLegs } : {}), {
+        clubId: clubId,
+        playerId: playerId,
+        stake: stakeAmt,
+        legs: legsArr,
+        nowMs: nowMs
+      });
+      return res.status(httpStatus).json(_rejectBody);
     }
     if (payoutResult && payoutResult.ok) {
       // Server payout is always authoritative — client payout value is ignored.
@@ -14877,7 +14989,10 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
     // balance/risk/conflict gates and immediately before place_bet_tx so a
     // live market move/suspension between the first check and the money RPC
     // still rejects without ticket, ledger, or HAB mutation.
-    const finalPayoutResult = await _recalcPayoutFromSnapshots(sb, stakeAmt, legsArr, Date.now(), oddsChangePolicy);
+    // When a verified confirmationQuote is present, price commits to the
+    // quoted accepted odds (identity/line/availability still rechecked).
+    const finalPayoutResult = await _recalcPayoutFromSnapshots(
+      sb, stakeAmt, legsArr, Date.now(), oddsChangePolicy, quoteLegByIndex);
     if (finalPayoutResult && !finalPayoutResult.ok) {
       const httpStatus = finalPayoutResult.code==='odds_service_unavailable'?503
         : (finalPayoutResult.code==='odds_changed'
@@ -14894,14 +15009,21 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         clubId,
         playerId
       }));
-      return res.status(httpStatus).json(Object.assign({
+      const _finalReject = _attachConfirmationQuote(Object.assign({
         ok:false,
         finalRecheck:true,
         oddsChangePolicy: oddsChangePolicy,
         requiresConfirmation: !!(finalPayoutResult.requiresConfirmation
           || finalPayoutResult.code === 'odds_changed'
           || finalPayoutResult.code === 'line_changed')
-      }, finalPayoutResult));
+      }, finalPayoutResult), {
+        clubId: clubId,
+        playerId: playerId,
+        stake: stakeAmt,
+        legs: legsArr,
+        nowMs: Date.now()
+      });
+      return res.status(httpStatus).json(_finalReject);
     }
     if (finalPayoutResult && finalPayoutResult.ok) {
       legsArr = finalPayoutResult.legs;
@@ -15007,6 +15129,10 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
             available:rrRpcResult.available, stake:stakeAmt });
         }
         return res.status(400).json({ ok:false, error:rrRpcResult.error||'rr_placement_failed' });
+      }
+
+      if (verifiedQuotePayload) {
+        try { confirmationQuoteLib.consumeConfirmationQuote(verifiedQuotePayload); } catch (_cq) {}
       }
 
       // Insert ticket_legs for all combo tickets.
@@ -15234,6 +15360,11 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         return res.status(400).json({ ok:false, error:'insufficient_balance',
           available:rpcResult.available, stake:stakeAmt });
       return res.status(400).json({ ok:false, error:rpcResult.error||'placement_failed' });
+    }
+
+    // Money mutation succeeded — consume confirmation quote (single-use).
+    if (verifiedQuotePayload) {
+      try { confirmationQuoteLib.consumeConfirmationQuote(verifiedQuotePayload); } catch (_cq) {}
     }
 
     // 6b. Insert ticket_legs AFTER the parent ticket exists so the
