@@ -130,4 +130,76 @@ describe('ncaaf-team-logos resolve', () => {
     expect(VERIFIED_ALIASES['Ole Miss']).toBe('Ole Miss Rebels');
     expect(VERIFIED_ALIASES.UNLV).toBe('UNLV Rebels');
   });
+
+  test('FIU Panthers and San Jose State Spartans alias fixes', () => {
+    const withFiu = buildResolverIndex(SAMPLE.concat([
+      row(2229, 'Florida International Panthers', ['FIU', 'Florida International'], {
+        abbreviation: 'FIU', location: 'Florida International'
+      }),
+      row(23, 'San José State Spartans', ['San Jose State', 'SJSU'], {
+        abbreviation: 'SJSU', location: 'San José State'
+      })
+    ]));
+    expect(resolveTeamLogo('FIU Panthers', withFiu).row.provider_team_id).toBe('2229');
+    expect(resolveTeamLogo('FIU', withFiu).row.provider_team_id).toBe('2229');
+    expect(resolveTeamLogo('San Jose State Spartans', withFiu).row.provider_team_id).toBe('23');
+    expect(resolveTeamLogo('San Jose State', withFiu).row.provider_team_id).toBe('23');
+  });
+
+  test('FCS shortDisplayName aliases resolve when seeded', () => {
+    const fcs = buildResolverIndex([
+      row(2000, 'Abilene Christian Wildcats', ['Abilene Chrstn', 'ACU'], {
+        abbreviation: 'ACU', location: 'Abilene Christian', classification: 'fcs'
+      }),
+      row(2110, 'Central Arkansas Bears', ['C Arkansas', 'CARK'], {
+        abbreviation: 'CARK', location: 'Central Arkansas', classification: 'fcs'
+      }),
+      row(2717, 'Western Carolina Catamounts', ['W Carolina', 'WCU'], {
+        abbreviation: 'WCU', location: 'Western Carolina', classification: 'fcs'
+      })
+    ]);
+    expect(resolveTeamLogo('Abilene Chrstn', fcs).row.provider_team_id).toBe('2000');
+    expect(resolveTeamLogo('C Arkansas', fcs).row.provider_team_id).toBe('2110');
+    expect(resolveTeamLogo('W Carolina', fcs).row.provider_team_id).toBe('2717');
+  });
+
+  test('buildAliasesForTeam adds abbrev+mascot style labels', () => {
+    const { buildAliasesForTeam } = require('../lib/ncaaf-team-logos');
+    const team = {
+      id: '2229',
+      displayName: 'Florida International Panthers',
+      shortDisplayName: 'FIU',
+      abbreviation: 'FIU',
+      location: 'Florida International',
+      nickname: 'FIU',
+      name: 'Panthers'
+    };
+    const aliases = buildAliasesForTeam(team, [team]);
+    expect(aliases).toEqual(expect.arrayContaining(['FIU Panthers', 'FIU']));
+  });
+
+  test('dedupeTeamsById keeps first occurrence', () => {
+    const { dedupeTeamsById } = require('../lib/ncaaf-team-logos');
+    const out = dedupeTeamsById([
+      { id: '16', displayName: 'A' },
+      { id: '16', displayName: 'B' },
+      { id: '2449', displayName: 'C' }
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0].displayName).toBe('A');
+  });
+
+  test('catalog recovery aliases resolve', () => {
+    const idx = buildResolverIndex(SAMPLE.concat([
+      row(2026, 'App State Mountaineers', ['App State'], { abbreviation: 'APP' }),
+      row(2433, 'UL Monroe Warhawks', ['UL Monroe'], { abbreviation: 'ULM' }),
+      row(2545, 'SE Louisiana Lions', ['SE Louisiana'], { abbreviation: 'SELA', classification: 'fcs' }),
+      row(2900, 'St. Thomas-Minnesota Tommies', ['St. Thomas-Minnesota'], { abbreviation: 'STMN', classification: 'fcs' })
+    ]));
+    expect(resolveTeamLogo('Appalachian State Mountaineers', idx).row.provider_team_id).toBe('2026');
+    expect(resolveTeamLogo('Louisiana-Monroe Warhawks', idx).row.provider_team_id).toBe('2433');
+    expect(resolveTeamLogo('Southeast Louisiana', idx).row.provider_team_id).toBe('2545');
+    expect(resolveTeamLogo('St. Thomas', idx).row.provider_team_id).toBe('2900');
+    expect(resolveTeamLogo('West Florida', idx).status).toBe('unresolved');
+  });
 });
