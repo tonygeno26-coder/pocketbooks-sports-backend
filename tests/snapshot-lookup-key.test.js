@@ -142,8 +142,8 @@ test('verify path uses pickClean for identity and selection_key query', function
     'must pass pickClean into _normalizeLegIdentity so canonical key is not miami_marlins_to_win');
   assert(indexSource.includes(".eq('selection_key', pickForLookup)"),
     'legacy query must use pickForLookup (cleaned), not raw pick');
-  assert(indexSource.includes('_lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup)'),
-    'live-cache lookup must use cleaned pickForLookup');
+  assert(indexSource.includes('_lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup, cacheOpts)'),
+    'live-cache lookup must use cleaned pickForLookup + line opts');
 });
 
 test('mlb short prefix expands to baseball_mlb Owls key', function() {
@@ -185,9 +185,16 @@ test('moneyline To Win suffix is stripped for selection_key', function() {
 });
 
 test('totals pick strips the numeric line for selection_key over/under', function() {
+  // Side-only normalize still strips trailing points for moneyline-style helpers;
+  // line-bearing snapshot keys re-attach via _buildLegacySelectionKey (over:8.5).
   assertEq(_normalizePickForSnapshotLookup('Over 9'), 'over');
   assertEq(_normalizePickForSnapshotLookup('Under 8.5'), 'under');
   assertEq(_normalizePickForSnapshotLookup('Over 8'), 'over');
+});
+
+test('live-cache lookup receives line opts for alternate isolation', function() {
+  assert(indexSource.includes('_lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup, cacheOpts)'),
+    'live-cache lookup must pass line opts so Over 8.5 ≠ Over 10');
 });
 
 test('spread pick strips the point line', function() {
@@ -329,11 +336,25 @@ test('place-bet validates the snapshot contract fields including gameId', functi
 });
 
 test('moneyline vs total cannot share a line-flex prefix', function() {
-  assert(indexSource.includes("ident.marketType === MARKET_TYPES.TOTAL"),
-    'line-flex must be gated on total/spread market types');
-  assert(indexSource.includes('canonical_line_flex'), 'line-flex strategy name missing');
-  assert(!/like\('canonical_selection_key', '%/.test(indexSource),
-    'must not wildcard the whole selection key (would mix moneyline with totals)');
+  // P1: canonical_line_flex removed — exact line identity only. Neighboring
+  // alternates must not resolve via LIKE over:% / under:%.
+  assert(!indexSource.includes("matchStrategy = 'canonical_line_flex'"),
+    'canonical_line_flex must be removed (alternate lines are distinct wagers)');
+  assert(!/\.like\('canonical_selection_key'/.test(indexSource),
+    'must not LIKE-match canonical_selection_key (collapses alternates)');
+});
+
+test('legacy selection_key includes line for totals and spreads', function() {
+  assert(indexSource.includes('function _buildLegacySelectionKey'),
+    'must build line-bearing legacy selection keys');
+  assert(indexSource.includes('function _formatPointLineForKey'),
+    'must normalize 8.5 / 8.50 identically');
+  assert(indexSource.includes("reason: 'selected_line_unavailable'") ||
+    indexSource.includes('reason: \'selected_line_unavailable\'') ||
+    indexSource.includes("reason: \"selected_line_unavailable\"") ||
+    indexSource.includes("reason: 'selected_line_unavailable'") ||
+    /selected_line_unavailable/.test(indexSource),
+    'exact line miss must fail closed as selected_line_unavailable');
 });
 
 console.log('\nSnapshot lookup key tests: ' + _pass + ' passed, ' + _fail + ' failed');

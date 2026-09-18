@@ -5948,13 +5948,78 @@ function _buildCanonicalMarketKey(input) {
   return `${gameKey}|${mt}`;
 }
 
+// Stable numeric line for identity keys. 8.5 / 8.50 / "8.50" → "8.5".
+// Odds are NEVER part of identity — only the point line.
+function _normalizePointLineValue(line) {
+  if (line == null || line === '') return null;
+  const n = typeof line === 'number' ? line : parseFloat(line);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 10000) / 10000;
+}
+
+function _formatPointLineForKey(line) {
+  const n = _normalizePointLineValue(line);
+  return n == null ? null : String(n);
+}
+
+function _pointLinesEqual(a, b) {
+  const na = _normalizePointLineValue(a);
+  const nb = _normalizePointLineValue(b);
+  if (na == null || nb == null) return false;
+  return Math.abs(na - nb) < 0.000001;
+}
+
+function _isLineBearingMarketType(marketTypeOrLabel) {
+  const mt = _coerceMarketType(marketTypeOrLabel) || String(marketTypeOrLabel || '').toLowerCase();
+  return mt === MARKET_TYPES.SPREAD || mt === MARKET_TYPES.TOTAL ||
+    mt === MARKET_TYPES.TEAM_TOTAL || mt === MARKET_TYPES.PLAYER_PROP ||
+    mt === MARKET_TYPES.PERIOD_SPREAD || mt === MARKET_TYPES.PERIOD_TOTAL ||
+    mt === 'spread' || mt === 'total' || mt === 'team_total' || mt === 'player_prop' ||
+    mt === 'period_spread' || mt === 'period_total';
+}
+
+// Legacy selection_key MUST include the line for line-bearing markets so
+// simultaneous alternates (Over 8.5 + Over 10) coexist under the upsert
+// conflict target (canonical_game_key, market_key, selection_key).
+// Shape mirrors canonical where practical:
+//   total / team_total / period_total : over:8.5 | under:8.5
+//   spread / period_spread            : team name:−1.5
+//   player_prop                       : player over 5.5  (existing grading shape)
+//   moneyline                         : team name only
+function _buildLegacySelectionKey(input) {
+  if (!input) return '';
+  const mt = _coerceMarketType(input.marketType || input.market) ||
+    String(input.marketType || input.market || '').toLowerCase();
+  const ln = _formatPointLineForKey(input.line);
+  if (mt === MARKET_TYPES.PLAYER_PROP || mt === 'player_prop') {
+    const player = String(input.playerName || input.player || '').trim().toLowerCase();
+    const side = String(input.overUnder || input.side || '').toLowerCase();
+    if (!player) return String(input.teamOrSide || input.outcomeName || '').toLowerCase();
+    return `${player} ${side} ${ln != null ? ln : ''}`.trim();
+  }
+  if (mt === MARKET_TYPES.TOTAL || mt === MARKET_TYPES.PERIOD_TOTAL ||
+      mt === MARKET_TYPES.TEAM_TOTAL || mt === 'total' || mt === 'team_total' ||
+      mt === 'period_total') {
+    const raw = String(input.overUnder || input.side || input.teamOrSide ||
+      input.outcomeName || '').toLowerCase();
+    const ou = raw.indexOf('under') >= 0 ? 'under' : 'over';
+    return ln != null ? `${ou}:${ln}` : ou;
+  }
+  if (mt === MARKET_TYPES.SPREAD || mt === MARKET_TYPES.PERIOD_SPREAD ||
+      mt === 'spread' || mt === 'period_spread') {
+    const team = String(input.teamOrSide || input.team || input.outcomeName || '')
+      .toLowerCase().trim();
+    return ln != null && team ? `${team}:${ln}` : team;
+  }
+  return String(input.teamOrSide || input.team || input.outcomeName || '').toLowerCase();
+}
+
 function _buildCanonicalSelectionKey(input) {
   if (!input) return null;
   const mt = _coerceMarketType(input.marketType || input.market);
   if (!mt) return null;
   const side = String(input.side || input.overUnder || input.teamOrSide || '').toLowerCase();
-  const line = (input.line != null && Number.isFinite(parseFloat(input.line)))
-                  ? parseFloat(input.line) : null;
+  const lineStr = _formatPointLineForKey(input.line);
   if (mt === MARKET_TYPES.MONEYLINE || mt === MARKET_TYPES.PERIOD_MONEYLINE) {
     // Strip lobby suffixes before slugifying — otherwise
     // "Miami Marlins To Win" becomes "miami_marlins_to_win" and misses
@@ -5964,20 +6029,20 @@ function _buildCanonicalSelectionKey(input) {
   }
   if (mt === MARKET_TYPES.SPREAD || mt === MARKET_TYPES.PERIOD_SPREAD) {
     const team = _normalizePlayerName(input.team || input.teamOrSide || '');
-    if (line == null || !team) return null;
-    return `${team}:${line}`;
+    if (lineStr == null || !team) return null;
+    return `${team}:${lineStr}`;
   }
   if (mt === MARKET_TYPES.TOTAL || mt === MARKET_TYPES.PERIOD_TOTAL ||
       mt === MARKET_TYPES.TEAM_TOTAL) {
     const ou = side.indexOf('under') >= 0 ? 'under' : 'over';
-    if (line == null) return null;
-    return `${ou}:${line}`;
+    if (lineStr == null) return null;
+    return `${ou}:${lineStr}`;
   }
   if (mt === MARKET_TYPES.PLAYER_PROP) {
     const player = _normalizePlayerName(input.player || input.playerName || '');
-    if (!player || line == null) return null;
+    if (!player || lineStr == null) return null;
     const ou = side.indexOf('under') >= 0 ? 'under' : 'over';
-    return `${player}:${ou}:${line}`;
+    return `${player}:${ou}:${lineStr}`;
   }
   return null;
 }
@@ -6198,26 +6263,32 @@ function _buildSnapshotRow(entry, outcome, opts) {
   }
 
   // ----- Selection key for the LEGACY column (kept for grading/back-compat) -----
+  // LINE is part of wager identity for totals/spreads/props. Alternate lines
+  // (Over 8.5 vs Over 10) MUST NOT share selection_key or upsert last-write-wins.
   let legacySelectionKey, legacyMarketKey, rawOdds, oddsAmerican, line;
   if (isOwlsShape) {
-    // For Owls props, the legacy selection_key carries the player+side+line
-    // so old grading paths that haven't been migrated yet can still locate
-    // the row by string match.
-    if (entry.marketType === 'player_prop' && entry.playerName) {
-      const side = (entry.overUnder || '').toLowerCase();
-      const ln   = entry.line != null ? entry.line : '';
-      legacySelectionKey = `${entry.playerName} ${side} ${ln}`.trim().toLowerCase();
-    } else {
-      legacySelectionKey = String(entry.teamOrSide || '').toLowerCase();
-    }
+    line            = entry.line != null ? entry.line : null;
+    legacySelectionKey = _buildLegacySelectionKey({
+      marketType: entry.marketType,
+      teamOrSide: entry.teamOrSide,
+      playerName: entry.playerName,
+      overUnder:  entry.overUnder,
+      side:       entry.overUnder || entry.teamOrSide,
+      line:       line
+    });
     legacyMarketKey = String(entry.marketType || '').toLowerCase();
     rawOdds         = entry.odds;
-    line            = entry.line != null ? entry.line : null;
   } else {
-    legacySelectionKey = String(outcome.name || '').toLowerCase();
+    line               = outcome.point != null ? outcome.point : null;
+    legacySelectionKey = _buildLegacySelectionKey({
+      marketType:  entry.market,
+      outcomeName: outcome.name,
+      teamOrSide:  outcome.name,
+      side:        outcome.name,
+      line:        line
+    });
     legacyMarketKey    = String(entry.market || '').toLowerCase();
     rawOdds            = outcome.price;
-    line               = outcome.point != null ? outcome.point : null;
   }
 
   const rawOddsNum = Number(rawOdds);
@@ -6341,51 +6412,71 @@ function _getLiveCacheAgeMs() {
 // When DB snapshots are stale/missing but the in-memory poll cache is fresh,
 // derive a snapshot-shaped object for placement verification (fail-closed on
 // stale cache — never falls back to client odds).
-function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
+function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup, opts) {
   const cache = typeof LIVE_MARKET_CACHE !== 'undefined' ? LIVE_MARKET_CACHE : null;
   if (!cache || !cache.updatedAt || !cache.gameCount) return null;
   const cacheAgeMs = _getLiveCacheAgeMs();
   if (!Number.isFinite(cacheAgeMs) || cacheAgeMs > PREGAME_SNAPSHOT_TTL_MS) return null;
 
-  const pickNorm = _normalizePickForSnapshotLookup(pickForLookup);
+  opts = opts || {};
+  const wantLine = _normalizePointLineValue(opts.line);
   const marketNorm = (marketForLookup || 'moneyline').toLowerCase();
+  const lineBearing = _isLineBearingMarketType(marketNorm);
+  // pickForLookup may already be "over:8.5" / "team:-1.5". For matching we
+  // compare the full legacy key when line-bearing; otherwise strip trailing numbers.
+  const pickRaw = String(pickForLookup || '').toLowerCase().trim();
+  const pickNorm = lineBearing ? pickRaw : _normalizePickForSnapshotLookup(pickForLookup);
   const mapKey = cKey + '|' + marketNorm;
   const byKey = cache.marketsByCanonicalKey || {};
 
   function snapFromEntry(entry, outcome) {
     if (!entry) return null;
     const isOwls = !!entry.marketType;
-    let legacySelectionKey, rawOdds;
+    let legacySelectionKey, rawOdds, pointLine;
     if (isOwls) {
-      if (entry.marketType === 'player_prop' && entry.playerName) {
-        const side = (entry.overUnder || '').toLowerCase();
-        const ln   = entry.line != null ? entry.line : '';
-        legacySelectionKey = `${entry.playerName} ${side} ${ln}`.trim().toLowerCase();
-      } else {
-        legacySelectionKey = String(entry.teamOrSide || '').toLowerCase();
-      }
       if (String(entry.marketType || '').toLowerCase() !== marketNorm) return null;
+      pointLine = entry.line != null ? entry.line : null;
+      legacySelectionKey = _buildLegacySelectionKey({
+        marketType: entry.marketType,
+        teamOrSide: entry.teamOrSide,
+        playerName: entry.playerName,
+        overUnder:  entry.overUnder,
+        side:       entry.overUnder || entry.teamOrSide,
+        line:       pointLine
+      });
       rawOdds = entry.odds;
     } else if (outcome) {
-      legacySelectionKey = String(outcome.name || '').toLowerCase();
+      pointLine = outcome.point != null ? outcome.point : null;
+      legacySelectionKey = _buildLegacySelectionKey({
+        marketType:  entry.market,
+        outcomeName: outcome.name,
+        teamOrSide:  outcome.name,
+        side:        outcome.name,
+        line:        pointLine
+      });
       rawOdds = outcome.price;
     } else {
       return null;
     }
-    if (_normalizePickForSnapshotLookup(legacySelectionKey) !== pickNorm) return null;
+    const selCmp = lineBearing
+      ? String(legacySelectionKey || '').toLowerCase().trim()
+      : _normalizePickForSnapshotLookup(legacySelectionKey);
+    if (selCmp !== pickNorm) return null;
+    // Defense in depth: line-bearing must also match numeric point when known.
+    if (lineBearing && wantLine != null &&
+        !_pointLinesEqual(wantLine, pointLine)) {
+      return null;
+    }
     const oddsAmerican = Math.round(_toAmericanOdds(Number(rawOdds)));
     if (!Number.isFinite(oddsAmerican) || oddsAmerican === 0) return null;
     const oddsDecimal = _americanToDecimalOdds(oddsAmerican);
-    const pointLine = isOwls
-      ? (entry.line != null ? entry.line : null)
-      : (outcome && outcome.point != null ? outcome.point : null);
     return {
       odds_american: oddsAmerican,
       odds_decimal: oddsDecimal,
       point_line: pointLine,
       canonical_game_key: entry.canonicalKey || entry.cKey || cKey,
       market_key: marketNorm,
-      selection_key: pickNorm,
+      selection_key: legacySelectionKey,
       fetched_at: cache.updatedAt,
       commence_time: entry.commenceTime || null,
       event_status: entry.gameStatus || null,
@@ -6454,6 +6545,9 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup) {
 function _dedupeSnapshotUpsertRows(rows) {
   // Postgres rejects ON CONFLICT DO UPDATE when a single INSERT batch
   // contains duplicate conflict-target rows. Keep last write wins.
+  // Conflict target is (canonical_game_key, market_key, selection_key).
+  // selection_key for line-bearing markets includes the line (over:8.5), so
+  // simultaneous alternates do not collapse.
   const byKey = new Map();
   let dropped = 0;
   for (let i = 0; i < (rows || []).length; i++) {
@@ -6940,9 +7034,43 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
   let pickForLookup = _normalizePickForSnapshotLookup(pickClean);
   const owlsSportForNorm = _mapToOwlsSport(_oddsApiSportKey(leg.sport || leg.league || '')) || 'mlb';
   const isTeamMarketLookup = marketForLookup === 'moneyline' || marketForLookup === 'spread' ||
-    marketForLookup === 'first_half_moneyline' || marketForLookup === 'first_half_spread';
+    marketForLookup === 'first_half_moneyline' || marketForLookup === 'first_half_spread' ||
+    marketForLookup === MARKET_TYPES.PERIOD_SPREAD || marketForLookup === MARKET_TYPES.PERIOD_MONEYLINE;
   if (isTeamMarketLookup && pickForLookup) {
     pickForLookup = (await _normalizeTeamName(pickForLookup, owlsSportForNorm)).toLowerCase();
+  }
+  // LINE is part of legacy selection identity for totals/spreads/props.
+  // Attach the exact submitted line so alternate lines do not collide on
+  // Tier 2 / date_flex / provider_game_id / live_cache lookups.
+  const submittedLineForLookup = _extractSubmittedPointLine(
+    Object.assign({}, leg, { pick: pickClean })
+  );
+  if (_isLineBearingMarketType(marketForLookup) && Number.isFinite(submittedLineForLookup)) {
+    const lnKey = _formatPointLineForKey(submittedLineForLookup);
+    if (marketForLookup === MARKET_TYPES.TOTAL || marketForLookup === MARKET_TYPES.PERIOD_TOTAL ||
+        marketForLookup === MARKET_TYPES.TEAM_TOTAL || marketForLookup === 'total' ||
+        marketForLookup === 'team_total' || marketForLookup === 'period_total' ||
+        /total/.test(marketForLookup)) {
+      const ou = (pickForLookup.indexOf('under') >= 0 || /\bunder\b/i.test(pickClean))
+        ? 'under' : 'over';
+      pickForLookup = `${ou}:${lnKey}`;
+    } else if (marketForLookup === MARKET_TYPES.SPREAD || marketForLookup === MARKET_TYPES.PERIOD_SPREAD ||
+        marketForLookup === 'spread' || marketForLookup === 'period_spread' ||
+        /spread|run.?line|puck.?line/.test(marketForLookup)) {
+      pickForLookup = `${pickForLookup}:${lnKey}`;
+    } else if (marketForLookup === MARKET_TYPES.PLAYER_PROP || marketForLookup === 'player_prop') {
+      // Props already embed player+side+line in the pick/legacy key.
+      pickForLookup = _buildLegacySelectionKey({
+        marketType: MARKET_TYPES.PLAYER_PROP,
+        playerName: leg.playerName || leg.player || null,
+        overUnder: leg.side || leg.overUnder || null,
+        line: submittedLineForLookup
+      }) || pickClean.toLowerCase();
+      if (!leg.playerName && !leg.player) {
+        // Fall back to normalized full pick (includes line text).
+        pickForLookup = pickClean.toLowerCase().replace(/\s+/g, ' ').trim();
+      }
+    }
   }
   // bypassOk is NEVER true in production — snapshot fallback to client odds
   // must be impossible even if DEV_AUTH_BYPASS is accidentally set in Railway env.
@@ -7005,50 +7133,18 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
     }
   }
 
-  // Tier 1b: totals/spreads — exact line in canonical_selection_key missed
-  // (lobby Over 9 vs snapshot over:8.5). Same market + same side only; never
-  // cross moneyline. Caller still applies exact odds + exact line checks.
-  if (!snap && cmk && (ident.marketType === MARKET_TYPES.TOTAL
-      || ident.marketType === MARKET_TYPES.PERIOD_TOTAL
-      || ident.marketType === MARKET_TYPES.TEAM_TOTAL
-      || ident.marketType === MARKET_TYPES.SPREAD
-      || ident.marketType === MARKET_TYPES.PERIOD_SPREAD)) {
-    const sidePrefix = (csk && String(csk).indexOf('under') === 0) ? 'under:'
-      : (csk && String(csk).indexOf(':') >= 0) ? String(csk).slice(0, String(csk).lastIndexOf(':') + 1)
-      : (pick.indexOf('under') >= 0 ? 'under:' : null);
-    // Totals: over:/under:. Spreads: team_slug:  — only flex the numeric suffix.
-    const likePrefix = sidePrefix || (ident.marketType === MARKET_TYPES.TOTAL
-      || ident.marketType === MARKET_TYPES.PERIOD_TOTAL
-      || ident.marketType === MARKET_TYPES.TEAM_TOTAL
-        ? (pick.indexOf('under') >= 0 ? 'under:' : 'over:')
-        : null);
-    if (likePrefix) {
-      try {
-        const { data, error } = await sb.from('odds_snapshots').select('*')
-          .eq('canonical_market_key', cmk)
-          .like('canonical_selection_key', likePrefix + '%')
-          .limit(4);
-        if (error) throw error;
-        if (data && data[0]) {
-          snap = data[0];
-          matchStrategy = 'canonical_line_flex';
-          _logSnapshotLookupHit('canonical_line_flex', snap,
-            'cmk=' + cmk + ' searchedCsk=' + csk + ' likePrefix=' + likePrefix);
-        }
-      } catch (flexErr) {
-        const msg = (flexErr && flexErr.message) || '';
-        if (!/canonical_market_key|canonical_selection_key/.test(msg)) {
-          console.warn('[snapshot] canonical line-flex lookup error:', msg);
-        }
-      }
-    }
-  }
+  // Tier 1b REMOVED (P1 alternate-line identity): canonical_line_flex used to
+  // LIKE-match over:% / under:% / team:% and take an arbitrary alternate when
+  // the exact line missed (Over 8.5 → Over 10). Simultaneous alternates are
+  // distinct wagers — fail closed below when the exact line is unavailable.
+  // Authoritative provider replacement identity is NOT implemented; mere
+  // existence of another alternate must never trigger line_changed.
 
   // Tier 2: legacy lookup by (canonical_game_key, market_key, selection_key).
-  // selection_key in the DB stores only the team/side name with no spread:
-  //   e.g. "toronto blue jays"  (NOT "toronto blue jays +1.5")
-  //   e.g. "over"               (NOT "over 9")
-  //   e.g. "colorado rockies"   (NOT "colorado rockies to win")
+  // selection_key for line-bearing markets includes the exact line:
+  //   e.g. "over:8.5"           (NOT bare "over")
+  //   e.g. "toronto blue jays:-1.5"
+  //   e.g. "colorado rockies"   (moneyline — no line)
   if (!snap) {
     try {
       for (let ki = 0; ki < keyCandidates.length; ki++) {
@@ -7125,8 +7221,9 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
   if (!snap || _classifyMarket(snap, nowMs) === 'stale') {
     let cacheSnap = null;
     let cacheKeyUsed = null;
+    const cacheOpts = { line: Number.isFinite(submittedLineForLookup) ? submittedLineForLookup : null };
     for (let ki = 0; ki < keyCandidates.length; ki++) {
-      cacheSnap = _lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup);
+      cacheSnap = _lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup, cacheOpts);
       if (cacheSnap) { cacheKeyUsed = keyCandidates[ki]; break; }
     }
     if (cacheSnap) {
@@ -7147,6 +7244,19 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
       console.warn('[snapshot] MISSING — DEV FALLBACK for', leg.pick);
       return { ok:true, devFallback:true, warn:'odds_snapshot_missing',
                acceptedOddsAmerican:parseInt(leg.odds,10)||0, acceptedOddsDecimal:null, isLive:false };
+    }
+    // Line-bearing exact miss: selected line unavailable (do NOT reprice to
+    // a neighboring alternate). Clean fail-closed for Confirm Wager.
+    if (_isLineBearingMarketType(ident.marketType || marketForLookup) &&
+        Number.isFinite(submittedLineForLookup)) {
+      return {
+        ok: false,
+        code: 'market_unavailable',
+        reason: 'selected_line_unavailable',
+        leg: leg.pick,
+        submittedPointLine: submittedLineForLookup,
+        userMessage: 'Selected line is no longer available.'
+      };
     }
     return { ok:false, code:'odds_service_unavailable', reason:'snapshot_missing', leg:leg.pick };
   }
@@ -7215,31 +7325,21 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
   const requiresLine = _marketRequiresPointLineExact(ident.marketType || market, market);
   const submittedLine = requiresLine ? _extractSubmittedPointLine(leg) : NaN;
 
-  // LINE vs PRICE: identity first. Flex-matched different points are a different
-  // wager — never treat as mere odds_changed, even under Accept All.
+  // LINE vs PRICE: identity first. Different points are a different wager —
+  // never treat as mere odds_changed, even under Accept All. Neighboring
+  // alternates must not reach this point (exact identity lookup only).
   if (requiresLine) {
     if (!Number.isFinite(submittedLine) || !Number.isFinite(serverLine) ||
-        Math.abs(submittedLine - serverLine) > 0.000001) {
+        !_pointLinesEqual(submittedLine, serverLine)) {
       return oddsChangePolicyLib.buildLineChangedPayload({
         leg: leg.pick,
         submittedPointLine: Number.isFinite(submittedLine) ? submittedLine : null,
         serverPointLine: Number.isFinite(serverLine) ? serverLine : null,
         submittedOdds: Number.isFinite(submittedOdds) ? submittedOdds : null,
         serverOdds: Number.isFinite(serverOdds) ? serverOdds : null,
-        reason: matchStrategy === 'canonical_line_flex'
-          ? 'market_identity_line_mismatch'
-          : 'exact_line_required'
+        reason: 'exact_line_required'
       });
     }
-  } else if (matchStrategy === 'canonical_line_flex') {
-    // Non-point markets should never resolve via line-flex.
-    return {
-      ok:false,
-      code:'market_changed',
-      leg:leg.pick,
-      reason:'unresolvable_market_identity',
-      userMessage:'Market temporarily unavailable'
-    };
   }
 
   if (rawSubmittedOdds == null || rawSubmittedOdds === '' ||
@@ -7328,11 +7428,13 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
 function _marketRequiresPointLineExact(marketType, market) {
   const m = String(marketType||market||'').toLowerCase();
   return m === MARKET_TYPES.SPREAD || m === MARKET_TYPES.TOTAL ||
+    m === MARKET_TYPES.TEAM_TOTAL || m === MARKET_TYPES.PLAYER_PROP ||
     m === MARKET_TYPES.PERIOD_SPREAD || m === MARKET_TYPES.PERIOD_TOTAL ||
     m.includes('spread') || m.includes('total') ||
     m.includes('run line') || m.includes('puck line') ||
     m.includes('alternate spread') || m.includes('alternate total') ||
-    m.includes('alt spread') || m.includes('alt total');
+    m.includes('alt spread') || m.includes('alt total') ||
+    m.includes('player_prop') || m.includes('team_total');
 }
 
 function _extractSubmittedPointLine(leg) {

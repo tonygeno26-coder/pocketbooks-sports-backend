@@ -204,5 +204,31 @@ test('large batch with many dups yields unique conflict set (perf + correctness)
     ' dropped=' + out.dropped + ' ms=' + ms.toFixed(2));
 });
 
+test('simultaneous alternate totals do not collapse under conflict key', function() {
+  const input = [
+    row({
+      market_key: 'total',
+      selection_key: 'over:8.5',
+      odds_american: -108,
+      point_line: 8.5
+    }),
+    row({
+      market_key: 'total',
+      selection_key: 'over:10',
+      odds_american: 167,
+      point_line: 10
+    }),
+    row({
+      market_key: 'total',
+      selection_key: 'under:8.5',
+      odds_american: -112,
+      point_line: 8.5
+    })
+  ];
+  const out = _dedupeSnapshotUpsertRows(input);
+  assertEq(out.dropped, 0);
+  assertEq(out.rows.length, 3);
+});
+
 console.log('\n-- Results: ' + _pass + ' passed, ' + _fail + ' failed --\n');
 if (_fail) process.exit(1);
