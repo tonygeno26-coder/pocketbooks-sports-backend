@@ -140,8 +140,9 @@ test('verify path uses pickClean for identity and selection_key query', function
     'must compute pickClean from raw pick before lookup');
   assert(indexSource.includes('pick: pickClean'),
     'must pass pickClean into _normalizeLegIdentity so canonical key is not miami_marlins_to_win');
-  assert(indexSource.includes(".eq('selection_key', pickForLookup)"),
-    'legacy query must use pickForLookup (cleaned), not raw pick');
+  assert(indexSource.includes(".eq('selection_key', trySel)") ||
+      indexSource.includes(".eq('selection_key', pickForLookup)"),
+    'legacy query must use cleaned pickForLookup / trySel, not raw pick');
   assert(indexSource.includes('_lookupSnapshotFromLiveCache(keyCandidates[ki], marketForLookup, pickForLookup, cacheOpts)'),
     'live-cache lookup must use cleaned pickForLookup + line opts');
 });
@@ -158,6 +159,13 @@ test('hyphenated MLB legacy key maps to Owls display names', function() {
   const db = 'baseball_mlb|Colorado Rockies|Atlanta Braves|2026-08-30';
   const cands = _gameKeyLookupCandidates(lobby);
   assert(cands.indexOf(db) >= 0, 'candidates must include ' + db + ', got ' + JSON.stringify(cands));
+});
+
+test('index expands compound-hyphen golf name candidates', function() {
+  assert(indexSource.includes('function _compoundHyphenGameKeyVariants'),
+    'must expand Neergaard Petersen ↔ Neergaard-Petersen');
+  assert(indexSource.includes('_compoundHyphenGameKeyVariants(p).forEach(add)'),
+    'lookup candidates must include compound-hyphen variants');
 });
 
 test('already-correct Owls key is preserved', function() {

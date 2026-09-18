@@ -6509,12 +6509,15 @@ function _lookupSnapshotFromLiveCache(cKey, marketForLookup, pickForLookup, opts
 
   // Prefix fallback: cache is dated (sport|Away|Home|YYYY-MM-DD) while the
   // searched key may still be empty-dated or a short/hyphenated sibling.
+  // Matchup identity ignores compound-hyphen ↔ space so golf names hit.
   const prefix = _gameKeyPrefixWithoutDate(cKey);
-  if (prefix) {
+  const wantMatchup = _gameKeyMatchupNorm(cKey);
+  if (prefix || wantMatchup) {
     const today = new Date().toISOString().slice(0, 10);
     const keys = Object.keys(byKey).filter(function(k) {
-      return k === cKey || k.indexOf(prefix) === 0 ||
-        _gameKeyPrefixWithoutDate(k) === prefix;
+      if (k === cKey) return true;
+      if (prefix && (k.indexOf(prefix) === 0 || _gameKeyPrefixWithoutDate(k) === prefix)) return true;
+      return !!(wantMatchup && _gameKeyMatchupNorm(k) === wantMatchup);
     });
     keys.sort(function(a, b) {
       const da = String(a).split('|').pop() || '';
@@ -6805,6 +6808,135 @@ function _hyphenateGameKeyTeams(cKey) {
   return parts.join('|');
 }
 
+// Strip combining marks so "Højgaard" / "Hojgaard" share lookup identity.
+// NFD alone does not fold ø/æ/å (atomic codepoints) — map those explicitly.
+function _stripAccentsForKey(s) {
+  return String(s || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/ø/g, 'o').replace(/Ø/g, 'O')
+    .replace(/æ/g, 'ae').replace(/Æ/g, 'AE')
+    .replace(/å/g, 'a').replace(/Å/g, 'A')
+    .replace(/đ/g, 'd').replace(/Đ/g, 'D')
+    .replace(/ł/g, 'l').replace(/Ł/g, 'L');
+}
+
+// Collapse hyphen/underscore/space runs for matchup identity compares.
+function _normalizeMatchupNameToken(s) {
+  return _stripAccentsForKey(s)
+    .toLowerCase()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// sport|away|home identity ignoring compound-hyphen vs space and accents.
+function _gameKeyMatchupNorm(cKey) {
+  const parts = String(cKey || '').split('|');
+  return _normalizeMatchupNameToken(parts[0] || '') + '|'
+    + _normalizeMatchupNameToken(parts[1] || '') + '|'
+    + _normalizeMatchupNameToken(parts[2] || '');
+}
+
+// "Rasmus Neergaard Petersen" ↔ "Rasmus Neergaard-Petersen" (all joint perms).
+// Caps at 4 joints (16 variants) to bound golf/tennis compound surnames.
+function _spaceHyphenNameVariants(name) {
+  const raw = _stripAccentsForKey(String(name || '').trim());
+  if (!raw) return [];
+  const words = raw.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim().split(' ')
+    .filter(Boolean);
+  if (!words.length) return [raw];
+  if (words.length === 1) return [words[0], raw].filter(Boolean);
+  const joints = Math.min(words.length - 1, 4);
+  const max = 1 << joints;
+  const out = [];
+  const seen = {};
+  function add(v) {
+    if (!v || seen[v]) return;
+    seen[v] = true;
+    out.push(v);
+  }
+  add(raw);
+  for (let mask = 0; mask < max; mask++) {
+    let s = words[0];
+    for (let i = 0; i < joints; i++) {
+      s += ((mask >> i) & 1) ? '-' : ' ';
+      s += words[i + 1];
+    }
+    // Preserve any trailing words beyond the capped joint window as spaces.
+    for (let j = joints + 1; j < words.length; j++) s += ' ' + words[j];
+    add(s);
+  }
+  return out;
+}
+
+// Expand a game key with compound-hyphen / space name variants (case preserved).
+function _compoundHyphenGameKeyVariants(cKey) {
+  if (!cKey) return [];
+  const parts = String(cKey).split('|');
+  if (parts.length < 3) return [String(cKey)];
+  const awayVars = _spaceHyphenNameVariants(parts[1]);
+  const homeVars = _spaceHyphenNameVariants(parts[2]);
+  const out = [];
+  const seen = {};
+  function add(k) {
+    if (!k || seen[k]) return;
+    seen[k] = true;
+    out.push(k);
+  }
+  add(String(cKey));
+  for (let a = 0; a < awayVars.length; a++) {
+    for (let h = 0; h < homeVars.length; h++) {
+      const next = parts.slice();
+      next[1] = awayVars[a];
+      next[2] = homeVars[h];
+      add(next.join('|'));
+    }
+  }
+  return out;
+}
+
+// Selection / pick lookup candidates for hyphen↔space + accent gaps.
+// Preserves exact `:line` suffixes (over:8.5 / team:-1.5) — never hyphen-flex the line.
+function _splitSelectionKeyLine(sel) {
+  const raw = String(sel || '');
+  const idx = raw.lastIndexOf(':');
+  if (idx < 0) return { name: raw, lineSuffix: '' };
+  const maybeLine = raw.slice(idx + 1);
+  if (/^[+-]?\d+(\.\d+)?$/.test(maybeLine)) {
+    return { name: raw.slice(0, idx), lineSuffix: ':' + maybeLine };
+  }
+  return { name: raw, lineSuffix: '' };
+}
+
+function _selectionKeyLookupCandidates(pick) {
+  const raw = String(pick || '').trim();
+  if (!raw) return [];
+  const split = _splitSelectionKeyLine(raw);
+  const seen = {};
+  const out = [];
+  function add(v) {
+    const s = String(v || '').trim();
+    if (!s || seen[s]) return;
+    seen[s] = true;
+    out.push(s);
+  }
+  add(raw);
+  add(raw.toLowerCase());
+  _spaceHyphenNameVariants(split.name).forEach(function(v) {
+    add(v + split.lineSuffix);
+    add(String(v).toLowerCase() + split.lineSuffix);
+  });
+  return out;
+}
+
+function _selectionKeysEquivalent(a, b) {
+  const aa = _splitSelectionKeyLine(a);
+  const bb = _splitSelectionKeyLine(b);
+  if (aa.lineSuffix !== bb.lineSuffix) return false;
+  return _normalizeMatchupNameToken(aa.name) === _normalizeMatchupNameToken(bb.name);
+}
+
 // baseball_mlb|... → MLB|... so ticket Owls keys match legacy slug snapshots.
 function _collapseSportPrefixOnGameKey(cKey) {
   if (!cKey) return cKey;
@@ -6842,6 +6974,7 @@ function _gameKeyLookupCandidates(cKey) {
     add(p);
     add(_unhyphenateGameKeyTeams(p));
     add(_hyphenateGameKeyTeams(p));
+    _compoundHyphenGameKeyVariants(p).forEach(add);
   });
   return out;
 }
@@ -6918,6 +7051,104 @@ function _pickDateFlexSnapshotRow(rows, today) {
   return pool[0] || null;
 }
 
+// provider_game_id can collide across prior-day live + fresh upcoming rows
+// (golf matchup ids reused). Prefer preferred/today/upcoming, never ancient live
+// when a fresher upcoming row exists for the same matchup identity.
+function _pickProviderGameIdSnapshotRow(rows, opts) {
+  opts = opts || {};
+  if (!rows || !rows.length) return null;
+  const preferredDate = String(opts.preferredDate || '').slice(0, 10);
+  const today = String(opts.today || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const nowMs = Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+
+  function dateOf(r) {
+    const parts = String((r && r.canonical_game_key) || '').split('|');
+    const d = parts[parts.length - 1] || '';
+    if (/^\d{4}-\d{2}-\d{2}/.test(d)) return d.slice(0, 10);
+    const ct = r && (r.commence_time || r.commenceTime);
+    if (ct) {
+      const ms = new Date(ct).getTime();
+      if (!isNaN(ms)) return new Date(ms).toISOString().slice(0, 10);
+    }
+    return '';
+  }
+  function isLiveRow(r) {
+    if (!r) return false;
+    if (r.event_live === true || r.eventLive === true) return true;
+    const ev = String(r.event_status || r.eventStatus || r.gameStatus || '').toLowerCase();
+    return ev === 'live' || ev === 'in_play' || ev === 'in_progress';
+  }
+  function fetchedMs(r) {
+    const ms = new Date((r && (r.fetched_at || r.fetchedAt)) || 0).getTime();
+    return Number.isFinite(ms) ? ms : 0;
+  }
+  function matchesDate(r, want) {
+    if (!want) return false;
+    const d = dateOf(r);
+    return d === want || (want && String(d).indexOf(want) === 0);
+  }
+  function sortFreshest(a, b) {
+    return fetchedMs(b) - fetchedMs(a);
+  }
+
+  // 1) Preferred event date from leg key / scheduledStart
+  if (preferredDate) {
+    const pref = rows.filter(function(r) { return matchesDate(r, preferredDate); });
+    if (pref.length) {
+      pref.sort(sortFreshest);
+      return pref[0];
+    }
+  }
+  // 2) Today's dated rows
+  if (today) {
+    const todays = rows.filter(function(r) { return matchesDate(r, today); });
+    if (todays.length) {
+      todays.sort(sortFreshest);
+      return todays[0];
+    }
+  }
+  // 3) Prefer non-live / fresher upcoming over ancient live prior-day
+  const nonLive = rows.filter(function(r) { return !isLiveRow(r); });
+  if (nonLive.length) {
+    nonLive.sort(sortFreshest);
+    const bestNonLive = nonLive[0];
+    const bestAny = rows.slice().sort(sortFreshest)[0];
+    if (bestAny && isLiveRow(bestAny) && fetchedMs(bestAny) < fetchedMs(bestNonLive)) {
+      return bestNonLive;
+    }
+    // Ancient live: if best live is older than LIVE TTL and a newer non-live exists
+    if (bestAny && isLiveRow(bestAny)) {
+      const liveAge = nowMs - fetchedMs(bestAny);
+      if (liveAge > LIVE_SNAPSHOT_TTL_MS && fetchedMs(bestNonLive) >= fetchedMs(bestAny)) {
+        return bestNonLive;
+      }
+    }
+    // When no preferred/today match: prefer latest-dated non-live row
+    let latest = '';
+    nonLive.forEach(function(r) {
+      const d = dateOf(r);
+      if (d > latest) latest = d;
+    });
+    if (latest) {
+      const latestRows = nonLive.filter(function(r) { return dateOf(r) === latest; });
+      latestRows.sort(sortFreshest);
+      if (latestRows[0]) return latestRows[0];
+    }
+    return bestNonLive;
+  }
+  // 4) All live / fallback — freshest fetched_at, prefer latest date
+  let latestLiveDate = '';
+  rows.forEach(function(r) {
+    const d = dateOf(r);
+    if (d > latestLiveDate) latestLiveDate = d;
+  });
+  const pool = latestLiveDate
+    ? rows.filter(function(r) { return dateOf(r) === latestLiveDate; })
+    : rows.slice();
+  pool.sort(sortFreshest);
+  return pool[0] || null;
+}
+
 async function _lookupSnapshotByDateFlexPrefix(sb, cKey, marketForLookup, pickForLookup) {
   const prefixes = [];
   const seen = {};
@@ -6933,10 +7164,12 @@ async function _lookupSnapshotByDateFlexPrefix(sb, cKey, marketForLookup, pickFo
     const { data, error } = await sb.from('odds_snapshots').select('*')
       .like('canonical_game_key', prefix + '%')
       .eq('market_key', marketForLookup)
-      .eq('selection_key', pickForLookup)
-      .limit(12);
+      .limit(24);
     if (error) throw error;
-    const picked = _pickDateFlexSnapshotRow(data || [], today);
+    const matched = (data || []).filter(function(r) {
+      return _selectionKeysEquivalent(r && r.selection_key, pickForLookup);
+    });
+    const picked = _pickDateFlexSnapshotRow(matched, today);
     if (picked) return { snap: picked, prefix: prefix };
   }
   return null;
@@ -7108,12 +7341,14 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
 
   // Tier 1: canonical lookup. Skipped when we can't build a structured key
   // (e.g. legacy leg with too little data) — we'll fall back to legacy below.
+  // Order by fetched_at desc so duplicate identity rows never return first-by-chance.
   if (cmk && csk) {
     try {
       const { data, error } = await sb.from('odds_snapshots').select('*')
         .eq('canonical_market_key',cmk)
         .eq('canonical_selection_key',csk)
-        .limit(1);
+        .order('fetched_at', { ascending: false })
+        .limit(4);
       if (error) throw error;
       if (data && data[0]) {
         snap = data[0];
@@ -7127,7 +7362,7 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
       // 42703 = column not found. Old DB, no canonical columns. Silent
       // fallback to legacy lookup below.
       const msg = (dbErr && dbErr.message) || '';
-      if (!/canonical_market_key|canonical_selection_key/.test(msg)) {
+      if (!/canonical_market_key|canonical_selection_key|fetched_at/.test(msg)) {
         console.warn('[snapshot] canonical lookup error:', msg);
       }
     }
@@ -7147,21 +7382,33 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
   //   e.g. "colorado rockies"   (moneyline — no line)
   if (!snap) {
     try {
-      for (let ki = 0; ki < keyCandidates.length; ki++) {
-        const tryKey = keyCandidates[ki];
-        const { data, error } = await sb.from('odds_snapshots').select('*')
-          .eq('canonical_game_key', tryKey).eq('market_key', marketForLookup).eq('selection_key', pickForLookup)
-          .limit(1);
-        if (error) throw error;
-        if (data && data[0]) {
-          snap = data[0];
-          matchStrategy = 'legacy';
-          if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
-            console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+      // Primary selection first; hyphen/space variants only on miss to bound queries.
+      const selCandidates = _selectionKeyLookupCandidates(pickForLookup);
+      let legacyHit = false;
+      for (let pass = 0; pass < 2 && !legacyHit; pass++) {
+        const sels = pass === 0 ? [pickForLookup] : selCandidates.filter(function(s) {
+          return s !== pickForLookup;
+        });
+        for (let ki = 0; ki < keyCandidates.length && !legacyHit; ki++) {
+          const tryKey = keyCandidates[ki];
+          for (let si = 0; si < sels.length && !legacyHit; si++) {
+            const trySel = sels[si];
+            const { data, error } = await sb.from('odds_snapshots').select('*')
+              .eq('canonical_game_key', tryKey).eq('market_key', marketForLookup).eq('selection_key', trySel)
+              .order('fetched_at', { ascending: false })
+              .limit(4);
+            if (error) throw error;
+            if (data && data[0]) {
+              snap = data[0];
+              matchStrategy = 'legacy';
+              if (ident.marketType === MARKET_TYPES.PLAYER_PROP) {
+                console.log(`PROP_SNAPSHOT_MATCH gameKey=${ident.gameKey} player=${_normalizePlayerName(ident.playerName||'')} propType=${_normalizePropType(ident.propType||'')} side=${(ident.side||'').toLowerCase()} line=${ident.line!=null?ident.line:'?'} via=legacy`);
+              }
+              _logSnapshotLookupHit('legacy', snap,
+                'searchedKey=' + tryKey + ' market=' + marketForLookup + ' selection=' + trySel);
+              legacyHit = true;
+            }
           }
-          _logSnapshotLookupHit('legacy', snap,
-            'searchedKey=' + tryKey + ' market=' + marketForLookup + ' selection=' + pickForLookup);
-          break;
         }
       }
     } catch(dbErr) {
@@ -7195,23 +7442,45 @@ async function _verifyLegOddsSnapshot(sb, leg, nowMs, oddsChangePolicy, quoteLeg
   }
 
   // Tier 2c: contract gameId → provider_game_id (Owls/provider event id).
+  // Same provider_game_id can span prior-day live + fresh upcoming rows
+  // (golf matchups). Never take .limit(1) first-row; pick CURRENT deterministically.
+  // ORDERING RULE (_pickProviderGameIdSnapshotRow):
+  //   1) preferred event date (leg scheduledStart / key date, UTC YYYY-MM-DD)
+  //   2) else today (UTC)
+  //   3) else freshest non-live / latest-dated upcoming over ancient live
+  //   4) within pool: fetched_at DESC (not created_at)
   if (!snap && contractGameId) {
     try {
+      const preferredSnapDate =
+        dateFromLeg ||
+        (_isoDateFromValue(String(preferredKey || '').split('|').pop() || '') || '');
       const { data, error } = await sb.from('odds_snapshots').select('*')
         .eq('provider_game_id', String(contractGameId))
         .eq('market_key', marketForLookup)
-        .eq('selection_key', pickForLookup)
-        .limit(1);
+        .order('fetched_at', { ascending: false })
+        .limit(24);
       if (error) throw error;
-      if (data && data[0]) {
-        snap = data[0];
+      const matched = (data || []).filter(function(r) {
+        return _selectionKeysEquivalent(r && r.selection_key, pickForLookup);
+      });
+      const picked = _pickProviderGameIdSnapshotRow(matched, {
+        preferredDate: preferredSnapDate,
+        today: new Date().toISOString().slice(0, 10),
+        nowMs: nowMs
+      });
+      if (picked) {
+        snap = picked;
         matchStrategy = 'provider_game_id';
         _logSnapshotLookupHit('provider_game_id', snap,
-          'gameId=' + contractGameId + ' market=' + marketForLookup + ' selection=' + pickForLookup);
+          'gameId=' + contractGameId
+          + ' preferredDate=' + preferredSnapDate
+          + ' market=' + marketForLookup
+          + ' selection=' + pickForLookup
+          + ' candidates=' + matched.length);
       }
     } catch (gidErr) {
       const msg = (gidErr && gidErr.message) || '';
-      if (!/provider_game_id/.test(msg)) {
+      if (!/provider_game_id|fetched_at/.test(msg)) {
         console.warn('[snapshot] provider_game_id lookup error:', msg);
       }
     }
@@ -14962,7 +15231,7 @@ app.post('/api/bets/place', requireCanonicalClubId, requirePermissionScoped('pla
         } else if (payoutResult.code === 'line_changed') {
           payoutResult.userMessage = 'Line changed — please review and confirm.';
         } else if (payoutResult.code === 'odds_stale') {
-          payoutResult.userMessage = 'Odds refreshing — please try again.';
+          payoutResult.userMessage = 'Current odds unavailable for this selection — please try again.';
         } else if (payoutResult.code === 'odds_service_unavailable') {
           payoutResult.userMessage = 'Odds service unavailable — please try again shortly.';
         }
