@@ -9535,7 +9535,7 @@ app.get('/api/mirror/tickets-with-legs', async (req, res) => {
     if (!clubId) return res.status(400).json({ enabled:false, tickets:[], legs:[], error:'missing_clubId' });
     const limit = Math.min(parseInt(limitQ)||200, 500);
     let tq = sb.from('tickets')
-      .select('id,type,status,risk_amount,potential_profit,estimated_payout,odds,placed_at,graded_at,grading_source,grading_snapshot,player_id,club_id')
+      .select('id,type,status,risk_amount,potential_profit,estimated_payout,odds,placed_at,graded_at,canceled_at,grading_source,grading_snapshot,player_id,club_id')
       .eq('player_id', playerId)
       .eq('club_id', clubId)
       .order('placed_at', { ascending: false }).limit(limit);
@@ -16256,7 +16256,7 @@ app.get('/api/player/dashboard', requireCanonicalClubId, requirePermissionScoped
   try {
     // Tickets for this player
     let tq = sb.from('tickets').select(
-      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,grading_source,odds,rr_group_id,insurance_enabled,cashout_offer_amount,cashout_offer_status'
+      'id,status,type,risk_amount,potential_profit,estimated_payout,placed_at,graded_at,canceled_at,grading_source,odds,rr_group_id,insurance_enabled,cashout_offer_amount,cashout_offer_status'
     ).eq('player_id', playerId).eq('club_id', clubId);
     tq = tq.order('placed_at', { ascending:false });
     const { data: tickets, error: tErr } = await tq;
